@@ -1,0 +1,10 @@
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      plugins: ["obstacle_layer", "voxel_layer", "camera_obstacle_layer", "inflation_layer"]
+
+      camera_obstacle_layer:
+        enabled: true
+
+      social_layer:
+        enabled: false

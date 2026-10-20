@@ -1,0 +1,91 @@
+# ==============================================================================
+# Foxy-specific overlay
+#
+# Foxy differences vs Humble:
+#   - single goal checker key (singular "_plugin")
+#   - recovery nodes live under recoveries_server, namespace nav2_recoveries
+#   - shorter BT plugin_lib_names list (no selector/cancel BT nodes added
+#     in later distros)
+#   - lifecycle_manager_navigation lists recoveries_server, not
+#     behavior_server
+# ==============================================================================
+
+bt_navigator:
+  ros__parameters:
+    default_server_timeout: 1000
+    default_bt_xml_filename: "$(find-pkg-share g1_nav2)/behavior_trees/navigate_w_replanning_clear_wait.xml"
+
+    plugin_lib_names:
+      - nav2_back_up_action_bt_node
+      - nav2_clear_costmap_service_bt_node
+      - nav2_compute_path_to_pose_action_bt_node
+      - nav2_distance_controller_bt_node
+      - nav2_distance_traveled_condition_bt_node
+      - nav2_follow_path_action_bt_node
+      - nav2_goal_reached_condition_bt_node
+      - nav2_goal_updated_condition_bt_node
+      - nav2_goal_updater_node_bt_node
+      - nav2_initial_pose_received_condition_bt_node
+      - nav2_is_battery_low_condition_bt_node
+      - nav2_is_stuck_condition_bt_node
+      - nav2_navigate_to_pose_action_bt_node
+      - nav2_pipeline_sequence_bt_node
+      - nav2_rate_controller_bt_node
+      - nav2_recovery_node_bt_node
+      - nav2_reinitialize_global_localization_service_bt_node
+      - nav2_round_robin_node_bt_node
+      - nav2_speed_controller_bt_node
+      - nav2_spin_action_bt_node
+      - nav2_time_expired_condition_bt_node
+      - nav2_transform_available_condition_bt_node
+      - nav2_truncate_path_action_bt_node
+      - nav2_wait_action_bt_node
+
+controller_server:
+  ros__parameters:
+    # References the progress_checker block already defined in the base file.
+    progress_checker_plugin: "progress_checker"
+
+    # Foxy uses a single string key, not a list.
+    goal_checker_plugin: "goal_checker"
+
+    goal_checker:
+      plugin: "nav2_controller::SimpleGoalChecker"
+      stateful: true
+      xy_goal_tolerance: 0.25
+      yaw_goal_tolerance: 0.15   # kept consistent with the Humble overlay
+
+recoveries_server:
+  ros__parameters:
+    use_sim_time: false
+    cycle_frequency: 5.0
+    global_frame: odom
+    robot_base_frame: base_footprint
+
+    #recovery_plugins: ["spin", "backup", "wait"]
+    recovery_plugins:
+      - spin
+      - wait
+
+    spin:
+      plugin: "nav2_recoveries/Spin"
+    backup:
+      plugin: "nav2_recoveries/BackUp"
+    wait:
+      plugin: "nav2_recoveries/Wait"
+
+    max_rotational_vel: 0.15
+    min_rotational_vel: 0.10
+    rotational_acc_lim: 0.20
+
+lifecycle_manager_navigation:
+  ros__parameters:
+    use_sim_time: false
+    autostart: true
+
+    node_names:
+      - controller_server
+      - planner_server
+      - recoveries_server
+      - bt_navigator
+      - waypoint_follower

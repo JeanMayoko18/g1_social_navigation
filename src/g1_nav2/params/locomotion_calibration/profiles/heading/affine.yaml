@@ -1,0 +1,26 @@
+locomotion_calibration_node:
+
+  ros__parameters:
+
+    enable_forward_heading_compensation: true
+
+    forward_heading_compensation_model_type: polynomial
+
+    # C_wz(vx) = b + a*vx
+    forward_heading_compensation_coefficients:
+      - -0.005375073124273092
+      - 0.04858620540816468
+
+    # Unused by the polynomial evaluator.
+    forward_heading_compensation_input_points:
+      - 0.0
+      - 1.0
+
+    forward_heading_compensation_output_points:
+      - 0.0
+      - 0.0
+
+    forward_heading_compensation_domain_min: 0.11
+    forward_heading_compensation_domain_max: 0.20
+
+    forward_heading_compensation_outside_domain_policy: disable

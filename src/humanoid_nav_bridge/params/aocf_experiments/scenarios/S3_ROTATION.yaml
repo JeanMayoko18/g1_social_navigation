@@ -1,0 +1,48 @@
+scenario:
+  id: "S3_ROTATION"
+  title: "In-place rotation"
+
+  description: >
+    The robot performs controlled in-place rotations to evaluate yaw
+    calibration, angular response learning and heading preservation.
+
+  command_source: "manual_or_controlled"
+  navigation_enabled: false
+
+  angles_deg:
+    preliminary:
+      - 90.0
+    final:
+      - 90.0
+      - 180.0
+      - 360.0
+
+  variants:
+    - id: "CW"
+      sign: -1
+
+    - id: "CCW"
+      sign: 1
+
+  ground_truth:
+    method: "floor_angular_markers_or_external_measurement"
+    expected_translation_m: 0.0
+
+  configurations:
+    - "B0_RAW"
+    - "A1_NO_RESPONSE_LEARNING"
+    - "A2_NO_AMCE"
+    - "A3_NO_AFI"
+    - "A5_NO_AHC"
+    - "FULL"
+
+  repetitions_preliminary: 3
+  repetitions_final: 10
+
+  primary_metrics:
+    - "final_yaw_error"
+    - "rotation_position_drift"
+    - "wz_response_gain"
+    - "mci_yaw_mean"
+    - "afi_yaw_correction"
+    - "published_wz_stability"

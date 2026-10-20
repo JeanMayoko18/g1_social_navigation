@@ -1,0 +1,2807 @@
+
+================================================================================
+FILE: src/yolo_ros/yolo_ros/yolo_ros/yolo_node.py
+================================================================================
+# Copyright (C) 2023 Miguel Ángel González Santamarta
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+
+from typing import List, Dict
+from cv_bridge import CvBridge
+
+import rclpy
+from rclpy.qos import QoSProfile
+from rclpy.qos import QoSHistoryPolicy
+from rclpy.qos import QoSDurabilityPolicy
+from rclpy.qos import QoSReliabilityPolicy
+from rclpy.lifecycle import LifecycleNode
+from rclpy.lifecycle import TransitionCallbackReturn
+from rclpy.lifecycle import LifecycleState
+
+import torch
+from ultralytics import YOLO, YOLOWorld, YOLOE
+from ultralytics.engine.results import Results
+from ultralytics.engine.results import Boxes
+from ultralytics.engine.results import Masks
+from ultralytics.engine.results import Keypoints
+
+from std_srvs.srv import SetBool
+from sensor_msgs.msg import Image
+from yolo_msgs.msg import Point2D
+from yolo_msgs.msg import BoundingBox2D
+from yolo_msgs.msg import Mask
+from yolo_msgs.msg import KeyPoint2D
+from yolo_msgs.msg import KeyPoint2DArray
+from yolo_msgs.msg import Detection
+from yolo_msgs.msg import DetectionArray
+from yolo_msgs.srv import SetClasses
+
+
+class YoloNode(LifecycleNode):
+    """
+    ROS 2 Lifecycle Node for YOLO object detection.
+
+    This node provides real-time object detection using various YOLO models
+    (YOLO, YOLOWorld, YOLOE). It subscribes to image topics and publishes
+    detection results including bounding boxes, masks, and keypoints.
+    """
+
+    def __init__(self) -> None:
+        """
+        Initialize the YOLO node.
+
+        Declares all ROS parameters for model configuration and inference settings.
+        """
+        super().__init__("yolo_node")
+
+        # Params
+        self.declare_parameter("model_type", "YOLO")
+        self.declare_parameter("model", "yolov8m.pt")
+        self.declare_parameter("device", "cuda:0")
+        self.declare_parameter("fuse_model", False)
+        self.declare_parameter("yolo_encoding", "bgr8")
+        self.declare_parameter("enable", True)
+        self.declare_parameter("image_reliability", QoSReliabilityPolicy.BEST_EFFORT)
+
+        self.declare_parameter("threshold", 0.5)
+        self.declare_parameter("iou", 0.5)
+        self.declare_parameter("imgsz_height", 640)
+        self.declare_parameter("imgsz_width", 640)
+        self.declare_parameter("half", False)
+        self.declare_parameter("max_det", 300)
+        self.declare_parameter("augment", False)
+        self.declare_parameter("agnostic_nms", False)
+        self.declare_parameter("retina_masks", False)
+
+        self.type_to_model = {"YOLO": YOLO, "World": YOLOWorld, "YOLOE": YOLOE}
+
+    def on_configure(self, state: LifecycleState) -> TransitionCallbackReturn:
+        """
+        Configure lifecycle callback.
+
+        Retrieves all parameters and sets up publishers and QoS profiles.
+
+        @param state Current lifecycle state
+        @return Transition callback return status
+        """
+        self.get_logger().info(f"[{self.get_name()}] Configuring...")
+
+        # Model params
+        self.model_type = (
+            self.get_parameter("model_type").get_parameter_value().string_value
+        )
+        self.model = self.get_parameter("model").get_parameter_value().string_value
+        self.device = self.get_parameter("device").get_parameter_value().string_value
+        self.fuse_model = (
+            self.get_parameter("fuse_model").get_parameter_value().bool_value
+        )
+        self.yolo_encoding = (
+            self.get_parameter("yolo_encoding").get_parameter_value().string_value
+        )
+
+        # Inference params
+        self.threshold = (
+            self.get_parameter("threshold").get_parameter_value().double_value
+        )
+        self.iou = self.get_parameter("iou").get_parameter_value().double_value
+        self.imgsz_height = (
+            self.get_parameter("imgsz_height").get_parameter_value().integer_value
+        )
+        self.imgsz_width = (
+            self.get_parameter("imgsz_width").get_parameter_value().integer_value
+        )
+        self.half = self.get_parameter("half").get_parameter_value().bool_value
+        self.max_det = self.get_parameter("max_det").get_parameter_value().integer_value
+        self.augment = self.get_parameter("augment").get_parameter_value().bool_value
+        self.agnostic_nms = (
+            self.get_parameter("agnostic_nms").get_parameter_value().bool_value
+        )
+        self.retina_masks = (
+            self.get_parameter("retina_masks").get_parameter_value().bool_value
+        )
+
+        # ROS params
+        self.enable = self.get_parameter("enable").get_parameter_value().bool_value
+        self.reliability = (
+            self.get_parameter("image_reliability").get_parameter_value().integer_value
+        )
+
+        # Detection pub
+        self.image_qos_profile = QoSProfile(
+            reliability=self.reliability,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            durability=QoSDurabilityPolicy.VOLATILE,
+            depth=1,
+        )
+
+        self._pub = self.create_lifecycle_publisher(DetectionArray, "detections", 10)
+        self.cv_bridge = CvBridge()
+
+        super().on_configure(state)
+        self.get_logger().info(f"[{self.get_name()}] Configured")
+
+        return TransitionCallbackReturn.SUCCESS
+
+    def on_activate(self, state: LifecycleState) -> TransitionCallbackReturn:
+        """
+        Activate lifecycle callback.
+
+        Loads the YOLO model, optionally fuses it, and creates subscriptions and services.
+
+        @param state Current lifecycle state
+        @return Transition callback return status
+        """
+        self.get_logger().info(f"[{self.get_name()}] Activating...")
+
+        try:
+            self.yolo = self.type_to_model[self.model_type](self.model)
+            self.yolo.to(self.device)
+        except FileNotFoundError:
+            self.get_logger().error(f"Model file '{self.model}' does not exists")
+            return TransitionCallbackReturn.ERROR
+
+        # YOLOE does not support fusing
+        if self.fuse_model and (
+            isinstance(self.yolo, YOLO) or isinstance(self.yolo, YOLOWorld)
+        ):
+            try:
+                self.get_logger().info("Trying to fuse model...")
+                self.yolo.fuse()
+            except TypeError as e:
+                self.get_logger().warn(f"Error while fuse: {e}")
+
+        self._enable_srv = self.create_service(SetBool, "enable", self.enable_cb)
+
+        self._has_set_classes = hasattr(self.yolo, "set_classes")
+        if self._has_set_classes:
+            self._set_classes_srv = self.create_service(
+                SetClasses, "set_classes", self.set_classes_cb
+            )
+
+        self._sub = self.create_subscription(
+            Image, "image_raw", self.image_cb, self.image_qos_profile
+        )
+
+        super().on_activate(state)
+        self.get_logger().info(f"[{self.get_name()}] Activated")
+
+        return TransitionCallbackReturn.SUCCESS
+
+    def on_deactivate(self, state: LifecycleState) -> TransitionCallbackReturn:
+        """
+        Deactivate lifecycle callback.
+
+        Destroys the YOLO model, clears CUDA cache if applicable, and cleans up services and subscriptions.
+
+        @param state Current lifecycle state
+        @return Transition callback return status
+        """
+        self.get_logger().info(f"[{self.get_name()}] Deactivating...")
+
+        del self.yolo
+        if "cuda" in self.device:
+            self.get_logger().info("Clearing CUDA cache")
+            torch.cuda.empty_cache()
+
+        self.destroy_service(self._enable_srv)
+        self._enable_srv = None
+
+        if self._has_set_classes:
+            self.destroy_service(self._set_classes_srv)
+            self._set_classes_srv = None
+
+        self.destroy_subscription(self._sub)
+        self._sub = None
+
+        super().on_deactivate(state)
+        self.get_logger().info(f"[{self.get_name()}] Deactivated")
+
+        return TransitionCallbackReturn.SUCCESS
+
+    def on_cleanup(self, state: LifecycleState) -> TransitionCallbackReturn:
+        """
+        Cleanup lifecycle callback.
+
+        Destroys publishers and cleans up resources.
+
+        @param state Current lifecycle state
+        @return Transition callback return status
+        """
+        self.get_logger().info(f"[{self.get_name()}] Cleaning up...")
+
+        self.destroy_publisher(self._pub)
+        del self.image_qos_profile
+
+        super().on_cleanup(state)
+        self.get_logger().info(f"[{self.get_name()}] Cleaned up")
+
+        return TransitionCallbackReturn.SUCCESS
+
+    def on_shutdown(self, state: LifecycleState) -> TransitionCallbackReturn:
+        """
+        Shutdown lifecycle callback.
+
+        Performs final cleanup before node shutdown.
+
+        @param state Current lifecycle state
+        @return Transition callback return status
+        """
+        self.get_logger().info(f"[{self.get_name()}] Shutting down...")
+        super().on_shutdown(state)
+        self.get_logger().info(f"[{self.get_name()}] Shutted down")
+        return TransitionCallbackReturn.SUCCESS
+
+    def enable_cb(
+        self,
+        request: SetBool.Request,
+        response: SetBool.Response,
+    ) -> SetBool.Response:
+        """
+        Service callback to enable or disable detection.
+
+        @param request Service request containing enable/disable flag
+        @param response Service response
+        @return Service response with success status
+        """
+        self.enable = request.data
+        response.success = True
+        return response
+
+    def parse_hypothesis(self, results: Results) -> List[Dict]:
+        """
+        Parse detection hypotheses from YOLO results.
+
+        Extracts class IDs, class names, and confidence scores from detection results.
+
+        @param results YOLO detection results
+        @return List of dictionaries containing class information and scores
+        """
+
+        hypothesis_list = []
+
+        if results.boxes:
+            box_data: Boxes
+            for box_data in results.boxes:
+                hypothesis = {
+                    "class_id": int(box_data.cls),
+                    "class_name": self.yolo.names[int(box_data.cls)],
+                    "score": float(box_data.conf),
+                }
+                hypothesis_list.append(hypothesis)
+
+        elif results.obb:
+            for i in range(results.obb.cls.shape[0]):
+                hypothesis = {
+                    "class_id": int(results.obb.cls[i]),
+                    "class_name": self.yolo.names[int(results.obb.cls[i])],
+                    "score": float(results.obb.conf[i]),
+                }
+                hypothesis_list.append(hypothesis)
+
+        return hypothesis_list
+
+    def parse_boxes(self, results: Results) -> List[BoundingBox2D]:
+        """
+        Parse bounding boxes from YOLO results.
+
+        Converts YOLO bounding box format to ROS BoundingBox2D messages.
+        Supports both regular boxes and oriented bounding boxes (OBB).
+
+        @param results YOLO detection results
+        @return List of BoundingBox2D messages
+        """
+
+        boxes_list = []
+
+        if results.boxes:
+            box_data: Boxes
+            for box_data in results.boxes:
+
+                msg = BoundingBox2D()
+
+                # Get boxes values
+                box = box_data.xywh[0]
+                msg.center.position.x = float(box[0])
+                msg.center.position.y = float(box[1])
+                msg.size.x = float(box[2])
+                msg.size.y = float(box[3])
+
+                # Append msg
+                boxes_list.append(msg)
+
+        elif results.obb:
+            for i in range(results.obb.cls.shape[0]):
+                msg = BoundingBox2D()
+
+                # Get boxes values
+                box = results.obb.xywhr[i]
+                msg.center.position.x = float(box[0])
+                msg.center.position.y = float(box[1])
+                msg.center.theta = float(box[4])
+                msg.size.x = float(box[2])
+                msg.size.y = float(box[3])
+
+                # Append msg
+                boxes_list.append(msg)
+
+        return boxes_list
+
+    def parse_masks(self, results: Results) -> List[Mask]:
+        """
+        Parse segmentation masks from YOLO results.
+
+        Converts YOLO mask format to ROS Mask messages containing polygon points.
+
+        @param results YOLO detection results
+        @return List of Mask messages
+        """
+
+        masks_list = []
+
+        def create_point2d(x: float, y: float) -> Point2D:
+            p = Point2D()
+            p.x = x
+            p.y = y
+            return p
+
+        mask: Masks
+        for mask in results.masks:
+
+            msg = Mask()
+
+            msg.data = [
+                create_point2d(float(ele[0]), float(ele[1]))
+                for ele in mask.xy[0].tolist()
+            ]
+            msg.height = results.orig_img.shape[0]
+            msg.width = results.orig_img.shape[1]
+
+            masks_list.append(msg)
+
+        return masks_list
+
+    def parse_keypoints(self, results: Results) -> List[KeyPoint2DArray]:
+        """
+        Parse keypoints from YOLO results.
+
+        Extracts keypoint positions and confidence scores, filtering by threshold.
+
+        @param results YOLO detection results
+        @return List of KeyPoint2DArray messages
+        """
+
+        keypoints_list = []
+
+        points: Keypoints
+        for points in results.keypoints:
+
+            msg_array = KeyPoint2DArray()
+
+            if points.conf is None:
+                continue
+
+            for kp_id, (p, conf) in enumerate(zip(points.xy[0], points.conf[0])):
+
+                if conf >= self.threshold:
+                    msg = KeyPoint2D()
+
+                    msg.id = kp_id + 1
+                    msg.point.x = float(p[0])
+                    msg.point.y = float(p[1])
+                    msg.score = float(conf)
+
+                    msg_array.data.append(msg)
+
+            keypoints_list.append(msg_array)
+
+        return keypoints_list
+
+    def image_cb(self, msg: Image) -> None:
+        """
+        Image callback for processing detections.
+
+        Receives images, runs YOLO inference, parses results, and publishes detections.
+
+        @param msg Image message to process
+        """
+
+        if self.enable:
+
+            # Convert image + predict
+            cv_image = self.cv_bridge.imgmsg_to_cv2(
+                msg, desired_encoding=self.yolo_encoding
+            )
+            results = self.yolo.predict(
+                source=cv_image,
+                verbose=False,
+                stream=False,
+                conf=self.threshold,
+                iou=self.iou,
+                imgsz=(self.imgsz_height, self.imgsz_width),
+                half=self.half,
+                max_det=self.max_det,
+                augment=self.augment,
+                agnostic_nms=self.agnostic_nms,
+                retina_masks=self.retina_masks,
+                device=self.device,
+            )
+            results: Results = results[0].cpu()
+
+            if results.boxes or results.obb:
+                hypothesis = self.parse_hypothesis(results)
+                boxes = self.parse_boxes(results)
+
+            if results.masks:
+                masks = self.parse_masks(results)
+
+            if results.keypoints:
+                keypoints = self.parse_keypoints(results)
+
+            # Create detection msgs
+            detections_msg = DetectionArray()
+
+            for i in range(len(results)):
+
+                aux_msg = Detection()
+
+                if (results.boxes or results.obb) and hypothesis and boxes:
+                    aux_msg.class_id = hypothesis[i]["class_id"]
+                    aux_msg.class_name = hypothesis[i]["class_name"]
+                    aux_msg.score = hypothesis[i]["score"]
+
+                    aux_msg.bbox = boxes[i]
+
+                if results.masks and masks:
+                    aux_msg.mask = masks[i]
+
+                if results.keypoints and keypoints:
+                    aux_msg.keypoints = keypoints[i]
+
+                detections_msg.detections.append(aux_msg)
+
+            # Publish detections
+            detections_msg.header = msg.header
+            self._pub.publish(detections_msg)
+
+            del results
+            del cv_image
+
+    def set_classes_cb(
+        self,
+        req: SetClasses.Request,
+        res: SetClasses.Response,
+    ) -> SetClasses.Response:
+        """
+        Service callback to set detection classes (YOLOWorld only).
+
+        Updates the classes that the model should detect.
+
+        @param req Service request containing list of class names
+        @param res Service response
+        @return Service response
+        """
+
+        try:
+            self.get_logger().info(f"Setting classes: {req.classes}")
+            self.yolo.set_classes(req.classes)
+            self.get_logger().info(f"New classes: {self.yolo.names}")
+        except Exception as e:
+            self.get_logger().error(f"Error setting classes: {e}")
+        return res
+
+
+def main():
+    rclpy.init()
+    node = YoloNode()
+    node.trigger_configure()
+    node.trigger_activate()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+
+
+================================================================================
+FILE: src/yolo_ros/yolo_bringup/launch/yolo.launch.py
+================================================================================
+# Copyright (C) 2023 Miguel Ángel González Santamarta
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+
+import os
+import glob
+import subprocess
+
+from launch import LaunchDescription, LaunchContext
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch_ros.actions import Node
+from launch.conditions import IfCondition
+from ament_index_python.packages import get_package_share_directory
+
+
+def generate_launch_description():
+
+    def run_yolo(context: LaunchContext, use_tracking, use_3d):
+
+        use_tracking = eval(context.perform_substitution(use_tracking))
+        use_3d = eval(context.perform_substitution(use_3d))
+
+        share_dir = get_package_share_directory("yolo_ros")
+        subprocess.run(["uv", "sync", "--project", share_dir], check=True)
+        venv_site_pkgs = glob.glob(
+            os.path.join(share_dir, ".venv", "lib", "python*", "site-packages")
+        )
+        existing_pythonpath = os.environ.get("PYTHONPATH", "")
+        new_pythonpath = ":".join(venv_site_pkgs + [existing_pythonpath]).strip(":")
+
+        model_type = LaunchConfiguration("model_type")
+        model_type_cmd = DeclareLaunchArgument(
+            "model_type",
+            default_value="YOLO",
+            choices=["YOLO", "World", "YOLOE"],
+            description="Model type form Ultralytics (YOLO, World, YOLOE)",
+        )
+
+        model = LaunchConfiguration("model")
+        model_cmd = DeclareLaunchArgument(
+            "model",
+            default_value="yolov8m.pt",
+            description="Model name or path",
+        )
+
+        tracker = LaunchConfiguration("tracker")
+        tracker_cmd = DeclareLaunchArgument(
+            "tracker",
+            default_value="bytetrack.yaml",
+            description="Tracker name or path",
+        )
+
+        device = LaunchConfiguration("device")
+        device_cmd = DeclareLaunchArgument(
+            "device",
+            default_value="cuda:0",
+            description="Device to use (GPU/CPU)",
+        )
+
+        fuse_model = LaunchConfiguration("fuse_model")
+        fuse_model_cmd = DeclareLaunchArgument(
+            "fuse_model",
+            default_value="False",
+            description="Whether to fuse the model for inference optimization",
+        )
+
+        yolo_encoding = LaunchConfiguration("yolo_encoding")
+        yolo_encoding_cmd = DeclareLaunchArgument(
+            "yolo_encoding",
+            default_value="bgr8",
+            description="Encoding of the input image topic",
+        )
+
+        enable = LaunchConfiguration("enable")
+        enable_cmd = DeclareLaunchArgument(
+            "enable",
+            default_value="True",
+            description="Whether to start YOLO enabled",
+        )
+
+        threshold = LaunchConfiguration("threshold")
+        threshold_cmd = DeclareLaunchArgument(
+            "threshold",
+            default_value="0.5",
+            description="Minimum probability of a detection to be published",
+        )
+
+        iou = LaunchConfiguration("iou")
+        iou_cmd = DeclareLaunchArgument(
+            "iou",
+            default_value="0.7",
+            description="IoU threshold",
+        )
+
+        imgsz_height = LaunchConfiguration("imgsz_height")
+        imgsz_height_cmd = DeclareLaunchArgument(
+            "imgsz_height",
+            default_value="480",
+            description="Image height for inference",
+        )
+
+        imgsz_width = LaunchConfiguration("imgsz_width")
+        imgsz_width_cmd = DeclareLaunchArgument(
+            "imgsz_width",
+            default_value="640",
+            description="Image width for inference",
+        )
+
+        half = LaunchConfiguration("half")
+        half_cmd = DeclareLaunchArgument(
+            "half",
+            default_value="False",
+            description="Whether to enable half-precision (FP16) inference speeding up model inference with minimal impact on accuracy",
+        )
+
+        max_det = LaunchConfiguration("max_det")
+        max_det_cmd = DeclareLaunchArgument(
+            "max_det",
+            default_value="300",
+            description="Maximum number of detections allowed per image",
+        )
+
+        augment = LaunchConfiguration("augment")
+        augment_cmd = DeclareLaunchArgument(
+            "augment",
+            default_value="False",
+            description="Whether to enable test-time augmentation (TTA) for predictions improving detection robustness at the cost of speed",
+        )
+
+        agnostic_nms = LaunchConfiguration("agnostic_nms")
+        agnostic_nms_cmd = DeclareLaunchArgument(
+            "agnostic_nms",
+            default_value="False",
+            description="Whether to enable class-agnostic Non-Maximum Suppression (NMS) merging overlapping boxes of different classes",
+        )
+
+        retina_masks = LaunchConfiguration("retina_masks")
+        retina_masks_cmd = DeclareLaunchArgument(
+            "retina_masks",
+            default_value="False",
+            description="Whether to use high-resolution segmentation masks if available in the model, enhancing mask quality for segmentation",
+        )
+
+        input_image_topic = LaunchConfiguration("input_image_topic")
+        input_image_topic_cmd = DeclareLaunchArgument(
+            "input_image_topic",
+            default_value="/camera/rgb/image_raw",
+            description="Name of the input image topic",
+        )
+
+        image_reliability = LaunchConfiguration("image_reliability")
+        image_reliability_cmd = DeclareLaunchArgument(
+            "image_reliability",
+            default_value="1",
+            choices=["0", "1", "2"],
+            description="Specific reliability QoS of the input image topic (0=system default, 1=Reliable, 2=Best Effort)",
+        )
+
+        input_depth_topic = LaunchConfiguration("input_depth_topic")
+        input_depth_topic_cmd = DeclareLaunchArgument(
+            "input_depth_topic",
+            default_value="/camera/depth/image_raw",
+            description="Name of the input depth topic",
+        )
+
+        depth_image_reliability = LaunchConfiguration("depth_image_reliability")
+        depth_image_reliability_cmd = DeclareLaunchArgument(
+            "depth_image_reliability",
+            default_value="1",
+            choices=["0", "1", "2"],
+            description="Specific reliability QoS of the input depth image topic (0=system default, 1=Reliable, 2=Best Effort)",
+        )
+
+        input_depth_info_topic = LaunchConfiguration("input_depth_info_topic")
+        input_depth_info_topic_cmd = DeclareLaunchArgument(
+            "input_depth_info_topic",
+            default_value="/camera/depth/camera_info",
+            description="Name of the input depth info topic",
+        )
+
+        depth_info_reliability = LaunchConfiguration("depth_info_reliability")
+        depth_info_reliability_cmd = DeclareLaunchArgument(
+            "depth_info_reliability",
+            default_value="1",
+            choices=["0", "1", "2"],
+            description="Specific reliability QoS of the input depth info topic (0=system default, 1=Reliable, 2=Best Effort)",
+        )
+
+        target_frame = LaunchConfiguration("target_frame")
+        target_frame_cmd = DeclareLaunchArgument(
+            "target_frame",
+            default_value="base_link",
+            description="Target frame to transform the 3D boxes",
+        )
+
+        depth_image_units_divisor = LaunchConfiguration("depth_image_units_divisor")
+        depth_image_units_divisor_cmd = DeclareLaunchArgument(
+            "depth_image_units_divisor",
+            default_value="1000",
+            description="Divisor used to convert the raw depth image values into metres",
+        )
+
+        namespace = LaunchConfiguration("namespace")
+        namespace_cmd = DeclareLaunchArgument(
+            "namespace",
+            default_value="yolo",
+            description="Namespace for the nodes",
+        )
+
+        use_debug = LaunchConfiguration("use_debug")
+        use_debug_cmd = DeclareLaunchArgument(
+            "use_debug",
+            default_value="True",
+            description="Whether to activate the debug node",
+        )
+
+        # get topics for remap
+        detect_3d_detections_topic = "detections"
+        debug_detections_topic = "detections"
+
+        if use_tracking:
+            detect_3d_detections_topic = "tracking"
+
+        if use_tracking and not use_3d:
+            debug_detections_topic = "tracking"
+        elif use_3d:
+            debug_detections_topic = "detections_3d"
+
+        yolo_node_cmd = Node(
+            package="yolo_ros",
+            executable="yolo_node",
+            name="yolo_node",
+            namespace=namespace,
+            additional_env={"PYTHONPATH": new_pythonpath},
+            parameters=[
+                {
+                    "model_type": model_type,
+                    "model": model,
+                    "device": device,
+                    "fuse_model": fuse_model,
+                    "yolo_encoding": yolo_encoding,
+                    "enable": enable,
+                    "threshold": threshold,
+                    "iou": iou,
+                    "imgsz_height": imgsz_height,
+                    "imgsz_width": imgsz_width,
+                    "half": half,
+                    "max_det": max_det,
+                    "augment": augment,
+                    "agnostic_nms": agnostic_nms,
+                    "retina_masks": retina_masks,
+                    "image_reliability": image_reliability,
+                }
+            ],
+            remappings=[("image_raw", input_image_topic)],
+        )
+
+        tracking_node_cmd = Node(
+            package="yolo_ros",
+            executable="tracking_node",
+            name="tracking_node",
+            namespace=namespace,
+            additional_env={"PYTHONPATH": new_pythonpath},
+            parameters=[{"tracker": tracker, "image_reliability": image_reliability}],
+            remappings=[("image_raw", input_image_topic)],
+            condition=IfCondition(PythonExpression([str(use_tracking)])),
+        )
+
+        detect_3d_node_cmd = Node(
+            package="yolo_ros",
+            executable="detect_3d_node",
+            name="detect_3d_node",
+            namespace=namespace,
+            additional_env={"PYTHONPATH": new_pythonpath},
+            parameters=[
+                {
+                    "target_frame": target_frame,
+                    "depth_image_units_divisor": depth_image_units_divisor,
+                    "depth_image_reliability": depth_image_reliability,
+                    "depth_info_reliability": depth_info_reliability,
+                }
+            ],
+            remappings=[
+                ("depth_image", input_depth_topic),
+                ("depth_info", input_depth_info_topic),
+                ("detections", detect_3d_detections_topic),
+            ],
+            condition=IfCondition(PythonExpression([str(use_3d)])),
+        )
+
+        debug_node_cmd = Node(
+            package="yolo_ros",
+            executable="debug_node",
+            name="debug_node",
+            namespace=namespace,
+            additional_env={"PYTHONPATH": new_pythonpath},
+            parameters=[{"image_reliability": image_reliability}],
+            remappings=[
+                ("image_raw", input_image_topic),
+                ("detections", debug_detections_topic),
+            ],
+            condition=IfCondition(PythonExpression([use_debug])),
+        )
+
+        return (
+            model_type_cmd,
+            model_cmd,
+            tracker_cmd,
+            device_cmd,
+            fuse_model_cmd,
+            yolo_encoding_cmd,
+            enable_cmd,
+            threshold_cmd,
+            iou_cmd,
+            imgsz_height_cmd,
+            imgsz_width_cmd,
+            half_cmd,
+            max_det_cmd,
+            augment_cmd,
+            agnostic_nms_cmd,
+            retina_masks_cmd,
+            input_image_topic_cmd,
+            image_reliability_cmd,
+            input_depth_topic_cmd,
+            depth_image_reliability_cmd,
+            input_depth_info_topic_cmd,
+            depth_info_reliability_cmd,
+            target_frame_cmd,
+            depth_image_units_divisor_cmd,
+            namespace_cmd,
+            use_debug_cmd,
+            yolo_node_cmd,
+            tracking_node_cmd,
+            detect_3d_node_cmd,
+            debug_node_cmd,
+        )
+
+    use_tracking = LaunchConfiguration("use_tracking")
+    use_tracking_cmd = DeclareLaunchArgument(
+        "use_tracking",
+        default_value="True",
+        description="Whether to activate tracking",
+    )
+
+    use_3d = LaunchConfiguration("use_3d")
+    use_3d_cmd = DeclareLaunchArgument(
+        "use_3d",
+        default_value="False",
+        description="Whether to activate 3D detections",
+    )
+
+    return LaunchDescription(
+        [
+            use_tracking_cmd,
+            use_3d_cmd,
+            OpaqueFunction(function=run_yolo, args=[use_tracking, use_3d]),
+        ]
+    )
+
+
+================================================================================
+FILE: src/g1_social_bringup/launch/vision_inference.launch.py
+================================================================================
+#!/usr/bin/env python3
+
+"""
+Launch the vision inference role.
+
+FLOW
+====
+External RGB image
+    |
+    v
+YOLO
+    |
+    v
+/yolo/detections
+
+RESPONSIBILITIES
+================
+This launch owns only vision inference.
+
+It owns:
+    - YOLO inference
+
+It MUST NOT own:
+    - RealSense acquisition
+    - image transport / ingress
+    - depth fusion
+    - person tracking
+    - social zones
+    - social decision
+    - navigation
+    - explanation / LLM
+    - speech / TTS
+    - visualization
+
+The RGB input topic is configurable so deployment orchestration can
+select either the direct hardware topic or a local ImageIngress topic.
+
+RealSense acquisition remains externally owned by rl_sar.
+"""
+
+import os
+
+from ament_index_python.packages import get_package_share_directory
+
+from launch import LaunchDescription
+from launch.actions import (
+    DeclareLaunchArgument,
+    IncludeLaunchDescription,
+)
+from launch.launch_description_sources import (
+    PythonLaunchDescriptionSource,
+)
+from launch.substitutions import LaunchConfiguration
+from launch.conditions import IfCondition
+
+
+def generate_launch_description():
+
+    yolo_bringup_share = get_package_share_directory(
+        "yolo_bringup"
+    )
+
+    input_image_topic = LaunchConfiguration(
+        "input_image_topic"
+    )
+
+    image_reliability = LaunchConfiguration(
+        "image_reliability"
+    )
+    enable_yolo = LaunchConfiguration(
+        "enable_yolo"
+    )
+
+    yolo = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(
+                yolo_bringup_share,
+                "launch",
+                "yolov11.launch.py",
+            )
+        ),
+        launch_arguments={
+            "input_image_topic": input_image_topic,
+            "image_reliability": image_reliability,
+        }.items(),
+        condition=IfCondition(enable_yolo),
+    )
+
+    return LaunchDescription(
+        [
+            DeclareLaunchArgument(
+                "input_image_topic",
+                default_value=(
+                    "/camera/camera/color/image_raw"
+                ),
+                description="RGB input topic for YOLO.",
+            ),
+
+            DeclareLaunchArgument(
+                "image_reliability",
+                default_value="2",
+                description=(
+                    "YOLO image subscription reliability."
+                ),
+            ),
+
+            DeclareLaunchArgument(
+                "enable_yolo",
+                default_value="true",
+                description="Enable YOLO vision inference.",
+            ),
+
+            yolo,
+        ]
+    )
+
+================================================================================
+FILE: src/g1_social_bringup/launch/system.launch.py
+================================================================================
+"""
+G1 navigation and social system entry point.
+
+FLOW
+====
+
+
+                    system.launch.py
+                           |
+                           v
+                    system_resolver
+                           |
+          +----------------+----------------+
+          |                |                |
+       profile         deployment       interaction
+       A/B/C/D         role placement   none/dialogue
+          |                |                |
+          +----------------+----------------+
+                           |
+                           v
+                      local roles
+                           |
+          +----------------+----------------+
+          |                |                |
+      perception       navigation         speech
+      social decision  explanation        dialogue
+      visualization
+                           |
+                           v
+                    role launch files
+
+
+                    TEXT PRODUCERS
+
+ExplanationNode --------------------------+
+                                          |
+NavigationInteractionSpeech --------------+---> /explainability/text
+                                          |
+NavigationGoalGate -----------------------+
+                                          |
+future ROS4HRI adapter -------------------+
+                                                   |
+                                                   v
+                                      +-------------------------+
+                                      | speech.launch.py        |
+                                      |                         |
+                                      | PiperTTSNode            |
+                                      |   ONE queue             |
+                                      |   Piper synthesis       |
+                                      |   audio backend         |
+                                      +------------+------------+
+                                                   |
+                                                   v
+                                  /explainability/speech_status
+
+Matrix
+
+                    pc_all   robot_all   robot_perception   pc_perception
+vision_inference       PC       Robot           PC                PC
+social_perception      PC       Robot          Robot               PC
+social_decision        PC       Robot           PC                PC
+navigation             PC       Robot           PC                PC
+explanation / LLM      PC       Robot           PC                PC
+speech                 PC       Robot          Robot              Robot
+visualization          PC        PC             PC                PC
+
+                   SYSTEM CONFIGURATION
+                         │
+       ┌─────────────────┼─────────────────┐
+       ▼                 ▼                 ▼
+    PROFILE          INTERACTION       DEPLOYMENT
+    A/B/C/D         none/dialogue      role → host
+                                           │
+                            ┌──────────────┴──────────────┐
+                            ▼                             ▼
+                         host=pc                      host=robot
+                            │                             │
+                     local active roles            local active roles
+                            │                             │
+                            └──────── ROS 2 ─────────────┘
+
+                                     +
+                              rl_sar separately
+                              on the G1 robot
+IMPORTANT
+=========
+rl_sar is NOT launched here.
+
+The robot hardware stack must be started independently.
+
+This launch consumes the interfaces provided by the hardware stack
+but never owns:
+    - LiDAR hardware
+    - RealSense hardware
+    - IMU hardware
+    - canonical odometry
+    - hardware TF
+    - low-level G1 control
+"""
+
+import importlib.util
+import os
+
+from ament_index_python.packages import (
+    get_package_share_directory,
+)
+
+from launch import LaunchDescription
+
+from launch.actions import (
+    DeclareLaunchArgument,
+    IncludeLaunchDescription,
+    LogInfo,
+    OpaqueFunction,
+    RegisterEventHandler,
+    TimerAction,
+)
+from launch.event_handlers import OnProcessExit
+from launch_ros.actions import Node
+from launch.conditions import IfCondition
+
+from launch.launch_description_sources import (
+    PythonLaunchDescriptionSource,
+)
+
+from launch.substitutions import LaunchConfiguration
+
+
+def _load_system_resolver():
+    package_share = get_package_share_directory("g1_social_bringup")
+
+    resolver_path = os.path.join(
+        package_share,
+        "launch",
+        "system_resolver.py",
+    )
+
+    spec = importlib.util.spec_from_file_location(
+        "g1_social_bringup_system_resolver",
+        resolver_path,
+    )
+
+    if spec is None or spec.loader is None:
+        raise RuntimeError(
+            f"Unable to load system resolver: {resolver_path}"
+        )
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    return module
+
+def _start_after_readiness(
+    event,
+    context,
+    actions,
+    label,
+    start_on_failure=False,
+):
+    """
+    Start dependent launch actions after the readiness process exits.
+
+    Normal path:
+        readiness succeeds -> start dependent subsystem.
+
+    Optional fallback:
+        readiness fails -> start dependent subsystem anyway when
+        start_on_failure=True.
+    """
+    del context
+
+    if event.returncode == 0:
+        return [
+            LogInfo(
+                msg=(
+                    f"[IMAGE INGRESS READY] {label} readiness passed. "
+                    "Starting dependent subsystem."
+                )
+            ),
+            *actions,
+        ]
+
+    if start_on_failure:
+        return [
+            LogInfo(
+                msg=(
+                    f"[IMAGE INGRESS FALLBACK] {label} readiness FAILED "
+                    f"(returncode={event.returncode}). "
+                    "Starting dependent subsystem without readiness dependency."
+                )
+            ),
+            *actions,
+        ]
+
+    return [
+        LogInfo(
+            msg=(
+                f"[IMAGE INGRESS READY] {label} readiness FAILED "
+                f"(returncode={event.returncode}). "
+                "Dependent subsystem will NOT be started."
+            )
+        )
+    ]
+
+def _resolve_and_launch(context):
+    resolver = _load_system_resolver()
+
+    profile = LaunchConfiguration("profile").perform(context)
+    interaction = LaunchConfiguration("interaction").perform(context)
+    deployment = LaunchConfiguration("deployment").perform(context)
+    host = LaunchConfiguration("host").perform(context)
+    ros_distro = LaunchConfiguration("ros_distro").perform(context)
+    map_yaml = LaunchConfiguration("map").perform(context)
+    language = LaunchConfiguration("language").perform(context).strip().lower()
+
+    if language not in ("en", "es", "fr"):
+        raise RuntimeError(
+            f"Unsupported language='{language}'. "
+            "Expected 'en', 'es' or 'fr'."
+        )
+
+    navigation_mode = LaunchConfiguration(
+        "navigation_mode"
+    ).perform(context)
+
+    controller = LaunchConfiguration(
+        "controller"
+    ).perform(context)
+
+    camera_transport = LaunchConfiguration(
+        "camera_transport"
+    ).perform(context)
+
+    navigation_speed = LaunchConfiguration(
+        "navigation_speed"
+    ).perform(context)
+
+    start_visual_odometry = LaunchConfiguration(
+        "start_visual_odometry"
+    ).perform(context)
+
+    enable_locomotion_calibration = LaunchConfiguration(
+        "enable_locomotion_calibration"
+    ).perform(context)
+
+    locomotion_calibration_profile = LaunchConfiguration(
+        "locomotion_calibration_profile"
+    ).perform(context)
+
+    forward_lateral_compensation_profile = LaunchConfiguration(
+        "forward_lateral_compensation_profile"
+    ).perform(context)
+
+    forward_heading_compensation_profile = LaunchConfiguration(
+        "forward_heading_compensation_profile"
+    ).perform(context)
+
+    plan = resolver.resolve_system(
+        profile=profile,
+        interaction=interaction,
+        deployment=deployment,
+        host=host,
+        ros_distro=ros_distro,
+    )
+    
+    bringup_share = get_package_share_directory(
+        "g1_social_bringup"
+    )
+
+    vision_is_local = plan.owns("vision_inference")
+    social_perception_is_local = plan.owns(
+        "social_perception"
+    )
+
+    enable_yolo = (
+        LaunchConfiguration("enable_yolo")
+        .perform(context)
+        .strip()
+        .lower()
+        == "true"
+    )
+
+    enable_ros4hri_visualization = (
+        LaunchConfiguration(
+            "enable_ros4hri_visualization"
+        ).perform(context).strip().lower()
+        == "true"
+    )
+
+    enable_visualization = (
+        LaunchConfiguration(
+            "enable_visualization"
+        ).perform(context).strip().lower()
+        == "true"
+    )
+
+    enable_social_rviz = (
+        LaunchConfiguration("enable_social_rviz")
+        .perform(context)
+        .strip()
+        .lower() == "true"
+    )
+
+    enable_raw_image_visualization = (
+        LaunchConfiguration(
+            "enable_raw_image_visualization"
+        ).perform(context).strip().lower()
+        == "true"
+    )
+
+    camera_host = "robot"
+
+    remote_rgb_required = (
+        vision_is_local
+        and plan.host != camera_host
+    )
+
+    remote_depth_required = (
+        social_perception_is_local
+        and plan.host != camera_host
+    )
+
+    visualization_is_local = plan.owns(
+        "visualization"
+    )
+
+    visualization_rgb_topic = (
+        "/visualization/raw_images_disabled/rgb"
+    )
+
+    visualization_depth_topic = (
+        "/visualization/raw_images_disabled/depth"
+    )
+
+    if (
+        visualization_is_local
+        and enable_raw_image_visualization
+    ):
+        if remote_rgb_required:
+            visualization_rgb_topic = (
+                "/perception/transport/color"
+                if camera_transport == "compressed"
+                else "/perception/ingress/color/image_raw"
+    )
+        elif plan.host == camera_host:
+            visualization_rgb_topic = (
+                "/camera/camera/color/image_raw"
+            )
+
+        if remote_depth_required:
+            visualization_depth_topic = (
+                "/perception/ingress/"
+                "aligned_depth/image_raw"
+            )
+        elif plan.host == camera_host:
+            visualization_depth_topic = (
+                "/camera/camera/"
+                "aligned_depth_to_color/image_raw"
+            )
+
+    role_map = ", ".join(
+        f"{role}={role_host}"
+        for role, role_host in plan.role_hosts.items()
+    )
+
+    local_roles = ", ".join(plan.local_roles)
+
+    if not local_roles:
+        local_roles = "none"
+
+    pc_audio_fallback_required_old = (
+        plan.host == "pc"
+        and plan.ros_distro == "humble"
+        and not plan.owns("speech")
+        and plan.speech_required
+    )
+    pc_audio_fallback_required = (
+        not plan.owns("speech")
+    )
+
+    actions = [
+        LogInfo(msg="=" * 72),
+        LogInfo(msg="G1 SYSTEM PLAN"),
+        LogInfo(msg="=" * 72),
+        LogInfo(msg=f"Host              : {plan.host}"),
+        LogInfo(msg=f"ROS distribution  : {plan.ros_distro}"),
+        LogInfo(msg=f"Profile           : {plan.profile}"),
+        LogInfo(msg=f"Interaction       : {plan.interaction}"),
+        LogInfo(msg=f"Deployment        : {plan.deployment}"),
+        LogInfo(
+            msg=f"Camera obstacles  : {plan.camera_obstacles}"
+        ),
+        LogInfo(
+            msg=f"Social navigation : {plan.social_navigation}"
+        ),
+        LogInfo(msg=f"Explanation       : {plan.explanation}"),
+        LogInfo(msg=f"Speech required   : {plan.speech_required}"),
+        LogInfo(msg=f"Dialogue          : {plan.dialogue}"),
+        LogInfo(msg=f"Role placement    : {role_map}"),
+        LogInfo(msg=f"Local roles       : {local_roles}"),
+        LogInfo(msg="Hardware owner    : rl_sar package"),
+        LogInfo(msg="=" * 72),
+    ]
+
+    # ---------------------------------------------------------
+    # IMAGE TRANSPORT
+    # ---------------------------------------------------------
+    if camera_transport == "compressed":
+
+        if plan.host == "robot":
+            actions.append(
+                Node(
+                    package="image_transport",
+                    executable="republish",
+                    name="rgb_network_transport_sender",
+                    arguments=[
+                        "raw",
+                        "compressed",
+                    ],
+                    remappings=[
+                        ("in", "/camera/camera/color/image_raw"),
+                        ("out/compressed", "/social_navigation/camera/color/compressed"),
+                    ],
+                    output="screen",
+                )
+            )
+
+        elif plan.host == "pc" and remote_rgb_required:
+            actions.append(
+                Node(
+                    package="image_transport",
+                    executable="republish",
+                    name="rgb_network_transport_receiver",
+                    arguments=[
+                        "compressed",
+                        "raw",
+                    ],
+                    remappings=[
+                        ("in/compressed", "/social_navigation/camera/color/compressed"),
+                        ("out", "/perception/transport/color"),
+                    ],
+                    output="screen",
+                )
+            )
+
+    # ---------------------------------------------------------
+    # IMAGE INGRESS
+    # ---------------------------------------------------------
+    if remote_rgb_required or remote_depth_required:
+
+        image_ingress_launch = os.path.join(
+            bringup_share,
+            "launch",
+            "image_ingress.launch.py",
+        )
+
+        actions.append(
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    image_ingress_launch
+                ),
+
+                launch_arguments={
+                    "enable_rgb": (
+                        "true"
+                        if remote_rgb_required and camera_transport != "compressed"
+                        else "false"
+                    ),
+                    "enable_depth": (
+                        "true"
+                        if remote_depth_required
+                        else "false"
+                    ),
+                    "enable_camera_info": (
+                        "true"
+                        if remote_depth_required
+                        else "false"
+                    ),
+                    #"rgb_input_topic": "/camera/camera/color/image_raw",
+                    "rgb_input_topic": (
+                        "/perception/transport/color"
+                        if camera_transport == "compressed"
+                        else "/camera/camera/color/image_raw"
+                    ),
+                }.items(),
+
+
+            )
+        )
+
+
+    # ---------------------------------------------------------
+    # IMAGE INGRESS READINESS BARRIERS
+    # ---------------------------------------------------------
+    #
+    # Remote image consumers must not start merely because an ingress
+    # process exists. They start only after at least one valid message
+    # has actually been received on every stream they require.
+    #
+    # RGB_READY:
+    #     valid RGB -> VisionInference may start
+    #
+    # DEPTH_READY:
+    #     valid depth + valid CameraInfo -> SocialPerception may start
+    #
+    # Local camera consumers do not use these barriers.
+
+    rgb_readiness = None
+    depth_readiness = None
+
+    if remote_rgb_required:
+        rgb_readiness = Node(
+            package="g1_social_bringup",
+            executable="wait_for_image_ingress",
+            name="wait_for_rgb_ingress",
+            output="screen",
+            remappings=[
+                (
+                    "/perception/ingress/color/image_raw",
+                    "/perception/transport/color",
+                )
+            ] if camera_transport == "compressed" else [],
+            parameters=[
+                {
+                    "require_rgb": True,
+                    "require_depth": False,
+                    "require_camera_info": False,
+                    "timeout_sec": 60.0,
+                }
+            ],
+        )
+
+    if remote_depth_required:
+        depth_readiness = Node(
+            package="g1_social_bringup",
+            executable="wait_for_image_ingress",
+            name="wait_for_depth_ingress",
+            output="screen",
+            parameters=[
+                {
+                    "require_rgb": False,
+                    "require_depth": True,
+                    "require_camera_info": True,
+                    "timeout_sec": 15.0,
+                }
+            ],
+        )
+
+    # ---------------------------------------------------------
+    # VISION INFERENCE ROLE
+    # ---------------------------------------------------------
+    #
+    # YOLO placement is independent from downstream social
+    # perception placement.
+    #
+    # In robot_perception, YOLO intentionally remains on the PC
+    # while fusion/tracking/zones run on the robot.
+    #
+    # Step 8D will insert ImageIngress when the RGB producer and
+    # YOLO are on different hosts.
+
+
+    if (
+        plan.social_navigation
+        and plan.owns("vision_inference")
+        and enable_yolo
+    ):
+        vision_inference_launch = os.path.join(
+            bringup_share,
+            "launch",
+            "vision_inference.launch.py",
+        )
+
+        vision_inference_action = IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                vision_inference_launch
+            ),
+            launch_arguments={
+                "enable_yolo": "true",
+                "input_image_topic": (
+                    "/perception/transport/color"
+                    if remote_rgb_required and camera_transport == "compressed"
+                    else (
+                        "/perception/ingress/color/image_raw"
+                        if remote_rgb_required
+                        else "/camera/camera/color/image_raw"
+                    )
+                ),
+            }.items(),
+        )
+
+        vision_log_action = LogInfo(
+            msg=(
+                "Starting local vision inference role "
+                f"on host '{plan.host}'."
+            )
+        )
+
+        if remote_rgb_required:
+            actions.append(
+                RegisterEventHandler(
+                    OnProcessExit(
+                        target_action=rgb_readiness,
+                        on_exit=lambda event, context: (
+                            _start_after_readiness(
+                                event,
+                                context,
+                                [
+                                    vision_inference_action,
+                                    vision_log_action,
+                                ],
+                                "RGB",
+                                start_on_failure=True,
+                            )
+                        ),
+                    )
+                )
+            )
+
+            actions.append(rgb_readiness)
+        else:
+            actions.extend(
+                [
+                    vision_inference_action,
+                    vision_log_action,
+                ]
+            )
+
+    # ---------------------------------------------------------
+    # SOCIAL PERCEPTION ROLE
+    # ---------------------------------------------------------
+    #
+    # This role contains the downstream processing chain only:
+    # fusion, tracking, transforms, and social zones.
+    #
+    # YOLO is not owned by this role.
+
+    if (
+        plan.social_navigation
+        and plan.owns("social_perception")
+    ):
+        social_perception_launch = os.path.join(
+            bringup_share,
+            "launch",
+            "social_perception.launch.py",
+        )
+
+        social_perception_action = IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                social_perception_launch
+            ),
+            launch_arguments={
+                "depth_topic": (
+                    "/perception/ingress/"
+                    "aligned_depth/image_raw"
+                    if remote_depth_required
+                    else (
+                        "/camera/camera/"
+                        "aligned_depth_to_color/image_raw"
+                    )
+                ),
+                "language": language,
+                "camera_info_topic": (
+                    "/perception/ingress/"
+                    "aligned_depth/camera_info"
+                    if remote_depth_required
+                    else (
+                        "/camera/camera/"
+                        "aligned_depth_to_color/camera_info"
+                    )
+                ),
+            }.items(),
+        )
+
+        social_perception_log_action = LogInfo(
+            msg=(
+                "Starting local social perception role "
+                f"on host '{plan.host}'."
+            )
+        )
+
+        # Start social perception directly.
+        #
+        # ImageIngress owns the network boundary when depth is remote.
+        # The real consumer subscribes directly to the ingress topics;
+        # no temporary readiness subscriber is inserted in the data path.
+        actions.extend(
+            [
+                social_perception_action,
+                social_perception_log_action,
+            ]
+        )
+
+    # ---------------------------------------------------------
+    # SOCIAL DECISION ROLE
+    # ---------------------------------------------------------
+    #
+    # Profiles C and D use the social decision chain.
+    #
+    # interaction=none:
+    #     deterministic social decision
+    #         -> CollaborationManager(hri_enabled=false)
+    #         -> CollaborativeDecision
+    #
+    # interaction=dialogue:
+    #     deterministic social decision
+    #         -> CollaborationManager(hri_enabled=true)
+    #         -> CollaborativeDecision
+    #
+    # Dialogue-specific HRI/ROS4HRI processes are launched
+    # separately and are not owned by this role.
+
+    if (
+        plan.social_navigation
+        and plan.owns("social_decision")
+    ):
+        social_decision_launch = os.path.join(
+            bringup_share,
+            "launch",
+            "social_decision.launch.py",
+        )
+
+        actions.append(
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    social_decision_launch
+                ),
+                launch_arguments={
+                    "interaction": plan.interaction,
+                    "host": plan.host,
+                    "language": language,
+                }.items(),
+            )
+        )
+
+        actions.append(
+            LogInfo(
+                msg=(
+                    "Starting local social decision role "
+                    f"on host '{plan.host}' "
+                    f"with interaction='{plan.interaction}'."
+                )
+            )
+        )
+
+
+    # ---------------------------------------------------------
+    # DIALOGUE ROLE
+    # ---------------------------------------------------------
+    #
+    # Dialogue is an independent interaction capability.
+    #
+    # interaction=none:
+    #     no HRI manager
+    #     no ROS4HRI
+    #
+    # interaction=dialogue:
+    #
+    #     CollaborationManager
+    #             |
+    #             | DialogueRequest
+    #             v
+    #         HRIManager
+    #             |
+    #             | HumanIntent
+    #             v
+    #     CollaborationManager
+    #
+    # ROS4HRI is a compatibility boundary around the dialogue
+    # subsystem. It does not own navigation or final speech.
+    #
+    # The resolver guarantees that a local dialogue role is
+    # started only on a compatible ROS 2 Humble host.
+
+    if (
+        plan.dialogue
+        and plan.owns("dialogue")
+    ):
+        hri_share = get_package_share_directory(
+            "g1_hri"
+        )
+
+        hri_launch = os.path.join(
+            hri_share,
+            "launch",
+            "hri.launch.py",
+        )
+
+        ros4hri_adapter_launch = os.path.join(
+            hri_share,
+            "launch",
+            "ros4hri_adapter.launch.py",
+        )
+
+        # HRI manager
+        actions.append(
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    hri_launch
+                ),
+                launch_arguments={
+                    "hri_enabled": "true",
+                }.items(),
+            )
+        )
+
+        # ROS4HRI / dialogue manager
+        actions.append(
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    ros4hri_adapter_launch
+                )
+            )
+        )
+
+
+        actions.append(
+            LogInfo(
+                msg=(
+                    "Starting local dialogue role "
+                    f"on host '{plan.host}' "
+                    "with HRI, ROS4HRI and PC ASR."
+                )
+            )
+        )
+
+        actions.append(
+            LogInfo(
+                msg=(
+                    "Starting local dialogue role "
+                    f"on host '{plan.host}' "
+                    "with HRI and ROS4HRI compatibility."
+                )
+            )
+        )
+
+        # ---------------------------------------------------------
+        # PC MICROPHONE ASR
+        # ---------------------------------------------------------
+        #
+        # The dialogue role is owned by the Humble-compatible PC.
+        # ASR publishes ROS4HRI LiveSpeech consumed by the existing
+        # dialogue pipeline.
+        #
+        # It is intentionally not part of the collaboration role:
+        # collaboration consumes HumanIntent and does not own
+        # speech recognition.
+
+        pc_asr_node = Node(
+            package="g1_pc_asr",
+            executable="pc_asr",
+            name="g1_pc_asr",
+            output="screen",
+            parameters=[
+                {
+                    "voice_id": "pc_user",
+                    "language": language,
+                    "model": "small",
+                    "device": "cpu",
+                    "compute_type": "int8",
+
+                    "sample_rate": 16000,
+                    "audio_device": -1,
+
+                    "vad_filter": True,
+
+                    "chunk_ms": 30,
+                    "speech_start_rms": 180.0,
+                    "speech_end_rms": 100.0,
+                    "end_silence_sec": 0.55,
+                    "min_speech_sec": 0.20,
+                    "max_speech_sec": 8.0,
+                    "pre_roll_sec": 0.20,
+                }
+            ],
+        )
+
+        actions.append(pc_asr_node)
+
+    # ---------------------------------------------------------
+    # NAVIGATION ROLE
+    # ---------------------------------------------------------
+    #
+    # All profiles use Nav2.
+    #
+    # Profiles A and B:
+    #     client -> Nav2
+    #
+    # Profiles C and D:
+    #     client -> NavigationGoalGate -> Nav2
+    #
+    # system.launch.py owns the profile-to-gate policy.
+    # navigation.launch.py only receives the resolved boolean.
+
+    if plan.owns("navigation"):
+        navigation_launch = os.path.join(
+            bringup_share,
+            "launch",
+            "navigation.launch.py",
+        )
+
+        enable_navigation_goal_gate = (
+            "true"
+            if plan.social_navigation
+            else "false"
+        )
+
+        actions.append(
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    navigation_launch
+                ),
+                launch_arguments={
+                    "profile": plan.profile,
+                    "ros_distro": plan.ros_distro,
+                    "enable_navigation_goal_gate": (
+                        enable_navigation_goal_gate
+                    ),
+                    "map": map_yaml,
+                    # Profiles C and D require speech.
+                    # Navigation only produces speech requests;
+                    # speech.launch.py owns Piper and audio.
+                    "enable_navigation_announcements": (
+                        "true"
+                        if plan.speech_required
+                        else "false"
+                    ),
+
+                    "navigation_mode": navigation_mode,
+                    "controller": controller,
+                    "navigation_speed": navigation_speed,
+                    "start_visual_odometry": start_visual_odometry,
+
+                    "enable_locomotion_calibration": (
+                        enable_locomotion_calibration
+                    ),
+                    "locomotion_calibration_profile": (
+                        locomotion_calibration_profile
+                    ),
+                    "forward_lateral_compensation_profile": (
+                        forward_lateral_compensation_profile
+                    ),
+                    "forward_heading_compensation_profile": (
+                        forward_heading_compensation_profile
+                    ),
+                    "language": language,
+
+                    # The gate owns goal-reception speech in C/D,
+                    # therefore the generic navigation announcer
+                    # must not duplicate it.
+                    "enable_direct_goal_speech": "false",
+
+                    # Nav2 RViz is the primary navigation visualization
+                    # for every profile.
+                    #
+                    # Profiles C/D additionally start the Social RViz
+                    # through the visualization role below.
+                    "start_rviz": (
+                        "true"
+                        if (
+                            enable_visualization
+                            and plan.owns("visualization")
+                        )
+                        else "false"
+                    ),
+                    
+
+                }.items(),
+            )
+        )
+
+        actions.append(
+            LogInfo(
+                msg=(
+                    "Starting local navigation role "
+                    f"on host '{plan.host}' | "
+                    "navigation_goal_gate="
+                    f"{enable_navigation_goal_gate}."
+                )
+            )
+        )
+
+    # ---------------------------------------------------------
+    # EXPLANATION ROLE
+    # ---------------------------------------------------------
+    #
+    # Explanation is intrinsic to social profiles C and D.
+    #
+    # NOTE:
+    # Explanation role: LLM/context/explanation generation only.
+    # Speech and navigation execution are owned by separate launch roles.
+
+    if (
+        plan.explanation
+        and plan.owns("explanation")
+    ):
+        explanation_share = get_package_share_directory(
+            "g1_robot_explainability"
+        )
+
+        explainability_launch = os.path.join(
+            explanation_share,
+            "launch",
+            "explainability.launch.py",
+        )
+
+        actions.append(
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    explainability_launch
+                ),
+                launch_arguments={
+                    "runtime_host": plan.host,
+                    "ros_distro": plan.ros_distro,
+                    "language": language,
+                    "enable_explanation_node": "true",
+                }.items(),
+            )
+        )
+
+        actions.append(
+            LogInfo(
+                msg=(
+                    "Starting local explanation role "
+                    f"on host '{plan.host}'."
+                )
+            )
+        )
+
+    # ---------------------------------------------------------
+    # PC AUDIO FALLBACK EXECUTOR
+    # ---------------------------------------------------------
+    #
+    # The PC fallback executor is NOT a speech authority.
+    #
+    # It is started only when:
+    #
+    #   - this machine is the Humble PC;
+    #   - speech is required by the active profile;
+    #   - another host owns the real speech role.
+    #
+    # Therefore:
+    #
+    #   PC with local PiperTTS
+    #       -> no fallback executor
+    #
+    #   PC while robot owns PiperTTS
+    #       -> fallback executor available
+    #
+    #   Robot
+    #       -> never launch PC fallback executor
+    #
+    # The executor subscribes ONLY to:
+    #
+    #   /explainability/pc_audio_fallback/request
+    #
+    # and never to:
+    #
+    #   /explainability/text
+    #
+    # so there remains exactly one speech authority.
+
+    if pc_audio_fallback_required:
+
+        actions.append(
+            Node(
+                package="g1_robot_explainability",
+                executable="pc_audio_fallback",
+                name="pc_audio_fallback",
+                output="screen",
+                parameters=[
+                    {
+                        "enabled": True,
+                        "request_topic": (
+                            "/explainability/"
+                            "pc_audio_fallback/request"
+                        ),
+                        "status_topic": (
+                            "/explainability/"
+                            "pc_audio_fallback/status"
+                        ),
+                        "audio_player": "aplay",
+                    }
+                ],
+            )
+        )
+
+        actions.append(
+            LogInfo(
+                msg=(
+                    "Starting passive PC audio fallback executor | "
+                    f"host='{plan.host}' | "
+                    f"ros_distro='{plan.ros_distro}' | "
+                    "local_speech_owner=false."
+                )
+            )
+        )
+        
+    # ---------------------------------------------------------
+    # SPEECH ROLE
+    # ---------------------------------------------------------
+    #
+    # Profiles C and D always require speech.
+    #
+    # Exactly one host owns the final speech engine.
+    # All text producers publish to the common speech API.
+    #
+    # This role owns:
+    #     - one speech queue
+    #     - Piper synthesis
+    #     - final audio output
+    #
+    # It does not own explanation generation.
+
+    if (
+        plan.speech_required
+        and plan.owns("speech")
+    ):
+        speech_launch = os.path.join(
+            bringup_share,
+            "launch",
+            "speech.launch.py",
+        )
+
+        actions.append(
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    speech_launch
+                ),
+                launch_arguments={
+                    "runtime_host": plan.host,
+                    "ros_distro": plan.ros_distro,
+                }.items(),
+            )
+        )
+
+        actions.append(
+            LogInfo(
+                msg=(
+                    "Starting local speech role "
+                    f"on host '{plan.host}'."
+                )
+            )
+        )
+
+    # ---------------------------------------------------------
+    # VISUALIZATION ROLE
+    # ---------------------------------------------------------
+    #
+    # Visualization is independent from perception execution.
+    #
+    # Stopping RViz must never stop perception.
+    #
+    #    | Deployment PC | RGB RViz | Depth RViz |
+    #    |---------------|----------|------------|
+    #    | `pc_all`      | ingress  | ingress    |
+    #    | `pc_perception`| ingress | ingress    |
+    #    | `robot_perception` | ingress | disabled |
+    #    | `robot_all`   | disabled |   disabled |
+
+    # Raw image visualization is disabled by default. When
+    # explicitly enabled, only image streams already available
+    # locally for the selected deployment are used.
+
+    if (
+        enable_visualization
+        and enable_social_rviz
+        and plan.owns("visualization")
+        and profile in ("C", "D")
+    ):
+        visualization_launch = os.path.join(
+            bringup_share,
+            "launch",
+            "visualization.launch.py",
+        )
+
+        visualization_action = IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                visualization_launch
+            ),
+            launch_arguments={
+                "enable_visualization": "true",
+                "rgb_topic": visualization_rgb_topic,
+                "aligned_depth_topic": visualization_depth_topic,
+                "enable_ros4hri_visualization": (
+                    "true"
+                    if enable_ros4hri_visualization
+                    else "false"
+                ),
+            }.items(),
+        )
+
+        actions.append(
+            TimerAction(
+                period=8.0,
+                actions=[visualization_action],
+            )
+        )
+
+        actions.append(
+            LogInfo(
+                msg=(
+                    "Starting visualization role "
+                    f"on host '{plan.host}' | "
+                    "raw_images="
+                    f"{enable_raw_image_visualization} | "
+                    f"rgb='{visualization_rgb_topic}' | "
+                    f"depth='{visualization_depth_topic}'."
+                )
+            )
+        )
+
+    return actions
+
+def generate_launch_description():
+    return LaunchDescription(
+        [
+            DeclareLaunchArgument(
+                "profile",
+                default_value="A",
+                description=(
+                    "Navigation/perception profile: "
+                    "A | B | C | D"
+                ),
+            ),
+
+            DeclareLaunchArgument(
+                "interaction",
+                default_value="none",
+                description=(
+                    "Human interaction capability: "
+                    "none | dialogue"
+                ),
+            ),
+
+            DeclareLaunchArgument(
+                "map",
+                default_value=os.path.join(
+                    os.path.expanduser("~"),
+                    "g1_ws",
+                    "maps",
+                    "mic.yaml",
+                ),
+                description="Nav2 map YAML.",
+            ),
+
+            DeclareLaunchArgument(
+                "deployment",
+                default_value="pc_perception",
+                description=(
+                    "Software role placement: "
+                    "pc_all | robot_all | "
+                    "robot_perception | pc_perception"
+                ),
+            ),
+
+            DeclareLaunchArgument(
+                "camera_transport",
+                default_value="raw",
+                choices=["raw", "compressed"],
+                description=(
+                    "Transport used for remote RGB images. "
+                    "'raw' transports sensor_msgs/Image directly; "
+                    "'compressed' uses image_transport compressed transport. "
+                    "Depth remains raw."
+                ),
+            ),
+
+            DeclareLaunchArgument(
+                "host",
+                description=(
+                    "Current machine: pc | robot"
+                ),
+            ),
+
+            DeclareLaunchArgument(
+                "enable_social_rviz",
+                default_value="true",
+                choices=["true", "false"],
+                description="Enable Social RViz independently of navigation RViz.",
+            ),
+
+            DeclareLaunchArgument(
+                "ros_distro",
+                default_value="auto",
+                description=(
+                    "ROS distribution: auto | foxy | humble"
+                ),
+            ),
+
+            DeclareLaunchArgument(
+                "enable_visualization",
+                default_value="true",
+                description=(
+                    "Enable visualization on the host owning the "
+                    "visualization role."
+                ),
+            ),
+
+            DeclareLaunchArgument(
+                "enable_raw_image_visualization",
+                default_value="false",
+                description=(
+                    "Allow visualization to consume RGB/depth streams. "
+                    "Disabled by default to avoid accidental network traffic."
+                ),
+            ),
+
+            DeclareLaunchArgument(
+                "navigation_mode",
+                default_value="nav2",
+                choices=["nav2", "slam"],
+                description="Navigation mode.",
+            ),
+
+            DeclareLaunchArgument(
+                "language",
+                default_value="en",
+                choices=["en", "es", "fr"],
+                description=(
+                    "System-wide spoken language. "
+                    "Propagated to all speech-producing subsystems."
+                ),
+            ),
+
+            DeclareLaunchArgument(
+                "controller",
+                default_value="dwb",
+                choices=["dwb", "rpp"],
+                description="Nav2 controller.",
+            ),
+
+            DeclareLaunchArgument(
+                "navigation_speed",
+                default_value="0.20",
+                description="Maximum navigation speed in m/s.",
+            ),
+
+            DeclareLaunchArgument(
+                "start_visual_odometry",
+                default_value="true",
+                choices=["true", "false"],
+                description="Start visual odometry.",
+            ),
+
+            DeclareLaunchArgument(
+                "enable_locomotion_calibration",
+                default_value="false",
+                choices=["true", "false"],
+                description="Enable locomotion calibration.",
+            ),
+
+            DeclareLaunchArgument(
+                "enable_yolo",
+                default_value="true",
+                choices=["true", "false"],
+                description=(
+                    "Enable YOLO vision inference when the current host "
+                    "owns the vision_inference role."
+                ),
+            ),
+
+            DeclareLaunchArgument(
+                "locomotion_calibration_profile",
+                default_value="previous_reference_scaled",
+                description="Locomotion calibration profile.",
+            ),
+
+            DeclareLaunchArgument(
+                "forward_lateral_compensation_profile",
+                default_value="previous_reference_scaled",
+                description="Forward lateral compensation profile.",
+            ),
+
+            DeclareLaunchArgument(
+                "forward_heading_compensation_profile",
+                default_value="previous_reference_scaled",
+                description="Forward heading compensation profile.",
+            ),
+
+            DeclareLaunchArgument(
+                "enable_ros4hri_visualization",
+                default_value="false",
+                choices=["true", "false"],
+                description=(
+                    "Enable ROS4HRI visualization in Social RViz. "
+                    "This does not enable dialogue or HRI arbitration."
+                ),
+            ),
+
+            OpaqueFunction(function=_resolve_and_launch),
+        ]
+    )
+
+================================================================================
+FILE: src/g1_social_bringup/launch/image_ingress.launch.py
+================================================================================
+#!/usr/bin/env python3
+
+"""
+Launch the network image ingress boundary.
+
+FLOW
+====
+rl_sar camera topics
+    |
+    | remote DDS boundary
+    v
+ImageIngress
+    |
+    +-- /perception/ingress/color/image_raw
+    +-- /perception/ingress/aligned_depth/image_raw
+    `-- /perception/ingress/aligned_depth/camera_info
+
+RESPONSIBILITIES
+================
+This launch owns the camera network ingress on the destination host.
+
+RGB and depth transport are independently selectable.
+
+Downstream perception nodes must not subscribe directly to remote
+hardware image topics while this ingress is active.
+
+Hardware remains externally owned by rl_sar.
+"""
+
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
+
+from launch_ros.actions import Node
+
+
+def generate_launch_description():
+
+    ingress = Node(
+        package="g1_social_perception",
+        executable="image_ingress",
+        name="image_ingress",
+        output="screen",
+        parameters=[
+            {
+                "enable_rgb": LaunchConfiguration("enable_rgb"),
+                "enable_depth": LaunchConfiguration("enable_depth"),
+                "enable_camera_info": LaunchConfiguration(
+                    "enable_camera_info"
+                ),
+                "rgb_input_topic": LaunchConfiguration("rgb_input_topic"),
+                "depth_input_topic": (
+                    "/camera/camera/"
+                    "aligned_depth_to_color/image_raw"
+                ),
+                "camera_info_input_topic": (
+                    "/camera/camera/"
+                    "aligned_depth_to_color/camera_info"
+                ),
+                "rgb_output_topic": (
+                    "/perception/ingress/color/image_raw"
+                ),
+                "depth_output_topic": (
+                    "/perception/ingress/"
+                    "aligned_depth/image_raw"
+                ),
+                "camera_info_output_topic": (
+                    "/perception/ingress/"
+                    "aligned_depth/camera_info"
+                ),
+            }
+        ],
+    )
+
+    return LaunchDescription(
+        [
+            DeclareLaunchArgument(
+                "enable_rgb",
+                default_value="true",
+                choices=["true", "false"],
+            ),
+            DeclareLaunchArgument(
+                "enable_depth",
+                default_value="true",
+                choices=["true", "false"],
+            ),
+            DeclareLaunchArgument(
+                "enable_camera_info",
+                default_value="true",
+                choices=["true", "false"],
+            ),
+
+            DeclareLaunchArgument(
+                "rgb_input_topic",
+                default_value="/camera/camera/color/image_raw",
+            ),
+
+            ingress,
+        ]
+    )
+
+================================================================================
+FILE: src/g1_social_perception/g1_social_perception/image_ingress_node.py
+================================================================================
+#!/usr/bin/env python3
+
+"""
+Network image ingress for distributed G1 perception.
+
+FLOW
+====
+Remote hardware topics
+    |
+    | DDS network boundary
+    v
+ImageIngress
+    |
+    +-- local RGB image
+    +-- local aligned depth image
+    `-- local aligned-depth CameraInfo
+
+RESPONSIBILITIES
+================
+This node is the single remote image reader for a destination host.
+
+It republishes selected remote camera streams onto perception-local
+topics. Downstream perception nodes MUST use the local topics whenever
+the ingress is active.
+
+The node does not:
+    - start camera hardware;
+    - perform inference;
+    - process images;
+    - perform depth fusion;
+    - compress or modify image payloads.
+
+RGB and depth forwarding can be enabled independently so deployments
+can avoid transporting streams that are processed on the robot.
+"""
+
+import rclpy
+import time
+from rclpy.node import Node
+
+from sensor_msgs.msg import CameraInfo, Image
+
+from g1_qos_manager.resolver import resolve_subscription_qos
+from g1_qos_manager.profiles import reliable_qos, sensor_data_qos
+
+
+class ImageIngressNode(Node):
+
+    def __init__(self) -> None:
+        super().__init__("image_ingress")
+
+        self.enable_rgb = bool(
+            self.declare_parameter(
+                "enable_rgb",
+                True,
+            ).value
+        )
+
+        self.enable_depth = bool(
+            self.declare_parameter(
+                "enable_depth",
+                True,
+            ).value
+        )
+
+        self.enable_camera_info = bool(
+            self.declare_parameter(
+                "enable_camera_info",
+                True,
+            ).value
+        )
+
+        self.rgb_input_topic = self.declare_parameter(
+            "rgb_input_topic",
+            "/camera/camera/color/image_raw",
+        ).value
+
+        self.depth_input_topic = self.declare_parameter(
+            "depth_input_topic",
+            "/camera/camera/aligned_depth_to_color/image_raw",
+        ).value
+
+        self.camera_info_input_topic = self.declare_parameter(
+            "camera_info_input_topic",
+            "/camera/camera/aligned_depth_to_color/camera_info",
+        ).value
+
+        self.rgb_output_topic = self.declare_parameter(
+            "rgb_output_topic",
+            "/perception/ingress/color/image_raw",
+        ).value
+
+        self.depth_output_topic = self.declare_parameter(
+            "depth_output_topic",
+            "/perception/ingress/aligned_depth/image_raw",
+        ).value
+
+        self.camera_info_output_topic = self.declare_parameter(
+            "camera_info_output_topic",
+            "/perception/ingress/aligned_depth/camera_info",
+        ).value
+
+        self._subscriptions = []
+        self._publishers = []
+        
+        self._relay_stats = {}
+        self._diagnostics_period_sec = 5.0
+
+        self._diagnostics_timer = self.create_timer(
+            self._diagnostics_period_sec,
+            self._report_relay_stats,
+        )
+
+        if self.enable_rgb:
+            self._create_relay(
+                Image,
+                self.rgb_input_topic,
+                self.rgb_output_topic,
+            )
+
+        if self.enable_depth:
+            self._create_relay(
+                Image,
+                self.depth_input_topic,
+                self.depth_output_topic,
+            )
+
+        if self.enable_camera_info:
+            self._create_relay(
+                CameraInfo,
+                self.camera_info_input_topic,
+                self.camera_info_output_topic,
+            )
+
+        self.get_logger().info(
+            "ImageIngress configured: "
+            f"rgb={self.enable_rgb}, "
+            f"depth={self.enable_depth}, "
+            f"camera_info={self.enable_camera_info}"
+        )
+
+    def _report_relay_stats(self) -> None:
+
+        now = time.monotonic()
+
+        for topic, stats in self._relay_stats.items():
+
+            elapsed = max(
+                now - stats["last_report_time"],
+                1e-6,
+            )
+
+            rx_delta = (
+                stats["received"]
+                - stats["last_report_received"]
+            )
+
+            tx_delta = (
+                stats["published"]
+                - stats["last_report_published"]
+            )
+
+            rx_hz = rx_delta / elapsed
+            tx_hz = tx_delta / elapsed
+
+            last_rx = stats["last_received"]
+
+            silence = (
+                now - last_rx
+                if last_rx is not None
+                else float("inf")
+            )
+
+            self.get_logger().info(
+                f"[IMAGE INGRESS] "
+                f"TOPIC={topic} | "
+                f"RX={stats['received']} | "
+                f"TX={stats['published']} | "
+                f"RX_HZ={rx_hz:.1f} | "
+                f"TX_HZ={tx_hz:.1f} | "
+                f"SILENCE={silence:.2f}s | "
+                f"ERRORS={stats['errors']}"
+            )
+
+            stats["last_report_received"] = stats["received"]
+            stats["last_report_published"] = stats["published"]
+            stats["last_report_time"] = now
+            
+    def _create_relay(
+        self,
+        message_type,
+        input_topic: str,
+        output_topic: str,
+    ) -> None:
+
+        subscription_qos = sensor_data_qos(depth=5)
+
+        if output_topic == self.depth_output_topic:
+            publisher_qos = sensor_data_qos(depth=5)
+            qos_description = "BEST_EFFORT -> BEST_EFFORT"
+        else:
+            publisher_qos = reliable_qos(depth=5)
+            qos_description = "BEST_EFFORT -> RELIABLE"
+
+        publisher = self.create_publisher(
+            message_type,
+            output_topic,
+            publisher_qos,
+        )
+
+        self._relay_stats[output_topic] = {
+            "received": 0,
+            "published": 0,
+            "errors": 0,
+            "last_received": None,
+            "last_report_received": 0,
+            "last_report_published": 0,
+            "last_report_time": time.monotonic(),
+        }
+
+        def relay_callback(msg) -> None:
+
+            stats = self._relay_stats[output_topic]
+
+            stats["received"] += 1
+            stats["last_received"] = time.monotonic()
+
+            try:
+                publisher.publish(msg)
+                stats["published"] += 1
+
+            except Exception as exc:
+                stats["errors"] += 1
+
+                self.get_logger().error(
+                    f"[IMAGE INGRESS] Publish exception "
+                    f"topic={output_topic}: {exc}",
+                    throttle_duration_sec=2.0,
+                )
+
+        subscription = self.create_subscription(
+            message_type,
+            input_topic,
+            relay_callback,
+            subscription_qos,
+        )
+
+        self._publishers.append(publisher)
+        self._subscriptions.append(subscription)
+
+        self.get_logger().info(
+            f"Image ingress relay: "
+            f"{input_topic} -> {output_topic} "
+            f"[{qos_description}]"
+        )
+        
+def main(args=None) -> None:
+    rclpy.init(args=args)
+
+    node = ImageIngressNode()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

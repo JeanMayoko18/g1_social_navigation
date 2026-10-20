@@ -1,0 +1,419 @@
+# ============================================================================
+# G1 SOCIAL SYSTEM — CENTRAL ROS CONFIGURATION
+# ============================================================================
+#
+# Single source of truth for the social-navigation ROS interfaces shared by:
+#
+#   SocialNavigationDecision
+#   CollaborationManager
+#   TrajectoryManager
+#   TrajectorySocialValidator
+#   NavigationGoalGate
+#
+# Runtime/deployment choices such as interaction mode may still be overridden
+# explicitly by launch files.
+#
+# ============================================================================
+
+
+# ============================================================================
+# SOCIAL NAVIGATION DECISION
+# ============================================================================
+
+social_navigation_decision:
+  ros__parameters:
+
+    input_topic: "/social_perception/social_zones"
+    output_topic: "/social_navigation/decision"
+
+    navigation_state_topic: "/social_navigation/navigation_state"
+    episode_state_topic: "/social_navigation/episode_state"
+
+    expected_frame: "base_footprint"
+
+    # Fixed robot-person intrusion threshold.
+    intrusion_distance_m: 1.50
+
+    # Release hysteresis:
+    # 1.50 + 0.15 = 1.65 m
+    release_margin_m: 0.15
+
+    person_absence_clear_sec: 2.0
+
+    minimum_radius_m: 0.05
+
+    conflict_confirmation_sec: 0.20
+    clear_confirmation_sec: 1.00
+
+    social_observation_timeout_sec: 1.0
+
+
+# ============================================================================
+# COLLABORATION MANAGER
+# ============================================================================
+
+collaboration_manager:
+  ros__parameters:
+
+    # ------------------------------------------------------------------------
+    # Social decision / HRI
+    # ------------------------------------------------------------------------
+
+    social_decision_topic: "/social_navigation/decision"
+
+    human_intent_topic: "/hri/human_intent"
+    dialogue_request_topic: "/hri/dialogue_request"
+
+    collaborative_decision_topic: "/social_navigation/collaborative_decision"
+
+    # ------------------------------------------------------------------------
+    # Navigation context
+    # ------------------------------------------------------------------------
+
+    navigation_state_topic: "/social_navigation/navigation_state"
+
+    navigation_goal_context_topic: "/social_navigation/navigation_goal_context"
+
+    robot_motion_state_topic: "/social_navigation/robot_motion_state"
+
+    # ------------------------------------------------------------------------
+    # Trajectory pipeline
+    # ------------------------------------------------------------------------
+
+    trajectory_generation_request_topic: "/social_navigation/trajectory_generation_request"
+
+    candidate_trajectory_topic: "/social_navigation/candidate_trajectory"
+
+    trajectory_validation_topic: "/social_navigation/trajectory_social_validation"
+
+    # ------------------------------------------------------------------------
+    # Explainability / speech
+    # ------------------------------------------------------------------------
+
+    explanation_context_topic: "/explainability/context"
+    explanation_text_topic: "/explainability/text"
+    speech_status_topic: "/explainability/speech_status"
+
+    # CollaborationManager is the authoritative producer of the integrated
+    # social ExplanationContext.
+    #
+    # # Supported integrated explanation languages: en/es/fr.
+    language: "en"
+
+    # ------------------------------------------------------------------------
+    # Policy timing
+    # ------------------------------------------------------------------------
+
+    dialogue_response_timeout_sec: 5.0
+    social_decision_max_age_sec: 1.0
+    trajectory_validation_max_age_sec: 1.0
+    conflict_persistence_sec: 2.0
+    initial_speech_start_timeout_sec: 15.0
+
+# ============================================================================
+# TRAJECTORY MANAGER
+# ============================================================================
+
+trajectory_manager:
+  ros__parameters:
+
+    generation_request_topic: "/social_navigation/trajectory_generation_request"
+
+    candidate_trajectory_topic: "/social_navigation/candidate_trajectory"
+
+    social_zones_topic: "/social_perception/social_zones"
+
+    compute_path_action: "/compute_path_to_pose"
+
+    compute_path_through_poses_action: "/compute_path_through_poses"
+
+    planner_server_wait_timeout_sec: 2.0
+    pending_request_timeout_sec: 15.0
+
+    social_zone_max_age_sec: 0.5
+
+    passage_lateral_offset_m: 1.0
+
+
+# ============================================================================
+# TRAJECTORY SOCIAL VALIDATOR
+# ============================================================================
+
+trajectory_social_validator:
+  ros__parameters:
+
+    candidate_trajectory_topic: "/social_navigation/candidate_trajectory"
+
+    social_zones_topic: "/social_perception/social_zones"
+
+    validation_topic: "/social_navigation/trajectory_social_validation"
+
+    social_observation_timeout_sec: 1.0
+
+    path_sampling_step_m: 0.05
+
+    minimum_radius_m: 0.05
+
+    tf_lookup_timeout_sec: 0.20
+
+# ============================================================================
+# NAVIGATION INTERACTION SPEECH
+# ============================================================================
+navigation_interaction_speech:
+  ros__parameters:
+    initial_pose_topic: "/initialpose"
+    goal_status_topic: "/navigate_to_pose/_action/status"
+    output_topic: "/explainability/text"
+
+# ============================================================================
+# NAVIGATION GOAL GATE
+# ============================================================================
+
+navigation_goal_gate:
+  ros__parameters:
+
+    enabled: true
+
+    # ------------------------------------------------------------------------
+    # Nav2 actions
+    # ------------------------------------------------------------------------
+
+    public_action_name: "/navigate_to_pose"
+
+    internal_action_name: "/navigate_to_pose_internal"
+
+    follow_path_action_name: "/follow_path"
+
+    # ------------------------------------------------------------------------
+    # Collaboration
+    # ------------------------------------------------------------------------
+
+    collaborative_decision_topic: "/social_navigation/collaborative_decision"
+
+    candidate_trajectory_topic: "/social_navigation/candidate_trajectory"
+
+    # ------------------------------------------------------------------------
+    # Navigation state/context
+    # ------------------------------------------------------------------------
+
+    navigation_state_topic: "/social_navigation/navigation_state"
+
+    navigation_goal_context_topic: "/social_navigation/navigation_goal_context"
+
+    # ------------------------------------------------------------------------
+    # Speech
+    # ------------------------------------------------------------------------
+
+    speech_topic: "/explainability/text"
+
+    speech_status_topic: "/explainability/speech_status"
+
+    language: "en"
+
+    # ------------------------------------------------------------------------
+    # Timing / safety
+    # ------------------------------------------------------------------------
+
+    speech_timeout_sec: 35.0
+
+    tts_discovery_timeout_sec: 2.0
+
+    navigation_server_timeout_sec: 10.0
+
+    navigation_cancel_timeout_sec: 5.0
+
+    fail_open: true
+
+    assume_idle_on_start: false
+
+# ============================================================================
+# EXPLANATION CONTEXT NODE
+# ============================================================================
+
+explanation_context_node:
+  ros__parameters:
+    supported_languages:
+      - es
+      - en
+      - fr
+    default_language: en
+
+
+
+# ============================================================================
+# EXPLANATION NODE
+# ============================================================================
+
+explanation_node:
+  ros__parameters:
+
+    # ------------------------------------------------------------------------
+    # ROS interfaces
+    # ------------------------------------------------------------------------
+
+    input_topic: "/explainability/context"
+    output_topic: "/explainability/text"
+
+    navigation_state_topic: "/social_navigation/navigation_state"
+    social_decision_topic: "/social_navigation/decision"
+    # ------------------------------------------------------------------------
+    # Supported languages
+    # ------------------------------------------------------------------------
+
+    supported_languages:
+      - es
+      - en
+      - fr
+    default_language: en
+
+    # ============================================================
+    # DETERMINISTIC EXPLANATIONS ONLY
+    # No local LLM, no online LLM, no cached generative text
+    # gemini | local| openai
+    # ============================================================
+
+    provider: "deterministic"
+    fallback_enabled: false
+    # Used only when the primary provider is local.
+    allow_online_fallback: false
+    online_fallback_provider: "gemini"
+
+    # Disabled to ensure every text comes from the deterministic provider
+    cache_enabled: false
+
+    # ------------------------------------------------------------------------
+    # Provider diagnostics
+    # ------------------------------------------------------------------------
+    # Disabled to reduce unnecessary disk writes
+    provider_diagnostics_enabled: false
+    provider_diagnostics_file: "~/g1_ws/log/explainability/provider_chain.jsonl"
+
+    # ------------------------------------------------------------------------
+    # OpenAI
+    # ------------------------------------------------------------------------
+
+    openai_model: "gpt-5-mini"
+    openai_api_key_env: "OPENAI_API_KEY"
+
+    # ------------------------------------------------------------------------
+    # Gemini
+    # ------------------------------------------------------------------------
+
+    gemini_model: "gemini-2.5-flash"
+    gemini_api_key_env: "GEMINI_API_KEY"
+
+    # ------------------------------------------------------------------------
+    # Local inference
+    # ------------------------------------------------------------------------
+
+    local_backend: "open_webui"
+    local_model: "qwen3:latest"
+
+    local_base_url: "http://127.0.0.1:3000/api"
+
+    local_api_key_env: "OPEN_WEBUI_API_KEY"
+    local_api_key: "local-no-key-required"
+
+    local_availability_timeout_sec: 2.0
+    local_generation_timeout_sec: 30.0
+
+    # ------------------------------------------------------------------------
+    # Generation
+    # ------------------------------------------------------------------------
+
+    max_output_tokens: 60
+    temperature: 0.2
+
+    navigation_state_timeout_sec: 1.0
+    maximum_context_age_sec: 30.0
+    max_speech_words: 30
+
+    # ------------------------------------------------------------------------
+    # Semantic cache
+    # ------------------------------------------------------------------------
+
+    cache_enabled: true
+    cache_file: "~/.cache/g1_robot_explainability/explanations.json"
+
+
+# ============================================================================
+# PIPER TTS
+# ============================================================================
+
+piper_tts:
+  ros__parameters:
+
+    enabled: true
+
+    # ------------------------------------------------------------------------
+    # ROS interfaces
+    # ------------------------------------------------------------------------
+
+    input_topic: "/explainability/text"
+    status_topic: "/explainability/speech_status"
+
+    navigation_state_topic: "/social_navigation/navigation_state"
+    social_decision_topic: "/social_navigation/decision"
+
+    # ------------------------------------------------------------------------
+    # Piper
+    # ------------------------------------------------------------------------
+
+    piper_executable: ""
+    piper_model_directory: ""
+
+    spanish_model: ""
+    english_model: ""
+
+    piper_backend: "auto"
+
+    speech_rate: 0.90
+    sentence_silence_sec: 0.20
+
+    synthesis_timeout_sec: 20.0
+    speech_queue_size: 10
+
+    # ------------------------------------------------------------------------
+    # Audio
+    # ------------------------------------------------------------------------
+
+    audio_player: "aplay"
+    audio_backend: "auto"
+
+    unitree_network_interface: "eth0"
+    unitree_volume: 85
+    unitree_stream_name: "g1_piper_tts"
+
+    unitree_chunk_size_bytes: 96000
+    unitree_chunk_delay_sec: 1.0
+    unitree_playback_margin_sec: 0.75
+    unitree_client_timeout_sec: 10.0
+
+    # ------------------------------------------------------------------------
+    # Social speech validation
+    # ------------------------------------------------------------------------
+
+    social_speech_max_age_sec: 10.0
+    navigation_state_timeout_sec: 1.0
+
+robot_motion_state_monitor:
+  ros__parameters:
+    cmd_vel_topic: "/cmd_vel_rlsar"
+    odom_topic: "/odom"
+
+    output_topic: "/social_navigation/robot_motion_state"
+
+    # Temporary conservative starting values.
+    # Must be calibrated from real G1 standing/navigation recordings.
+    cmd_linear_threshold: 0.03
+    cmd_angular_threshold: 0.04
+
+    odom_linear_threshold: 0.05
+    odom_angular_threshold: 0.08
+
+    stable_dwell_sec: 0.75
+
+    cmd_timeout_sec: 0.50
+    odom_timeout_sec: 0.50
+
+    publish_frequency_hz: 20.0

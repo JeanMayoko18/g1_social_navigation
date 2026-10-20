@@ -1,0 +1,68 @@
+<?xml version="1.0"?>
+
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+
+    <RecoveryNode
+      number_of_retries="3"
+      name="NavigateWithStationaryRecovery">
+
+      <PipelineSequence name="NavigateWithReplanning">
+
+        <RateController hz="1.0">
+          <RecoveryNode
+            number_of_retries="1"
+            name="ComputePathToPose">
+
+            <ComputePathToPose
+              goal="{goal}"
+              path="{path}"
+              planner_id="GridBased"/>
+
+            <ClearEntireCostmap
+              name="ClearGlobalCostmapAfterPlanningFailure"
+              service_name="global_costmap/clear_entirely_global_costmap"/>
+
+          </RecoveryNode>
+        </RateController>
+
+        <RecoveryNode
+          number_of_retries="1"
+          name="FollowPath">
+
+          <FollowPath
+            path="{path}"
+            controller_id="FollowPath"/>
+
+          <ClearEntireCostmap
+            name="ClearLocalCostmapAfterControlFailure"
+            service_name="local_costmap/clear_entirely_local_costmap"/>
+
+        </RecoveryNode>
+
+      </PipelineSequence>
+
+      <ReactiveFallback name="RecoveryFallback">
+
+        <GoalUpdated/>
+
+        <Sequence name="ClearCostmapsAndWait">
+
+          <ClearEntireCostmap
+            name="ClearLocalCostmap"
+            service_name="local_costmap/clear_entirely_local_costmap"/>
+
+          <ClearEntireCostmap
+            name="ClearGlobalCostmap"
+            service_name="global_costmap/clear_entirely_global_costmap"/>
+
+          <Wait wait_duration="2.0"/>
+
+        </Sequence>
+
+      </ReactiveFallback>
+
+    </RecoveryNode>
+
+  </BehaviorTree>
+</root>

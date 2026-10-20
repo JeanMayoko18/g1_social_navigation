@@ -1,0 +1,38 @@
+configuration:
+  id: "A3_NO_AFI"
+  family: "ablation"
+  category: "fusion_ablation"
+
+  title: "AOCF without AFI"
+
+  description: >
+    AOCF computes the MPM prediction and AMCE confidence indices,
+    but does not use them to adapt the measured temporal increment.
+
+  active_modules:
+    tmir: true
+    mpm: true
+    response_learning: true
+    amce: true
+    afi: false
+    ahc: true
+    atc: true
+    increment_limiter: true
+    stationary_hold: true
+    increment_lowpass: false
+
+  scientific_role: >
+    Isolates the contribution of adaptive fusion after inconsistency
+    detection.
+
+  primary_comparisons:
+    - "FULL"
+
+  expected_effect:
+    - "MCI remains observable"
+    - "No AFI correction is applied"
+    - "Measured increments remain dominant"
+
+  safety_level: "normal"
+  allowed_on_robot: true
+  allowed_with_nav2: true

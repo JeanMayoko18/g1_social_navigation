@@ -1,0 +1,33 @@
+configuration:
+  id: "CONFIGURATION_ID"
+  family: "baseline_or_ablation"
+  category: "category_name"
+
+  title: "Human-readable configuration title"
+
+  description: >
+    Complete description of the active and inactive AOCF modules.
+
+  active_modules:
+    tmir: true
+    mpm: null
+    response_learning: null
+    amce: null
+    afi: null
+    ahc: null
+    atc: null
+    increment_limiter: null
+    stationary_hold: null
+    increment_lowpass: false
+
+  scientific_role: >
+    Scientific question answered by this configuration.
+
+  primary_comparisons:
+    - "FULL"
+
+  expected_effect: []
+
+  safety_level: "normal"
+  allowed_on_robot: true
+  allowed_with_nav2: true

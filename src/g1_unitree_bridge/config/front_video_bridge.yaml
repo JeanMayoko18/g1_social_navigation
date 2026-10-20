@@ -1,0 +1,19 @@
+front_video_bridge:
+  ros__parameters:
+    out_topic: /camera/front/image_raw
+    camera_info_topic: /camera/front/camera_info
+    frame_id: front_camera
+
+    publish_rate: 10.0
+    #log_period_s: 2.0
+    log_period_s: 5.0
+
+    width: 1280
+    height: 720
+
+    fx: 900.0
+    fy: 900.0
+    cx: 640.0
+    cy: 360.0
+
+    max_consecutive_decode_errors: 20

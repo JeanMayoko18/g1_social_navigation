@@ -1,0 +1,9 @@
+bag_path,start_s,end_s,outcome,participant_id,manual_intervention
+/home/jean/g1_ws/experiments/restaurant_social_awareness/participant/A/S1a/participant_A_S1a_R01/navigation,46.334546089,89.765534639,nav2_succeeded,,false
+/home/jean/g1_ws/experiments/restaurant_social_awareness/participant/A/S1b/participant_A_S1b_R01/navigation,44.451884031,106.744600058,nav2_aborted,,false
+/home/jean/g1_ws/experiments/restaurant_social_awareness/participant/A/S2/participant_A_S2_R02/navigation,32.323758602,63.283236504,nav2_succeeded,,false
+/home/jean/g1_ws/experiments/restaurant_social_awareness/participant/A/S3/participant_A_S3_R01/navigation,30.837594509,83.910901546,nav2_succeeded,,false
+/home/jean/g1_ws/experiments/restaurant_social_awareness/participant/D/S1a/participant_D_S1a_R01/navigation,44.051074505,116.229075909,nav2_succeeded,,false
+/home/jean/g1_ws/experiments/restaurant_social_awareness/participant/D/S1b/participant_D_S1b_R03/navigation,73.612387657,237.673480749,final_goal_succeeded_task_link_unverified,,false
+/home/jean/g1_ws/experiments/restaurant_social_awareness/participant/D/S2/participant_D_S2_R01/navigation,73.131453753,223.997233152,final_goal_succeeded_task_link_unverified,,false
+/home/jean/g1_ws/experiments/restaurant_social_awareness/participant/D/S3/participant_D_S3_R02/navigation,43.195799112,289.921464205,final_goal_succeeded_task_link_unverified,,false

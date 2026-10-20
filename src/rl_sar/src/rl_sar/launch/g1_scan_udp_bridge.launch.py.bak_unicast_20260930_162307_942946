@@ -1,0 +1,1535 @@
+import os
+
+from ament_index_python import get_package_share_directory
+from launch import LaunchDescription
+from launch.actions import GroupAction, IncludeLaunchDescription, TimerAction
+from launch_ros.actions import Node, SetRemap
+from launch.substitutions import PathJoinSubstitution
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.conditions import IfCondition
+from launch_ros.substitutions import FindPackageShare
+from launch.actions import DeclareLaunchArgument
+from launch.actions import SetEnvironmentVariable
+from launch.actions import ExecuteProcess
+from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch_ros.parameter_descriptions import ParameterValue
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
+
+ETH0_ENV = {
+    **os.environ,
+    "ROS_DOMAIN_ID": "0",
+    "RMW_IMPLEMENTATION": "rmw_cyclonedds_cpp",
+    "ROS_LOCALHOST_ONLY": "0",
+    "CYCLONEDDS_URI": "/home/unitree/cyclonedds_ws/cyclonedds.xml",
+}
+
+WIFI_ENV = {
+    **os.environ,
+    "ROS_DOMAIN_ID": "10",
+    "RMW_IMPLEMENTATION": "rmw_cyclonedds_cpp",
+    "ROS_LOCALHOST_ONLY": "0",
+    "CYCLONEDDS_URI": "file:///home/unitree/cyclonedds_ws/cyclonedds_wifi.xml",
+}
+
+
+EKF_PARAMETERS_PATH = os.path.join(
+    get_package_share_directory("g1_nav2"),
+    "params",
+    "dog_odom_ekf.yaml",
+)
+
+def create_dog_ekf(context):
+    imu_input_topic = LaunchConfiguration(
+        "imu_input_topic"
+    ).perform(context)
+
+    imu_input_frame = LaunchConfiguration(
+        "imu_input_frame"
+    ).perform(context)
+
+    imu_adapter_output_topic = LaunchConfiguration(
+        "imu_adapter_output_topic"
+    ).perform(context)
+
+    print("=" * 70)
+    print("DOG ODOMETRY EKF")
+    print("=" * 70)
+    print(f"Raw IMU topic      : {imu_input_topic}")
+    print(f"Raw IMU frame      : {imu_input_frame}")
+    print(f"Prepared IMU topic : {imu_adapter_output_topic}")
+    print("Odometry input     : /odom_dog_calibrated")
+    print("EKF output         : /odom_dog_ekf")
+    print("EKF publishes TF   : no")
+    print("=" * 70)
+
+    ekf_node = Node(
+        package="robot_localization",
+        executable="ekf_node",
+        name="dog_odom_ekf",
+        output="screen",
+        additional_env=ETH0_ENV,
+
+        parameters=[
+            EKF_PARAMETERS_PATH,
+            {
+                "imu0": imu_adapter_output_topic,
+                "publish_tf": False,
+            },
+        ],
+
+        remappings=[
+            (
+                "odometry/filtered",
+                "/odom_dog_ekf",
+            ),
+        ],
+    )
+
+    return [ekf_node]
+
+# ============================================================
+# G1 SCAN UDP BRIDGE LAUNCH
+# ============================================================
+#
+# This launch starts the robot-side LiDAR preprocessing pipeline
+# and the UDP bridge processes.
+#
+# The raw Livox PointCloud2 topic is visible only inside the
+# Unitree DDS / eth0 environment. Sending this full cloud over
+# Wi-Fi is too heavy, so the cloud is converted locally on the
+# robot into a lightweight LaserScan.
+#
+# Architecture:
+#
+#   /utlidar/cloud_livox_mid360
+#          ↓
+#   pc2_restamper_node
+#          ↓
+#   cloud_y_flip_node
+#          ↓
+#   pointcloud_to_laserscan_node
+#          ↓
+#        /scan_robot
+#          ↓
+#   topics_udp_sender_node
+#          ↓ UDP
+#   topics_udp_receiver_node
+#          ↓
+#      /repub/scan
+#
+# ETH0_ENV nodes:
+#   - pc2_restamper_node
+#   - cloud_y_flip_node
+#   - pointcloud_to_laserscan_node
+#   - topics_udp_sender_node
+#
+# WIFI_ENV nodes:
+#   - topics_udp_receiver_node
+#   - ros2_nav_bridge_node
+#
+# Result:
+#   The external PC receives /repub/scan without receiving the
+#   heavy /utlidar/cloud_livox_mid360 PointCloud2 stream.
+# ============================================================
+def generate_launch_description():
+    bridge_odom = LaunchConfiguration("bridge_odom")
+    bridge_dog_odom = LaunchConfiguration("bridge_dog_odom")
+    bridge_mola_odom = LaunchConfiguration("bridge_mola_odom")
+    bridge_imu = LaunchConfiguration("bridge_imu")
+    bridge_scan = LaunchConfiguration("bridge_scan")
+    bridge_tf = LaunchConfiguration("bridge_tf")
+    bridge_joint_states = LaunchConfiguration("bridge_joint_states")
+    bridge_map = LaunchConfiguration("bridge_map")
+    common_time_offset_sec = LaunchConfiguration("common_time_offset_sec")
+    bridge_goal = LaunchConfiguration("bridge_goal")
+    bridge_initialpose = LaunchConfiguration("bridge_initialpose")
+    bridge_global_costmap = LaunchConfiguration("bridge_global_costmap")
+    bridge_local_costmap = LaunchConfiguration("bridge_local_costmap")
+    
+    g1_nav2_share = get_package_share_directory("g1_nav2")
+
+    # -------------------------
+    # G1 real robot low-level launch args
+    # -------------------------
+    network_interface = LaunchConfiguration("network_interface")
+    cmd_vel_topic = LaunchConfiguration("cmd_vel_topic")
+    cmd_vel_timeout_sec = LaunchConfiguration("cmd_vel_timeout_sec")
+    hw_mode = LaunchConfiguration("hw_mode")
+    g1_mode = LaunchConfiguration("g1_mode")
+    joint_states_topic = LaunchConfiguration("joint_states_topic")
+    tf_time_offset_sec = LaunchConfiguration("tf_time_offset_sec")
+    yaw_correction_rad_value = LaunchConfiguration("yaw_correction_rad")
+    odom_source = LaunchConfiguration("odom_source")
+    enable_dog_odom_calibration = LaunchConfiguration(
+        "enable_dog_odom_calibration"
+    )
+    lidar_source = LaunchConfiguration("lidar_source")
+    enable_realsense = LaunchConfiguration(
+        "enable_realsense"
+    )
+    enable_realsense_tf = LaunchConfiguration(
+        "enable_realsense_tf"
+    )
+
+    is_unitree_lidar = IfCondition(
+        PythonExpression([
+            "'", lidar_source, "' == 'unitree'"
+        ])
+    )
+
+    is_livox_lidar = IfCondition(
+        PythonExpression([
+            "'", lidar_source, "' == 'livox'"
+        ])
+    )
+
+    lidar_topic = PythonExpression([
+        "'/utlidar/cloud_livox_mid360' "
+        "if '", lidar_source, "' == 'unitree' "
+        "else '/livox/lidar'"
+    ])
+
+    imu_input_topic = LaunchConfiguration(
+    "imu_input_topic"
+    )
+
+    imu_input_frame = LaunchConfiguration(
+        "imu_input_frame"
+    )
+
+    imu_adapter_output_topic = LaunchConfiguration(
+        "imu_adapter_output_topic"
+    )
+
+    imu_topics = {
+        "livox": "/imu_livox_corrected",
+    }
+
+    use_cloud_stabilizer = LaunchConfiguration("use_cloud_stabilizer")
+    
+
+
+    # ------------------------------------------------------------
+    # 3) OFFICIAL POINTCLOUD2 -> LASERSCAN CONVERSION
+    # ------------------------------------------------------------
+    # This node is not compiled inside rl_sar.
+    # It comes from the official ROS 2 package:
+    #
+    #   pointcloud_to_laserscan
+    #
+    # It subscribes to the corrected cloud:
+    #
+    #   /cloud_fixed
+    #
+    # and publishes the lightweight 2D scan:
+    #
+    #   /scan_robot
+    #
+    # /scan_robot is then transported by topics_udp_sender_node
+    # instead of sending the full PointCloud2 over Wi-Fi. 
+    cloud_nav_stabilizer = Node(
+        package="rl_sar",
+        executable="cloud_nav_stabilizer_node",
+        name="cloud_nav_stabilizer_node",
+        output="screen",
+        additional_env=ETH0_ENV,
+
+        parameters=[{
+            "input_cloud_topic": lidar_topic,
+            "output_cloud_topic": "/cloud_nav_deskewed",
+
+            "source_frame": "livox_frame",
+            "target_frame": "base_footprint",
+
+            # Automatically select point-level deskew or cloud-level transform.
+            "point_time_mode": "auto",
+            "point_time_field": "time",
+            "point_time_unit": "nanoseconds",
+            "time_scale": 1.0e-9,
+
+            "deskew_bins": 40,
+
+            # Same exact value used by mola_odom_adapter_node.
+            "common_time_offset_sec": common_time_offset_sec,
+            "time_origin_mode": "auto_offset",
+            "offset_filter_alpha": 0.02,
+            "cloud_time_offset_sec": 0.0,
+            "tf_time_offset_sec": tf_time_offset_sec,
+
+            "output_stamp_policy": "current_ros_time",
+        }],
+    )
+
+    cloud_stamp_relay = Node(
+        package="rl_sar",
+        executable="cloud_stamp_relay_node",
+        name="cloud_stamp_relay_node",
+        output="screen",
+        additional_env=ETH0_ENV,
+
+        parameters=[{
+            "input_topic": "/utlidar/cloud_livox_mid360",
+            "output_topic": "/cloud_livox_now",
+            "log_every_n": 100,
+        }],
+    )
+
+    cloud_to_scan_in = Node(
+        package="pointcloud_to_laserscan",
+        executable="pointcloud_to_laserscan_node",
+        name="pointcloud_to_laserscan_node",
+        output="screen",
+        additional_env=ETH0_ENV,
+
+        condition=is_unitree_lidar,
+
+        remappings=[
+            ("cloud_in", "/cloud_nav_deskewed"),
+            ("scan", "/scan"),
+        ],
+
+        parameters=[{
+            # ----------------------------------------------------------
+            # Reference frame used to project the PointCloud2 into 2D.
+            #
+            # IMPORTANT:
+            # In the current G1 URDF:
+            #
+            #     base_footprint == pelvis
+            #
+            # because:
+            #
+            #     base_footprint -> pelvis
+            #     xyz = [0, 0, 0]
+            #
+            # Therefore z=0 in base_footprint is NOT the floor.
+            # It corresponds approximately to the pelvis height.
+            #
+            # Estimated pelvis height above floor:
+            #
+            #     H_pelvis ~= 0.78 m
+            #
+            # Consequently, a physical height H above the floor must be
+            # converted into base_footprint coordinates using:
+            #
+            #     z_base = H_floor - H_pelvis
+            #
+            # ----------------------------------------------------------
+            "target_frame": "base_footprint",
+
+            "transform_tolerance": 0.05,
+
+            # ----------------------------------------------------------
+            # Vertical PointCloud slice used to generate /scan
+            # ----------------------------------------------------------
+            #
+            # Approximate pelvis height above floor:
+            #     H_pelvis ~= 0.78 m
+            #
+            # Desired minimum physical obstacle height:
+            #     H_min = 0.25 m
+            #
+            # Conversion:
+            #     z_min = H_min - H_pelvis
+            #           = 0.25 - 0.78
+            #           = -0.53 m
+            #
+            # This higher minimum threshold is intentionally used to reject
+            # floor/self returns that can enter the scan during humanoid
+            # body oscillations and rotations.
+            "min_height": -0.53,
+
+            # Desired maximum physical height:
+            #     H_max = 1.50 m
+            #
+            #     z_max = 1.50 - 0.78
+            #           = +0.72 m
+            "max_height": 0.72,
+
+            # Full 360-degree scan.
+            "angle_min": -3.141592653589793,
+            "angle_max": 3.141592653589793,
+
+            # Approximately 0.5 degree angular resolution.
+            "angle_increment": 0.0087,
+
+            "scan_time": 0.10,
+
+            # Ignore points closer than 30 cm to reduce robot/self returns
+            # and retain measurements up to 30 m.
+            "range_min": 0.30,
+            "range_max": 30.0,
+
+            "use_inf": True,
+            "inf_epsilon": 1.0,
+
+            "queue_size": 5,
+        }],
+    )
+
+    cloud_to_scan = Node(
+        package="pointcloud_to_laserscan",
+        executable="pointcloud_to_laserscan_node",
+        name="pointcloud_to_laserscan",
+        output="screen",
+
+        env=ETH0_ENV,
+
+        condition=is_livox_lidar,
+
+        remappings=[
+            ("cloud_in", lidar_topic),
+            ("scan", "/scan"),
+        ],
+
+        parameters=[{
+            # ----------------------------------------------------------
+            # The current base_footprint origin is coincident with pelvis.
+            #
+            # Approximate physical pelvis height:
+            #
+            #     H_pelvis ~= 0.78 m
+            #
+            # Therefore:
+            #
+            #     z_base = H_floor - 0.78
+            #
+            # and NOT simply:
+            #
+            #     z_base = H_floor
+            #
+            # ----------------------------------------------------------
+            "target_frame": "base_footprint",
+
+            "transform_tolerance": 0.05,
+
+            # Approximate pelvis height above floor:
+            #     H_pelvis ~= 0.78 m
+            #
+            # Desired minimum physical obstacle height:
+            #     H_min = 0.25 m
+            #
+            # Conversion:
+            #     z_min = H_min - H_pelvis
+            #           = 0.25 - 0.78
+            #           = -0.53 m
+            #
+            # This higher minimum threshold is intentionally used to reject
+            # floor/self returns that can enter the scan during humanoid
+            # body oscillations and rotations.
+            "min_height": -0.53,
+
+            # Desired maximum physical height:
+            #     H_max = 1.50 m
+            #
+            #     z_max = 1.50 - 0.78
+            #           = +0.72 m
+            "max_height": 0.72,
+
+            "angle_min": -3.14159,
+            "angle_max": 3.14159,
+            "angle_increment": 0.0087,
+
+            "scan_time": 0.1,
+
+            "range_min": 0.3,
+            "range_max": 30.0,
+
+            "use_inf": True,
+        }],
+    )
+
+    def create_mola_lidar_odom_launch(context):
+        selected_lidar = LaunchConfiguration(
+            "lidar_source"
+        ).perform(context)
+
+        if selected_lidar == "unitree":
+            mola_lidar_topic = "/utlidar/cloud_livox_mid360"
+            mola_imu_topic = "/utlidar/imu_livox_mid360"
+
+        elif selected_lidar == "livox":
+            mola_lidar_topic = "/livox/lidar"
+            mola_imu_topic = "/livox/imu"
+
+        else:
+            raise RuntimeError(
+                f"Invalid lidar_source '{selected_lidar}'. "
+                "Supported values: unitree, livox"
+            )
+
+        print("=" * 70)
+        print("MOLA SENSOR SOURCE SELECTION")
+        print("=" * 70)
+        print(f"LiDAR source : {selected_lidar}")
+        print(f"MOLA LiDAR   : {mola_lidar_topic}")
+        print(f"MOLA IMU     : {mola_imu_topic}")
+        print("=" * 70)
+
+        mola_process = ExecuteProcess(
+            cmd=[
+                "bash",
+                "-lc",
+                f"""
+                source /opt/ros/foxy/setup.bash && \
+                export CMAKE_PREFIX_PATH="$HOME/cli11_install:$HOME/mrpt_install:$CMAKE_PREFIX_PATH" && \
+                export LD_LIBRARY_PATH="$HOME/mrpt_install/lib:$HOME/g1_ws/install/mola_kernel/lib:$HOME/g1_ws/install/mp2p_icp_core/lib:$HOME/g1_ws/install/mola_pose_list/lib:$HOME/g1_ws/install/mola_imu_preintegration/lib:$HOME/g1_ws/install/mola_bridge_ros2/lib:$HOME/g1_ws/install/mola_state_estimation_simple/lib:$LD_LIBRARY_PATH" && \
+                source $HOME/g1_ws/install/setup.bash && \
+
+                export ROS_DOMAIN_ID=0 && \
+                export ROS_LOCALHOST_ONLY=0 && \
+                export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp && \
+                export CYCLONEDDS_URI=/home/unitree/cyclonedds_ws/cyclonedds.xml && \
+
+                export MOLA_LIDAR_TOPIC={mola_lidar_topic} && \
+                export MOLA_IMU_TOPIC={mola_imu_topic} && \
+
+                export MOLA_USE_FIXED_LIDAR_POSE=true && \
+                export MOLA_USE_FIXED_IMU_POSE=true && \
+
+                export LIDAR_POSE_X=0.08 && \
+                export LIDAR_POSE_Y=0.0 && \
+                export LIDAR_POSE_Z=1.20 && \
+                export LIDAR_POSE_YAW=0.0 && \
+                export LIDAR_POSE_PITCH=0.0 && \
+                export LIDAR_POSE_ROLL=0.0 && \
+
+                export IMU_POSE_X=0.08 && \
+                export IMU_POSE_Y=0.0 && \
+                export IMU_POSE_Z=1.20 && \
+                export IMU_POSE_YAW=0.0 && \
+                export IMU_POSE_PITCH=0.0 && \
+                export IMU_POSE_ROLL=0.0 && \
+
+                export MOLA_LOCALIZATION_PUBLISH_TF=false && \
+                export MOLA_TF_FOOTPRINT_LINK="" && \
+
+                mola-cli $HOME/g1_ws/mola_g1_ros2.yaml
+                """
+            ],
+            output="screen",
+        )
+
+        return [mola_process]
+
+    mola_lidar_odom_launch = ExecuteProcess(
+        cmd=[
+            "bash",
+            "-lc",
+            """
+            source /opt/ros/foxy/setup.bash && \
+            export CMAKE_PREFIX_PATH="$HOME/cli11_install:$HOME/mrpt_install:$CMAKE_PREFIX_PATH" && \
+            export LD_LIBRARY_PATH="$HOME/mrpt_install/lib:$HOME/g1_ws/install/mola_kernel/lib:$HOME/g1_ws/install/mp2p_icp_core/lib:$HOME/g1_ws/install/mola_pose_list/lib:$HOME/g1_ws/install/mola_imu_preintegration/lib:$HOME/g1_ws/install/mola_bridge_ros2/lib:$HOME/g1_ws/install/mola_state_estimation_simple/lib:$LD_LIBRARY_PATH" && \
+            source $HOME/g1_ws/install/setup.bash && \
+
+            export ROS_DOMAIN_ID=0 && \
+            export ROS_LOCALHOST_ONLY=0 && \
+            export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp && \
+            export CYCLONEDDS_URI=/home/unitree/cyclonedds_ws/cyclonedds.xml && \
+
+            export MOLA_LIDAR_TOPIC=/utlidar/cloud_livox_mid360 && \
+            export MOLA_IMU_TOPIC=/utlidar/imu_livox_mid360 && \
+
+            export MOLA_USE_FIXED_LIDAR_POSE=true && \
+            export MOLA_USE_FIXED_IMU_POSE=true && \
+
+            export LIDAR_POSE_X=0.08 && \
+            export LIDAR_POSE_Y=0.0 && \
+            export LIDAR_POSE_Z=1.20 && \
+            export LIDAR_POSE_YAW=0.0 && \
+            export LIDAR_POSE_PITCH=0.0 && \
+            export LIDAR_POSE_ROLL=0.0 && \
+
+            export IMU_POSE_X=0.08 && \
+            export IMU_POSE_Y=0.0 && \
+            export IMU_POSE_Z=1.20 && \
+            export IMU_POSE_YAW=0.0 && \
+            export IMU_POSE_PITCH=0.0 && \
+            export IMU_POSE_ROLL=0.0 && \
+
+            export MOLA_LOCALIZATION_PUBLISH_TF=false && \
+            export MOLA_TF_FOOTPRINT_LINK="" && \
+
+            mola-cli $HOME/g1_ws/mola_g1_ros2.yaml
+            """
+        ],
+        output="screen",
+    )
+
+    dog_odom_adapter_node = Node(
+        package="rl_sar",
+        executable="dog_odom_adapter_node",
+        name="dog_odom_adapter_node",
+        output="screen",
+
+        # This node is the only one that must directly access
+        # the native Unitree dog_odom source through Ethernet DDS.
+        additional_env=ETH0_ENV,
+
+        parameters=[{
+            "input_topic": "/dog_odom",
+            "output_topic": "/dog_odom_2d",
+
+            "output_frame_id": "odom",
+            "output_child_frame_id": "pelvis",
+
+            "preserve_source_twist": True,
+        }],
+    )
+    
+    dog_odom_calibration_node = Node(
+        package="rl_sar",
+        executable="dog_odom_calibration_node",
+        name="dog_odom_calibration_node",
+        output="screen",
+
+        # Keep the same local robot DDS environment.
+        additional_env=ETH0_ENV,
+
+        parameters=[{
+            # ================================================================
+            # TOPICS / FRAMES
+            # ================================================================
+
+            "input_topic": "/dog_odom_2d",
+            "output_topic": "/odom_dog_calibrated",
+
+            "odom_frame": "odom",
+            "base_frame": "base_footprint",
+
+            # ================================================================
+            # GLOBAL CALIBRATION
+            # ================================================================
+
+            "enable_calibration": ParameterValue(
+                enable_dog_odom_calibration,
+                value_type=bool,
+            ),
+
+            # ================================================================
+            # LONGITUDINAL SCALING
+            # ================================================================
+            #
+            # Derived from DOG-raw measurements of:
+            #   straight_compensation_campaign_2
+            #
+            # Candidate accepted for the next campaign.
+            # Physical validation is still required.
+            # ================================================================
+
+            "enable_longitudinal_scaling": True,
+            "longitudinal_scale": 1.1649814791564732,
+
+            # ================================================================
+            # LATERAL SCALING
+            # ================================================================
+            #
+            # Disabled until independent physical lateral calibration evidence
+            # is available.
+            # ================================================================
+
+            "enable_lateral_scaling": False,
+            "lateral_scale": 1.0,
+
+            # ================================================================
+            # YAW SCALING
+            # ================================================================
+            #
+            # Disabled until DOG yaw is calibrated against independent
+            # physical ground truth.
+            # ================================================================
+
+            "enable_yaw_scaling": False,
+            "yaw_scale_ccw": 1.0,
+            "yaw_scale_cw": 1.0,
+
+            # ================================================================
+            # TWIST HANDLING
+            # ================================================================
+            #
+            # Calibration is currently defined on relative pose increments.
+            # Preserve the source odometry Twist unchanged.
+            # ================================================================
+            "scale_twist": False,
+
+
+            "command_topic": "/cmd_vel_rlsar",
+            "command_timeout_s": 0.30,
+
+            "maximum_linear_velocity_for_rotation": 0.02,
+            "minimum_angular_velocity_for_rotation": 0.03,
+            # ================================================================
+            # RAW DOG DISCONTINUITY GUARDS
+            # ================================================================
+            #
+            # Safety guards only. These are not calibration parameters.
+            # ================================================================
+
+            "maximum_translation_increment_m": 0.20,
+            "maximum_yaw_increment_rad": 0.30,
+
+            "maximum_linear_velocity_for_rotation": 0.02,
+            "minimum_angular_velocity_for_rotation": 0.03,
+        }],
+    )
+
+    def create_navigation_time_sync(context):
+        selected_lidar = LaunchConfiguration(
+            "lidar_source"
+        ).perform(context)
+
+        if selected_lidar == "livox":
+            lidar_topic = "/livox/lidar"
+            lidar_timestamp_mode = "header_stamp"
+
+        elif selected_lidar == "unitree":
+            lidar_topic = "/utlidar/cloud_livox_mid360"
+            lidar_timestamp_mode = "point_time"
+
+        else:
+            raise RuntimeError(
+                f"Invalid lidar_source '{selected_lidar}'. "
+                "Supported values: unitree, livox"
+            )
+
+        print("=" * 70)
+        print("LIDAR TIME SOURCE SELECTION")
+        print("=" * 70)
+        print(f"LiDAR source   : {selected_lidar}")
+        print(f"LiDAR topic    : {lidar_topic}")
+        print(f"Timestamp mode : {lidar_timestamp_mode}")
+        print("=" * 70)
+
+        navigation_time_sync_node = Node(
+            package="rl_sar",
+            executable="navigation_time_sync_node",
+            name="navigation_time_sync_node",
+            output="screen",
+            additional_env=ETH0_ENV,
+
+            parameters=[{
+                "lidar_topic": lidar_topic,
+
+                # Livox uses the PointCloud2 header timestamp.
+                # Unitree uses its native per-point time field.
+                "lidar_timestamp_mode": lidar_timestamp_mode,
+
+                "dog_odom_topic": "/dog_odom",
+
+                "lidar_to_nav_offset_topic":
+                    "/navigation_time/lidar_to_nav_offset",
+
+                "dog_to_lidar_offset_topic":
+                    "/navigation_time/dog_to_lidar_offset",
+
+                "dog_to_nav_offset_topic":
+                    "/navigation_time/dog_to_nav_offset",
+
+                "sync_status_topic":
+                    "/navigation_time/sync_status",
+
+                "warmup_samples": 100,
+                "history_size": 500,
+                "stable_mad_threshold_sec": 0.005,
+                "drift_detection_threshold_sec": 0.01,
+                "min_drift_samples": 100,
+                "diagnostics_frequency_hz": 1.0,
+            }],
+        )
+
+        return [navigation_time_sync_node]
+
+    dog_odom_aocf_node = Node(
+        package="rl_sar",
+        executable="dog_odom_aocf_node",
+        name="dog_odom_aocf_node",
+        output="screen",
+
+        # Keep the same local robot DDS environment.
+        additional_env=ETH0_ENV,
+
+        parameters=[{
+            # ----------------------------------------------------------
+            # Topics
+            # ----------------------------------------------------------
+            "input_odom_topic": "/dog_odom_2d",
+            "output_odom_topic": "/odom_aocf",
+
+            "cmd_vel_topic": "/cmd_vel_rlsar",
+
+            "odom_frame": "odom",
+            "base_frame": "pelvis",
+
+
+            # ----------------------------------------------------------
+            # AOCF module switches
+            #
+            # TMIR is always active because it builds the temporal
+            # body-frame increment used by every downstream module.
+            # ----------------------------------------------------------
+            "enable_mpm": True,
+            "enable_amce": True,
+            "enable_afi": False,
+            "enable_ahc": True,
+            "enable_atc": True,
+
+
+            # ----------------------------------------------------------
+            # Independent safety mechanisms
+            # ----------------------------------------------------------
+            "enable_increment_limiter": True,
+            "stationary_hold_enabled": True,
+
+
+            # ----------------------------------------------------------
+            # Output publication
+            # ----------------------------------------------------------
+            "output_frequency_hz": 45.0,
+            "max_state_age_sec": 0.5,
+
+
+            # ----------------------------------------------------------
+            # Startup
+            # ----------------------------------------------------------
+            "startup_freeze_sec": 2.0,
+            "startup_ramp_sec": 1.0,
+
+
+            # ----------------------------------------------------------
+            # TMIR source timing
+            # ----------------------------------------------------------
+            "odom_period_alpha": 0.02,
+            "odom_gap_factor": 5.0,
+            "odom_period_init_samples": 20,
+
+
+            # ----------------------------------------------------------
+            # Increment limiter
+            # ----------------------------------------------------------
+            "max_step_m": 0.12,
+            "max_step_yaw": 0.12,
+
+
+            # ----------------------------------------------------------
+            # MPM command model
+            # ----------------------------------------------------------
+            "straight_cmd_vx_min": 0.08,
+            "straight_cmd_wz_max": 0.08,
+            "turn_cmd_wz_min": 0.08,
+
+            "vx_gain_min": 0.35,
+            "vx_gain_max": 1.20,
+
+            "wz_gain_min": 0.30,
+            "wz_gain_max": 1.30,
+
+
+            # ----------------------------------------------------------
+            # AMCE
+            # ----------------------------------------------------------
+
+            "amce_alpha": 0.02,
+
+            "mci_x_min": 0.60,
+            "mci_y_min": 0.10,
+            "mci_yaw_min": 0.05,
+
+            "mci_x_sensitivity": 8.0,
+            "mci_y_sensitivity": 16.0,
+            "mci_yaw_sensitivity": 10.0,
+
+            "straight_lateral_hold_enabled": True,
+            "straight_lateral_velocity_max": 0.04,
+
+
+            # ----------------------------------------------------------
+            # AHC
+            # ----------------------------------------------------------
+            "straight_yaw_gate_wz": 0.008,
+
+
+            # ----------------------------------------------------------
+            # Stationary hold
+            # ----------------------------------------------------------
+            "stationary_cmd_vx_max": 0.02,
+            "stationary_cmd_wz_max": 0.02,
+
+            "stationary_raw_step_max": 0.003,
+            "stationary_raw_yaw_max": 0.003,
+
+
+            # ----------------------------------------------------------
+            # Command validity
+            # ----------------------------------------------------------
+            "cmd_timeout_sec": 0.35,
+
+
+            # ----------------------------------------------------------
+            # ATC
+            # ----------------------------------------------------------
+            "filter_output_vx": True,
+            "filter_output_vy": True,
+            "filter_output_wz": True,
+
+            "ema_vx_alpha": 0.20,
+            "ema_vy_alpha": 0.15,
+            "ema_wz_alpha": 0.25,
+
+            "max_output_vx": 0.25,
+            "max_output_vy": 0.08,
+            "max_output_wz": 0.35,
+        }],
+    )
+
+    mola_lidar_odom_launch_off = GroupAction([
+        SetEnvironmentVariable("ROS_DOMAIN_ID", "0"),
+        SetEnvironmentVariable(
+            "RMW_IMPLEMENTATION",
+            "rmw_cyclonedds_cpp"
+        ),
+        SetEnvironmentVariable(
+            "ROS_LOCALHOST_ONLY",
+            "0"
+        ),
+        SetEnvironmentVariable(
+            "CYCLONEDDS_URI",
+            "/home/unitree/cyclonedds_ws/cyclonedds.xml"
+        ),
+        SetRemap(src="/tf", dst="/mola/tf"),
+
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                PathJoinSubstitution([
+                    FindPackageShare("mola_lidar_odometry"),
+                    "ros2-launchs",
+                    "ros2-lidar-odometry.launch.py",
+                ])
+            ),
+            launch_arguments={
+                "lidar_topic_name": "/mola/cloud_xyz_i",
+                "lidar_topic_type": "PointCloud2",
+
+                "use_rviz": "False",
+                "use_mola_gui": "False",
+                "use_diagnostic_aggregator": "False",
+
+                "use_sim_time": "False",
+                "gnss_mode": "none",
+                "generate_simplemap": "False",
+
+                "enforce_planar_motion": "True",
+                "use_state_estimator": "True",
+                "use_imu_for_lio": "False",
+                "imu_topic_name": "/mola_unused_imu",
+
+                "mola_lo_reference_frame": "mola_map",
+                "mola_bridge_odometry_frame": "mola_odom",
+                "mola_state_estimator_reference_frame": "mola_map",
+
+                "mola_lo_pipeline": "../pipelines/lidar3d-default.yaml",
+                "mola_tf_base_link": "mola_robot_base",
+
+                "start_active": "True",
+                "start_mapping_enabled": "True",
+                "publish_localization_following_rep105": "False",
+            }.items(),
+        )
+    ])
+
+    sender = Node(
+        package="rl_sar",
+        executable="topics_udp_sender_node",
+        name="topics_udp_sender_node",
+        output="screen",
+        additional_env=ETH0_ENV,
+        parameters=[{
+            "bridge_odom": bridge_odom,
+            "bridge_dog_odom": bridge_dog_odom,
+            "bridge_mola_odom": bridge_mola_odom,
+            "bridge_imu": bridge_imu,
+            "bridge_scan": bridge_scan,
+            "bridge_tf": bridge_tf,
+            "bridge_joint_states": bridge_joint_states,
+            "bridge_map": bridge_map,
+            "bridge_global_costmap": bridge_global_costmap,
+            "bridge_local_costmap": bridge_local_costmap,
+        }],
+    )
+
+    receiver = Node(
+        package="rl_sar",
+        executable="topics_udp_receiver_node",
+        name="topics_udp_receiver_node",
+        output="screen",
+        additional_env=WIFI_ENV,
+
+        parameters=[{
+            "bridge_odom": bridge_odom,
+            "bridge_dog_odom": bridge_dog_odom,
+            "bridge_mola_odom": bridge_mola_odom,
+            "bridge_imu": bridge_imu,
+            "bridge_scan": bridge_scan,
+            "bridge_tf": bridge_tf,
+            "bridge_joint_states": bridge_joint_states,
+            "bridge_map": bridge_map,
+            "bridge_global_costmap": bridge_global_costmap,
+            "bridge_local_costmap": bridge_local_costmap,
+
+            "bridge_goal": bridge_goal,
+            "bridge_initialpose": bridge_initialpose,
+
+            "command_udp_host": "127.0.0.1",
+            "command_udp_port": 16003,
+        }],
+    )
+
+    nav_cmd_bridge = Node(
+        package="rl_sar",
+        executable="ros2_nav_bridge_node",
+        name="ros2_nav_bridge_node",
+        output="screen",
+
+        additional_env=ETH0_ENV,
+
+        parameters=[{
+            "cmd_vel_topic": "/cmd_vel_rlsar",
+            "udp_host": "127.0.0.1",
+            "udp_port": 15000,
+        }],
+    )
+
+    # -------------------------
+    # G1 real robot low-level bringup with TF
+    # -------------------------
+    lowstate_to_joint_states = Node(
+        package="rl_sar",
+        executable="lowstate_to_joint_states_node",
+        name="lowstate_to_joint_states_node",
+        output="screen",
+        additional_env=ETH0_ENV,
+        parameters=[{
+            "lowstate_topic": "/lowstate",
+            "output_topic": "/joint_states_source",
+            "base_yaml_path": "/home/unitree/g1_ws/src/rl_sar/policy/g1/base_edu23.yaml",
+            "policy_yaml_path": "/home/unitree/g1_ws/src/rl_sar/policy/g1/robomimic/locomotion/config.yaml",
+            "joint_pub_rate_hz": 20.0,
+        }],
+    )
+
+    g1_with_tf_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            PathJoinSubstitution([
+                FindPackageShare("g1_nav2"),
+                "launch",
+                "g1_with_tf.launch.py",
+            ])
+        ),
+
+        launch_arguments={
+        "joint_states_topic": joint_states_topic,
+        "mode": g1_mode,
+        "network_interface": network_interface,
+        "cmd_vel_topic": cmd_vel_topic,
+        "cmd_vel_timeout_sec": cmd_vel_timeout_sec,
+        "hw_mode": hw_mode,
+        "publish_full_body_tf": "true",
+    }.items(),
+    )
+
+    g1_with_tf_group = GroupAction([
+        SetEnvironmentVariable("ROS_DOMAIN_ID", "0"),
+        SetEnvironmentVariable(
+            "RMW_IMPLEMENTATION",
+            "rmw_cyclonedds_cpp",
+        ),
+        SetEnvironmentVariable(
+            "ROS_LOCALHOST_ONLY",
+            "0",
+        ),
+        SetEnvironmentVariable(
+            "CYCLONEDDS_URI",
+            "/home/unitree/cyclonedds_ws/cyclonedds.xml",
+        ),
+        g1_with_tf_launch,
+    ])
+
+    mola_odom_adapter_node = Node(
+        package="rl_sar",
+        executable="mola_odom_adapter_node",
+        name="mola_odom_adapter_node",
+        output="screen",
+
+        additional_env=ETH0_ENV,
+
+        parameters=[{
+            "input_topic": "/lidar_odometry/pose",
+
+            # MOLA remains available only as an independent reference.
+            "output_topic": "/odom_mola_2d",
+
+            # Do not publish the final Nav2 odometry during this test.
+            "nav_output_topic": "/odom_mola_nav",
+
+            "output_frame_id": "odom",
+            "output_child_frame_id": "pelvis",
+
+            "publish_nav_tf": False,
+
+            "nav_publish_frequency": 30.0,
+            "max_state_age_sec": 0.5,
+
+            # No longer relevant while MOLA navigation TF is disabled,
+            # but they can remain configured.
+            "tf_future_offset_sec": 0.03,
+            "max_tf_prediction_sec": 0.25,
+
+            "enable_twist_filter": True,
+            "twist_filter_alpha": 0.3,
+
+            "stationary_linear_threshold": 0.025,
+            "stationary_angular_threshold": 0.01,
+
+            "common_time_offset_sec": common_time_offset_sec,
+            # Apply clock conversion only for the Unitree LiDAR source.
+            "apply_lidar_time_offset": ParameterValue(
+                PythonExpression([
+                    "'", lidar_source, "' == 'unitree'"
+                ]),
+                value_type=bool,
+            ),
+
+            "max_dt": 0.5,
+            "max_linear_velocity": 2.0,
+            "max_angular_velocity": 2.0,
+        }],
+    )
+
+    odom_unitree_sender = ExecuteProcess(
+        cmd=[
+            "bash",
+            "-lc",
+            """
+            /home/unitree/g1_ws/install/rl_sar/lib/rl_sar/g1_odom_unitree_sender eth0
+            """
+        ],
+        output="screen",
+    )
+
+    odom_publisher = Node(
+        package="rl_sar",
+        executable="g1_odom_publisher",
+        name="g1_odom_publisher",
+        output="screen",
+        additional_env=ETH0_ENV,
+
+        parameters=[{
+            "udp_port": 17001,
+
+            "output_topic": "/odom_unitree",
+            "publish_tf": False,
+
+            "odom_frame": "odom",
+            "base_frame": "pelvis",
+
+            "zero_local_origin": True,
+        }],
+    )
+
+    def create_odom_selector(context):
+        selected_source = LaunchConfiguration(
+            "odom_source"
+        ).perform(context)
+
+        source_topics = {
+            "unitree": "/odom_unitree",
+            "dog": "/dog_odom_2d",
+            "dogc": "/odom_dog_calibrated",
+            "dogekf": "/odom_dog_ekf",
+            "aocf": "/odom_aocf",
+            "mola": "/odom_mola_nav",
+        }
+
+        if selected_source not in source_topics:
+            valid_sources = ", ".join(source_topics.keys())
+
+            raise RuntimeError(
+                f"Invalid odom_source '{selected_source}'. "
+                f"Supported values: {valid_sources}"
+            )
+
+        selected_topic = source_topics[selected_source]
+
+        print("=" * 70)
+        print("CANONICAL ODOMETRY SELECTION")
+        print("=" * 70)
+        print(f"Selected source : {selected_source}")
+        print(f"Input topic     : {selected_topic}")
+        print("Output topic    : /odom")
+        print("Published TF    : odom -> base_footprint")
+        print("=" * 70)
+
+        selector_node = Node(
+            package="rl_sar",
+            executable="odom_source_selector",
+            name="odom_source_selector",
+            output="screen",
+            additional_env=ETH0_ENV,
+
+            parameters=[{
+                "input_topic": selected_topic,
+                "output_topic": "/odom",
+
+                "odom_frame": "odom",
+                "base_frame": "base_footprint",
+
+                "publish_tf": True,
+                "preserve_input_stamp": True,
+            }],
+        )
+
+        return [selector_node]
+
+    realsense_launch_old = ExecuteProcess(
+        cmd=[
+            "env",
+            "-u",
+            "CYCLONEDDS_URI",
+            "ros2",
+            "launch",
+            "realsense2_camera",
+            "rs_launch.py",
+            "camera_namespace:=camera",
+            "camera_name:=camera",
+            "depth_module.depth_profile:=640x480x15",
+            "rgb_camera.color_profile:=640x480x15",
+            "enable_depth:=true",
+            "enable_color:=true",
+            "enable_sync:=false",
+            "align_depth.enable:=true",
+            "pointcloud.enable:=false",
+            "publish_tf:=true",
+            "log_level:=info",
+        ],
+        additional_env={
+            "ROS_DOMAIN_ID": "0",
+            "ROS_LOCALHOST_ONLY": "0",
+            "RMW_IMPLEMENTATION": "rmw_cyclonedds_cpp",
+            "CYCLONEDDS_URI": "/home/unitree/cyclonedds_ws/cyclonedds.xml",
+        },
+        output="screen",
+        condition=IfCondition(enable_realsense),
+    )
+    realsense_launch = ExecuteProcess(
+        cmd=[
+            "ros2",
+            "launch",
+            "realsense2_camera",
+            "rs_launch.py",
+            "camera_namespace:=camera",
+            "camera_name:=camera",
+            "enable_depth:=true",
+            "enable_color:=true",
+            "depth_module.depth_profile:=640x480x15",
+            "rgb_camera.color_profile:=640x480x15",
+            "enable_sync:=true",
+            "align_depth.enable:=true",
+            "pointcloud.enable:=false",
+            "publish_tf:=true",
+            "log_level:=info",
+        ],
+        additional_env={
+            "ROS_DOMAIN_ID": "0",
+            "ROS_LOCALHOST_ONLY": "0",
+            "RMW_IMPLEMENTATION": "rmw_cyclonedds_cpp",
+            "CYCLONEDDS_URI": (
+                '<CycloneDDS><Domain id="any">'
+                '<General>'
+                '<NetworkInterfaceAddress>eth0</NetworkInterfaceAddress>'
+                '<MaxMessageSize>1400B</MaxMessageSize>'
+                '<FragmentSize>1280B</FragmentSize>'
+                '</General>'
+                '<Internal>'
+                '<SocketSendBufferSize min="4MB"/>'
+                '</Internal>'
+                '</Domain></CycloneDDS>'
+            ),
+        },
+        output="screen",
+        condition=IfCondition(enable_realsense),
+    )
+
+    d435_to_camera_link_tf = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        name="d435_to_camera_link_tf",
+        output="screen",
+
+        condition=IfCondition(
+            enable_realsense_tf
+        ),
+
+        arguments=[
+            "0", "0", "0",
+            "0", "0", "0",
+            "d435_link",
+            "camera_link",
+        ],
+    )
+
+    lidar_imu_adapter_node = Node(
+        package="rl_sar",
+        executable="livox_imu_adapter_node",
+        name="imu_adapter_node",
+        output="screen",
+        additional_env=ETH0_ENV,
+
+        parameters=[{
+            "input_topic": imu_input_topic,
+            "output_topic": imu_adapter_output_topic,
+
+            "expected_frame_id": imu_input_frame,
+            "reject_unexpected_frame": True,
+
+            "angular_velocity_variance_x": 0.01,
+            "angular_velocity_variance_y": 0.01,
+            "angular_velocity_variance_z": 0.01,
+        }],
+    )
+
+    return LaunchDescription([
+
+        DeclareLaunchArgument("bridge_dog_odom", default_value="false"),
+        DeclareLaunchArgument("bridge_mola_odom", default_value="false"),
+        DeclareLaunchArgument("bridge_imu", default_value="false"),
+        DeclareLaunchArgument("bridge_scan", default_value="true"),
+        DeclareLaunchArgument("bridge_odom", default_value="true"),
+        DeclareLaunchArgument("bridge_tf", default_value="true"),
+        DeclareLaunchArgument("bridge_joint_states", default_value="true"),
+        DeclareLaunchArgument("bridge_map", default_value="true"),
+        DeclareLaunchArgument("bridge_initialpose", default_value="true"),
+        DeclareLaunchArgument("bridge_goal", default_value="true",
+            description=(
+                "Create a UDP proxy server for the NavigateToPose action. "
+                "Keep false when the real Nav2 action server is directly available."
+            ),
+        ),
+        DeclareLaunchArgument(
+            "bridge_global_costmap",
+            default_value="true"
+        ),
+
+        DeclareLaunchArgument(
+            "bridge_local_costmap",
+            default_value="true"
+        ),
+
+        DeclareLaunchArgument(
+            "joint_states_topic",
+            default_value="/joint_states_source",
+            description="Topic for joint states published by lowstate_to_joint_states_node and consumed by g1_with_tf.launch.py",
+        ),
+
+        DeclareLaunchArgument(
+            "common_time_offset_sec",
+            default_value="0.0",
+            description=(
+                "Common time offset applied to both raw LiDAR "
+                "and MOLA timestamps to convert them into ROS time"
+            ),
+        ),
+
+        DeclareLaunchArgument(
+            "g1_mode",
+            default_value="mujoco",
+            description="Mode for g1_with_tf.launch.py",
+        ),
+        DeclareLaunchArgument(
+            "network_interface",
+            default_value="eth0",
+            description="Network interface used by the real G1 robot eno1",
+        ),
+        DeclareLaunchArgument(
+            "cmd_vel_topic",
+            default_value="/cmd_vel_rlsar",
+            description="Velocity topic consumed by g1_with_tf.launch.py",
+        ),
+        DeclareLaunchArgument(
+            "cmd_vel_timeout_sec",
+            default_value="0.35",
+            description="Command timeout for low-level G1 interface",
+        ),
+        DeclareLaunchArgument(
+            "hw_mode",
+            default_value="0",
+            description="Hardware mode passed to g1_with_tf.launch.py",
+        ),
+
+        DeclareLaunchArgument(
+            "tf_time_offset_sec",
+            default_value="0.0",
+            description="TF lookup time offset in seconds. Negative values avoid future extrapolation.",
+        ),
+        DeclareLaunchArgument(
+            "yaw_correction_rad",
+            default_value="0.4", # ~1.1 deg
+            description="Yaw correction in radians for cloud stabilization. Positive rotates cloud clockwise.",
+        ),
+
+        DeclareLaunchArgument(
+            "odom_source",
+            default_value="dog",
+            description=(
+                "Canonical odometry source. "
+                "Supported values: unitree, dog, dogc, aocf, mola."
+            ),
+        ),
+
+        DeclareLaunchArgument(
+            "enable_dog_odom_calibration",
+            default_value="true",
+            description=(
+                "Enable the DOG odometry calibration applied from "
+                "/dog_odom_2d to /odom_dog_calibrated."
+            ),
+        ),
+
+        DeclareLaunchArgument(
+            "lidar_topic",
+            default_value="/utlidar/cloud_livox_mid360",
+            description=(
+                "LiDAR source "
+            ),
+        ),
+        DeclareLaunchArgument(
+            "lidar_source",
+            default_value="unitree",
+            description="unitree | livox",
+        ),
+
+        DeclareLaunchArgument(
+            "enable_realsense",
+            default_value="true",
+            description="Start the Intel RealSense D435i camera pipeline.",
+        ),
+        DeclareLaunchArgument(
+            "enable_realsense_tf",
+            default_value="true",
+            description="Start the Intel RealSense D435i camera pipeline.",
+        ),
+        
+
+        DeclareLaunchArgument(
+            "imu_input_topic",
+            default_value="/livox/imu",
+            description=(
+                "sensor_msgs/Imu topic used as EKF angular velocity input."
+            ),
+        ),
+
+        DeclareLaunchArgument(
+            "imu_input_frame",
+            default_value="livox_frame",
+            description=(
+                "Expected frame_id of the selected IMU."
+            ),
+        ),
+
+        DeclareLaunchArgument(
+            "imu_adapter_output_topic",
+            default_value="/imu_ekf_input",
+            description=(
+                "Prepared sensor_msgs/Imu topic provided to the EKF."
+            ),
+        ),
+
+        # 1) TF tree first
+        # Keep this only if robot_state_publisher does NOT publish pelvis -> torso_link
+
+        # 2) Joint states source before robot_state_publisher consumes it
+        TimerAction(period=0.1, actions=[lowstate_to_joint_states]),
+
+        # 3) robot_state_publisher using /joint_states_source
+        TimerAction(period=0.9, actions=[g1_with_tf_group]),
+
+        # 4) RealSense D435i
+        TimerAction(
+            period=1.2,
+            actions=[
+                realsense_launch,
+            ],
+        ),
+
+        # Connect the G1 mechanical camera frame to the RealSense root frame.
+        TimerAction(
+            period=1.5,
+            actions=[
+                d435_to_camera_link_tf,
+            ],
+        ),
+
+        TimerAction(
+            period=1.8,
+            actions=[
+                OpaqueFunction(
+                    function=create_navigation_time_sync
+                )
+            ],
+        ),
+        #TimerAction(period=1.7, actions=[cloud_stamp_relay]),
+
+        TimerAction(
+            period=2.2,
+            actions=[
+                OpaqueFunction(
+                    function=create_mola_lidar_odom_launch
+                )
+            ],
+        ),
+        TimerAction(period=2.4, actions=[dog_odom_adapter_node]),
+        TimerAction(period=2.6, actions=[odom_unitree_sender]),
+
+        # ) Cloud pipeline
+        TimerAction(period=2.9, actions=[cloud_nav_stabilizer],), 
+         
+    
+        # ) LaserScan generation
+        TimerAction(period=3.2, actions=[cloud_to_scan],),
+        TimerAction(period=3.5, actions=[cloud_to_scan_in],),
+        
+
+        # ) UDP bridge
+        #TimerAction(period=3.0, actions=[receiver]),
+        #TimerAction(period=3.9, actions=[sender]),
+        
+        TimerAction(period=4.0, actions=[dog_odom_calibration_node]),
+        TimerAction(period=4.3, actions=[dog_odom_aocf_node]),
+
+        TimerAction(
+            period=4.5,
+            actions=[lidar_imu_adapter_node],
+        ),
+
+        TimerAction(period=4.6, actions=[odom_publisher]),
+
+        TimerAction(
+            period=4.8,
+            actions=[
+                OpaqueFunction(
+                    function=create_dog_ekf
+                )
+            ],
+        ),
+        TimerAction(period=4.9, actions=[mola_odom_adapter_node]),
+
+        TimerAction(
+            period=5.2,
+            actions=[
+                OpaqueFunction(
+                    function=create_odom_selector
+                )
+            ],
+        ),
+
+        # ) Command bridge last 
+        TimerAction(period=5.5, actions=[nav_cmd_bridge]),
+    ])

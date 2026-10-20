@@ -1,0 +1,46 @@
+scenario:
+  id: "S5_NAV2"
+  title: "Nav2 navigation"
+
+  description: >
+    The complete navigation stack uses AOCF odometry to execute repeatable
+    navigation goals in a mapped indoor environment.
+
+  command_source: "nav2"
+  navigation_enabled: true
+
+  variants:
+    - id: "STRAIGHT"
+      description: "Single straight goal"
+      nominal_distance_m: 3.0
+
+    - id: "ONE_TURN"
+      description: "Goal requiring one 90-degree turn"
+
+    - id: "MULTI"
+      description: "Multi-segment indoor navigation route"
+
+  ground_truth:
+    method: "amcl_plus_physical_final_pose_measurement"
+
+  configurations:
+    - "B0_RAW"
+    - "B1_SAFE"
+    - "A3_NO_AFI"
+    - "A5_NO_AHC"
+    - "A6_NO_ATC"
+    - "FULL"
+
+  repetitions_preliminary: 3
+  repetitions_final: 5
+
+  primary_metrics:
+    - "navigation_success_rate"
+    - "abort_rate"
+    - "navigation_time"
+    - "final_goal_position_error"
+    - "final_goal_yaw_error"
+    - "executed_path_length"
+    - "command_oscillation"
+    - "amcl_covariance"
+    - "amcl_jump_count"

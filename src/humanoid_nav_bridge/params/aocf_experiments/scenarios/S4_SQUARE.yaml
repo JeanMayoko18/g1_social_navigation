@@ -1,0 +1,45 @@
+scenario:
+  id: "S4_SQUARE"
+  title: "Square trajectory"
+
+  description: >
+    The robot follows a closed square trajectory to evaluate cumulative
+    translation-yaw error and clockwise/counter-clockwise asymmetry.
+
+  command_source: "manual_or_waypoint_controlled"
+  navigation_enabled: false
+
+  side_length_m: 2.0
+  expected_turn_deg: 90.0
+  expected_number_of_turns: 4
+
+  variants:
+    - id: "CW"
+      direction: "clockwise"
+
+    - id: "CCW"
+      direction: "counter_clockwise"
+
+  ground_truth:
+    method: "marked_square_and_final_pose_measurement"
+    expected_closure_position_m: 0.0
+    expected_closure_yaw_deg: 0.0
+
+  configurations:
+    - "B0_RAW"
+    - "B1_SAFE"
+    - "A1_NO_RESPONSE_LEARNING"
+    - "A3_NO_AFI"
+    - "A5_NO_AHC"
+    - "FULL"
+
+  repetitions_preliminary: 3
+  repetitions_final: 5
+
+  primary_metrics:
+    - "position_closure_error"
+    - "yaw_closure_error"
+    - "cw_ccw_asymmetry"
+    - "side_length_error"
+    - "turning_error"
+    - "lateral_drift"

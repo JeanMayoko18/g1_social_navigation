@@ -1,0 +1,199 @@
+explanation_node:
+  ros__parameters:
+
+    # ========================================================================
+    # EXPLANATION PROVIDER POLICY
+    # ========================================================================
+    
+    # openai | gemini | local
+    provider: "gemini"
+
+    # Final deterministic fallback.
+    fallback_enabled: true
+
+    # Internet inference is explicit opt-in only.
+    # Internet inference is explicitly authorized as a fallback only.
+    # The online provider is used only when the primary local provider fails.
+    allow_online_fallback: true
+    #allow_online_fallback: false
+
+    # openai | gemini 
+    online_fallback_provider: "gemini"
+
+    # ========================================================================
+    # OPENAI
+    # ========================================================================
+
+    openai_model: "gpt-5-mini"
+    openai_api_key_env: "OPENAI_API_KEY"
+
+    # ========================================================================
+    # GEMINI
+    # ========================================================================
+
+    gemini_model: "gemini-2.5-flash"
+    gemini_api_key_env: "GEMINI_API_KEY"
+
+    # ========================================================================
+    # LOCAL INFERENCE
+    # ========================================================================
+
+    # llama_cpp | open_webui
+    local_backend: "open_webui"
+
+    local_model: "qwen3:latest"
+    local_base_url: "http://127.0.0.1:3000/api"
+
+    # Secret is read from the process environment.
+    local_api_key_env: "OPEN_WEBUI_API_KEY"
+
+    # Compatibility value for local servers such as llama.cpp.
+    local_api_key: "local-no-key-required"
+
+    local_availability_timeout_sec: 2.0
+    local_generation_timeout_sec: 30.0
+
+    # ========================================================================
+    # GENERATION
+    # ========================================================================
+
+    # Social explanations must remain short enough for real-time interaction.
+    max_output_tokens: 60
+    temperature: 0.2
+
+    navigation_state_timeout_sec: 1.0
+    maximum_context_age_sec: 30.0
+
+    # ========================================================================
+    # CACHE
+    # ========================================================================
+
+    cache_enabled: false
+    cache_file: "~/.cache/g1_robot_explainability/explanations.json"
+
+# ============================================================================
+# SPEECH SYNTHESIS AND AUDIO OUTPUT
+# ============================================================================
+
+piper_tts:
+  ros__parameters:
+    enabled: true
+
+    input_topic: "/explainability/text"
+    status_topic: "/explainability/speech_status"
+
+    # Empty values activate automatic path resolution:
+    # environment variable -> PATH -> ~/g1_ws/models/piper
+    piper_executable: ""
+    piper_model_directory: ""
+
+    # Empty values select models from piper_model_directory.
+    spanish_model: ""
+    english_model: ""
+
+    # auto: resolved according to the runtime configuration.
+    #   Foxy  -> standalone executable when the Python module is unavailable
+    #   Humble -> Python module when available
+    piper_backend: "auto"
+
+    # PC output.
+    audio_player: "aplay"
+
+    # auto:
+    #   Foxy  -> unitree
+    #   Humble -> aplay
+    audio_backend: "auto"
+
+    # Robot output. Volume range: 0 to 100.
+    unitree_network_interface: "eth0"
+    unitree_volume: 85
+    unitree_stream_name: "g1_piper_tts"
+
+    # 1.00 = normal
+    # 0.85 = slower
+    # 1.15 = faster
+    #speech_rate: 0.85
+    speech_rate: 0.90
+    sentence_silence_sec: 0.20
+
+    # 96000 bytes = environ 3 secondes de PCM.
+    unitree_chunk_size_bytes: 96000
+
+    # Délai entre deux envois PlayStream.
+    unitree_chunk_delay_sec: 1.0
+
+    # Temps supplémentaire avant PlayStop.
+    unitree_playback_margin_sec: 0.75
+
+    # Timeout des appels Unitree AudioClient.
+    unitree_client_timeout_sec: 10.0
+
+    # Bounded waiting queue and synthesis timeout.
+    speech_queue_size: 10
+    synthesis_timeout_sec: 20.0
+
+    # Social speech is checked before synthesis and before playback.
+    social_speech_max_age_sec: 10.0
+    navigation_state_topic: "/social_navigation/navigation_state"
+    navigation_state_timeout_sec: 1.0
+    social_decision_topic: "/social_navigation/decision"
+
+# ============================================================================
+# INITIAL POSE AND NAVIGATION ANNOUNCEMENTS
+# ============================================================================
+
+navigation_interaction_speech:
+  ros__parameters:
+    enabled: true
+
+    # Default only: overridden by the launch language argument.
+    language: "en"
+
+    enable_initial_pose_speech: true
+
+    # The launch overrides this to false when the goal gate is enabled.
+    enable_goal_speech: true
+    # Announce SUCCEEDED, ABORTED, and CANCELED terminal states.
+    enable_goal_result_speech: true
+
+    initial_pose_topic: "/initialpose"
+    goal_status_topic: "/navigate_to_pose/_action/status"
+    output_topic: "/explainability/text"
+
+    maximum_remembered_goals: 100
+
+# ============================================================================
+# NAVIGATION GOAL GATE
+# ============================================================================
+
+navigation_goal_gate:
+  ros__parameters:
+    enabled: true
+
+    public_action_name: "/navigate_to_pose"
+    internal_action_name: "/navigate_to_pose_internal"
+
+    speech_topic: "/explainability/text"
+    speech_status_topic: "/explainability/speech_status"
+
+    language: "en"
+
+    # Navigation continues when speech fails.
+    fail_open: true
+
+    # Do not wait when Piper has no subscriber.
+    bypass_when_tts_unavailable: true
+
+    # Includes time spent waiting for speech.
+    # Maximum waiting time for STARTED or COMPLETED.
+    speech_timeout_sec: 35.0
+
+    # Maximum waiting time for the internal Nav2 action server.
+    navigation_server_timeout_sec: 10.0
+
+    # Remember completed external goal UUIDs.
+    maximum_remembered_goals: 100
+
+    # True only for a complete Nav2 + gate startup with no existing goal.
+    # Use false when restarting the gate while Nav2 remains running.
+    assume_idle_on_start: true

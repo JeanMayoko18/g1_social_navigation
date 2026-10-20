@@ -1,0 +1,426 @@
+# ==============================================================================
+# G1 NAV2 GENERIC CONFIGURATION
+# Controller: Regulated Pure Pursuit
+#
+# Distribution-specific parameters are provided by:
+#   distro_overlays/nav2_foxy.yaml
+#   distro_overlays/nav2_humble.yaml
+#
+# Perception-specific parameters are provided by:
+#   perception_profiles/perception_a.yaml
+#   perception_profiles/perception_b.yaml
+#   perception_profiles/perception_c.yaml
+#   perception_profiles/perception_d.yaml
+#
+# Expected frames:
+#   map -> odom -> base_footprint
+#
+# Expected command chain:
+#   Nav2 -> /cmd_vel_nav
+#        -> velocity_smoother or direct remapping
+#        -> /cmd_vel
+#        -> twist_mux
+#        -> /cmd_vel_mux
+#        -> QoS adapter
+#        -> /cmd_vel_rlsar
+# ==============================================================================
+
+
+# ==============================================================================
+# Behavior Tree Navigator
+# ==============================================================================
+
+bt_navigator:
+  ros__parameters:
+    use_sim_time: false
+
+    global_frame: map
+    robot_base_frame: base_footprint
+    odom_topic: /odom
+
+    bt_loop_duration: 10
+
+    # Distribution-specific parameters are intentionally absent:
+    #
+    # Foxy:
+    #   default_bt_xml_filename
+    #
+    # Humble:
+    #   default_nav_to_pose_bt_xml
+    #   default_nav_through_poses_bt_xml
+    #
+    # plugin_lib_names is also provided by the distribution overlay.
+
+
+# ==============================================================================
+# Planner Server
+# ==============================================================================
+
+planner_server:
+  ros__parameters:
+    use_sim_time: false
+
+    expected_planner_frequency: 5.0
+    planner_plugins:
+      - GridBased
+
+    GridBased:
+      plugin: "nav2_navfn_planner/NavfnPlanner"
+      tolerance: 0.5
+      use_astar: false
+      allow_unknown: true
+
+
+# ==============================================================================
+# Controller Server
+# ==============================================================================
+
+controller_server:
+  ros__parameters:
+    use_sim_time: false
+
+    controller_frequency: 10.0
+
+    # Odometry velocities below these thresholds are treated as zero.
+    min_x_velocity_threshold: 0.02
+    min_y_velocity_threshold: 0.001
+    min_theta_velocity_threshold: 0.001
+
+    failure_tolerance: 0.3
+
+    # The selector parameters are intentionally absent:
+    #
+    # Foxy:
+    #   progress_checker_plugin
+    #   goal_checker_plugin
+    #
+    # Humble:
+    #   progress_checker_plugin
+    #   goal_checker_plugins
+
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      required_movement_radius: 0.05
+      movement_time_allowance: 12.0
+
+
+    controller_plugins:
+      - FollowPath
+
+    FollowPath:
+      plugin: >-
+        nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController
+
+      # ------------------------------------------------------------------------
+      # Nominal motion
+      # ------------------------------------------------------------------------
+
+      desired_linear_vel: 0.20
+
+      # ------------------------------------------------------------------------
+      # Lookahead
+      # ------------------------------------------------------------------------
+
+      lookahead_dist: 0.60
+      min_lookahead_dist: 0.40
+      max_lookahead_dist: 0.90
+      lookahead_time: 1.5
+
+      use_velocity_scaled_lookahead_dist: true
+
+      # ------------------------------------------------------------------------
+      # Goal approach
+      # ------------------------------------------------------------------------
+
+      min_approach_linear_velocity: 0.08
+      approach_velocity_scaling_dist: 0.60
+      use_approach_linear_velocity_scaling: true
+
+      # ------------------------------------------------------------------------
+      # Curvature regulation
+      # ------------------------------------------------------------------------
+
+      use_regulated_linear_velocity_scaling: true
+      regulated_linear_scaling_min_radius: 0.90
+      regulated_linear_scaling_min_speed: 0.11
+
+      # ------------------------------------------------------------------------
+      # Cost regulation
+      # ------------------------------------------------------------------------
+
+      use_cost_regulated_linear_velocity_scaling: true
+      cost_scaling_dist: 0.32
+      cost_scaling_gain: 1.0
+      inflation_cost_scaling_factor: 8.0
+
+      # ------------------------------------------------------------------------
+      # Collision checking
+      # ------------------------------------------------------------------------
+
+      use_collision_detection: true
+
+      # ------------------------------------------------------------------------
+      # Rotate to heading
+      # ------------------------------------------------------------------------
+
+      use_rotate_to_heading: true
+      rotate_to_heading_angular_vel: 0.18
+      rotate_to_heading_min_angle: 0.35
+      max_angular_accel: 0.20
+
+      allow_reversing: false
+
+      # ------------------------------------------------------------------------
+      # TF
+      # ------------------------------------------------------------------------
+
+      transform_tolerance: 0.20
+
+
+# ==============================================================================
+# Map Saver
+# ==============================================================================
+
+map_saver:
+  ros__parameters:
+    use_sim_time: false
+
+    save_map_timeout: 5.0
+    free_thresh_default: 0.25
+    occupied_thresh_default: 0.65
+    map_subscribe_transient_local: true
+
+
+# ==============================================================================
+# Global Costmap
+# ==============================================================================
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      use_sim_time: false
+
+      global_frame: map
+      robot_base_frame: base_footprint
+      transform_tolerance: 0.20
+
+      update_frequency: 1.0
+      publish_frequency: 1.0
+
+      resolution: 0.05
+      track_unknown_space: true
+      rolling_window: false
+
+      # G1 width with safety margin: approximately 0.60 m.
+      robot_radius: 0.30
+
+      plugins:
+        - static_layer
+        - obstacle_layer
+        - inflation_layer
+
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        enabled: true
+        map_subscribe_transient_local: true
+        map_topic: /map_runtime
+
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+
+        observation_sources: scan
+
+        scan:
+          topic: /scan
+          data_type: "LaserScan"
+
+          marking: true
+          clearing: true
+
+          min_obstacle_height: 0.0
+          max_obstacle_height: 2.0
+
+          obstacle_min_range: 0.0
+          obstacle_max_range: 2.5
+
+          raytrace_min_range: 0.0
+          raytrace_max_range: 3.0
+
+          observation_persistence: 0.0
+          expected_update_rate: 0.0
+
+          footprint_clearing_enabled: true
+
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        enabled: true
+
+        inflation_radius: 0.80
+        cost_scaling_factor: 2.5
+
+      always_send_full_costmap: true
+
+
+# ==============================================================================
+# Local Costmap
+# ==============================================================================
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      use_sim_time: false
+
+      global_frame: odom
+      robot_base_frame: base_footprint
+      transform_tolerance: 0.20
+
+      update_frequency: 5.0
+      publish_frequency: 2.0
+
+      rolling_window: true
+      width: 3.0
+      height: 3.0
+      resolution: 0.05
+
+      robot_radius: 0.30
+
+      # Default composition.
+      # The perception overlay replaces this list.
+      plugins:
+        - voxel_layer
+        - inflation_layer
+
+      # ------------------------------------------------------------------------
+      # LiDAR layer
+      # ------------------------------------------------------------------------
+
+      voxel_layer:
+        plugin: "nav2_costmap_2d::VoxelLayer"
+        enabled: true
+
+        publish_voxel_map: false
+        footprint_clearing_enabled: true
+
+        origin_z: 0.0
+        z_resolution: 0.05
+        z_voxels: 16
+
+        max_obstacle_height: 2.0
+        mark_threshold: 0
+
+        observation_sources: scan
+
+        scan:
+          topic: /scan
+          data_type: "LaserScan"
+
+          marking: true
+          clearing: true
+
+          min_obstacle_height: 0.0
+          max_obstacle_height: 2.0
+
+          obstacle_min_range: 0.0
+          obstacle_max_range: 2.5
+
+          raytrace_min_range: 0.0
+          raytrace_max_range: 3.0
+
+          observation_persistence: 0.0
+          expected_update_rate: 0.0
+
+          footprint_clearing_enabled: true
+
+      # ------------------------------------------------------------------------
+      # Optional D435 layer
+      #
+      # Loading is controlled by perception profiles B and D.
+      # ------------------------------------------------------------------------
+
+      camera_obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: false
+
+        observation_sources: camera_depth
+
+        camera_depth:
+          topic: /camera/obstacles
+          data_type: "PointCloud2"
+
+          marking: true
+          clearing: true
+
+          min_obstacle_height: 0.0
+          max_obstacle_height: 0.50
+
+          obstacle_min_range: 0.0
+          obstacle_max_range: 1.50
+
+          raytrace_min_range: 0.0
+          raytrace_max_range: 1.80
+
+          observation_persistence: 0.0
+          expected_update_rate: 0.0
+
+          footprint_clearing_enabled: true
+
+      # ------------------------------------------------------------------------
+      # Optional social layer
+      #
+      # Loading is controlled by perception profiles C and D.
+      # ------------------------------------------------------------------------
+
+      social_layer:
+        plugin: "g1_social_costmap::SocialLayer"
+        enabled: false
+
+        input_message_type: social_zone_array
+        social_zones_topic: /social_perception/social_zones
+
+        observation_timeout_sec: 0.80
+        transform_tolerance_sec: 0.20
+
+        include_tentative_tracks: false
+        include_lost_tracks: false
+
+        lethal_person_radius_m: 0.35
+
+        maximum_social_cost: 252
+        minimum_social_cost: 10
+        gaussian_cutoff: 3.0
+
+        subscription_qos_depth: 10
+        subscription_qos_reliability: reliable
+
+      # ------------------------------------------------------------------------
+      # Final inflation
+      # ------------------------------------------------------------------------
+
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        enabled: true
+
+        inflation_radius: 0.35
+        cost_scaling_factor: 8.0
+
+      always_send_full_costmap: true
+
+
+# ==============================================================================
+# Waypoint Follower
+# ==============================================================================
+
+waypoint_follower:
+  ros__parameters:
+    use_sim_time: false
+
+    loop_rate: 20
+    stop_on_failure: false
+    waypoint_task_executor_plugin: "wait_at_waypoint"
+
+    wait_at_waypoint:
+      plugin: "nav2_waypoint_follower::WaitAtWaypoint"
+      enabled: true
+      waypoint_pause_duration: 200
+

@@ -1,0 +1,42 @@
+# All times are seconds; all distances are metres.
+# Adjust to the actual evaluated deployment, not to desired paper outcomes.
+odom_topic: /odom
+human_topic: /social_perception/tracked_persons
+
+# Inspect trials/*/schema_samples.json after the first run.
+# Example mappings ONLY: confirm against your custom message definitions.
+human_array: persons
+human_position: position
+human_id: track_id
+human_frame: header.frame_id
+human_stamp: header.stamp
+# human_stamp must identify the LAST REAL observation of each person,
+# not the publication time of a retained/predicted track.
+human_valid_field: null
+human_valid_values: []
+# Example, if your message has an observed_now boolean:
+# human_valid_field: observed_now
+# human_valid_values: [true]
+
+base_frames: [base_footprint, base_link, pelvis]
+max_human_age_s: 0.5
+sync_tolerance_s: 0.15
+max_gap_s: 0.5
+stop_speed_mps: 0.03
+stop_yaw_rps: 0.05
+minimum_stop_s: 0.5
+max_plausible_speed_mps: 1.0
+minimum_pose_step_m: 0.0
+# Keep null until the experimental interpersonal threshold is defined.
+social_distance_m: null
+plot_step_s: 0.1
+hri_context_s: 8.0
+max_examples: 8
+
+speech_text_fields: [text, speech, utterance, transcript, data]
+speech_id_fields: [utterance_id, speech_id, request_id, context_id]
+speech_status_fields: [status, state]
+# Change to actual string/numeric codes used by your TTS messages.
+speech_started_values: [started, speaking, playing]
+speech_finished_values: [completed, finished, done]
+event_state_fields: [state, status, event, decision, action, reason]

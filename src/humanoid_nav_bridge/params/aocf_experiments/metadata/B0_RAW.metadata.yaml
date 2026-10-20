@@ -1,0 +1,36 @@
+configuration:
+  id: "B0_RAW"
+  family: "baseline"
+  category: "raw_odometry_baseline"
+
+  title: "Raw normalized odometry"
+
+  description: >
+    Local 2D representation of raw Unitree odometry without
+    command-conditioned prediction, adaptive consistency estimation,
+    adaptive fusion, heading calibration, twist calibration,
+    increment limiting or stationary hold.
+
+  active_modules:
+    tmir: true
+    mpm: false
+    response_learning: false
+    amce: false
+    afi: false
+    ahc: false
+    atc: false
+    increment_limiter: false
+    stationary_hold: false
+    increment_lowpass: false
+
+  scientific_role: >
+    Measures the behavior of the raw normalized odometry before
+    AOCF adaptation.
+
+  primary_comparisons:
+    - "FULL"
+    - "B1_SAFE"
+
+  safety_level: "restricted"
+  allowed_on_robot: true
+  allowed_with_nav2: false

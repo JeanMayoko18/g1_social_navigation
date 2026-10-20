@@ -1,0 +1,147 @@
+# ============================================================
+# real_odom_tf_bridge_cmd_gated.yaml
+# ============================================================
+# ROS 2 parameters for the "command-gated" odom/TF bridge.
+#
+# Design goal:
+#   - Humanoid RL stabilization creates tiny motions at rest.
+#   - Nav2 drift happens if we integrate raw odom all the time.
+#   - We integrate only when a command is active; otherwise we freeze pose.
+#
+# Topics:
+#   - input_odom_topic: driver odom (/dog_odom)
+#   - cmd_vel_topic   : command actually driving the robot (/cmd_vel_rlsar)
+#   - output_odom_topic: Nav2 odom (/odom)
+#
+# Frames:
+#   - odom_frame: "odom"
+#   - base_frame: robot base used by Nav2 (e.g., "robot_center")
+#
+# ============================================================
+
+real_odom_tf_bridge:
+  ros__parameters:
+
+    # ----------------------------
+    # Time / stamping policy
+    # ----------------------------
+    use_sim_time: false            # Real robot: keep false unless you have /clock
+    use_node_time: true            # Recommended: stamp outputs with node time for stable TF/Nav2
+
+    # ----------------------------
+    # Topics
+    # ----------------------------
+    input_odom_topic: /dog_odom
+    cmd_vel_topic: /cmd_vel
+    output_odom_topic: /odom
+    # gate = Nav2 intention
+    gate_cmd_vel_topic: /cmd_vel_nav
+
+    # ----------------------------
+    # Frames
+    # ----------------------------
+    odom_frame: odom
+    base_frame: base_footprint
+    body_frame: robot_center
+
+    # ----------------------------
+    # Pose source (important)
+    # ----------------------------
+    # integrate: use SE(2) integration from (vx,wz)  (recommended for humanoid RL)
+    # driver   : use driver pose (x,y,yaw from msg.pose.pose) but can freeze when idle
+    # hybrid   : x,y from driver pose, yaw from integration (useful if driver quaternion is unstable)
+    pose_source: integrate
+    #pose_source: "driver"
+
+    # ----------------------------
+    # Zero origin at startup
+    # ----------------------------
+    # If true, subtract initial (x0, y0, yaw0) so Nav2 starts near (0,0,0).
+    # Works for integrate/driver/hybrid (offset is computed from first /dog_odom pose).
+    zero_at_start: true
+
+    # ----------------------------
+    # Non-REP103 fix (YOU CONTROL THIS)
+    # ----------------------------
+    # Some drivers put yaw-rate in twist.angular.y instead of angular.z.
+    # - true  => wz_used := angular.y
+    # - false => wz_used := angular.z
+    remap_yawrate_y_to_z: True
+
+    # =========================================================
+    # Command gating (core feature)
+    # =========================================================
+    # Integrate odom only when command is active:
+    #   |cmd_vx| > cmd_eps_vx OR |cmd_wz| > cmd_eps_wz
+    # AND command is not stale (cmd_age <= cmd_timeout_sec)
+    # Gate
+    cmd_timeout_sec: 0.35        # un peu plus tolérant
+    cmd_eps_vx: 0.01
+    cmd_eps_wz: 0.01
+
+    gate_on_hold_sec: 0.05
+    gate_off_hold_sec: 0.10
+
+    # If true, when command is idle we freeze yaw too (recommended for humanoids)
+    freeze_yaw_when_idle: true
+
+    # =========================================================
+    # Turn-in-place rule (avoid arc drift during rotations)
+    # =========================================================
+    # If the command indicates a pure rotation:
+    #   |cmd_wz| > turn_wz_thresh AND |cmd_vx| < turn_vx_small
+    # then force vx_integrated = 0 (prevents left/right arc bias).
+    turn_wz_thresh: 0.25
+    turn_vx_small: 0.04
+
+    # =========================================================
+    # Filtering of measured twist (from /dog_odom)
+    # =========================================================
+    enable_filter: true
+
+    # Deadband removes tiny RL stabilization ticks
+    deadband_vx: 0.02
+    deadband_wz: 0.02
+    meas_eps_wz: 0.03
+
+    # EMA smoothing:
+    #   filtered = alpha*new + (1-alpha)*old
+    # Larger alpha -> reacts faster but less smooth
+    ema_alpha: 0.25
+
+    # =========================================================
+    # Integration safety
+    # =========================================================
+    # If dt is too large (pause, startup), skip integration to avoid teleport jumps.
+    dt_max: 0.20
+
+    # =========================================================
+    # Publishing toggles + rates
+    # =========================================================
+    publish_tf: true
+    publish_odom: true
+    publish_status: true            # publishes /odom_bridge/status (debug JSON-ish)
+    tf_rate_hz: 50.0
+    odom_rate_hz: 50.0
+    status_rate_hz: 5.0
+
+    # =========================================================
+    # Watchdog / stale detection
+    # =========================================================
+    # Warn if /dog_odom becomes stale (age > timeout_sec)
+    timeout_sec: 1.0
+
+    # =========================================================
+    # QoS knobs (real robot DDS)
+    # =========================================================
+    # RELIABLE is usually safe for odom and cmd topics if the rest of your stack is reliable.
+    # If you face DDS drops, you can try BEST_EFFORT on subscriptions.
+    # QoS (separated)
+    odom_sub_reliable: true     # /dog_odom
+    cmd_sub_reliable: false     # /cmd_vel_rlsar (published BEST_EFFORT)
+    gate_cmd_sub_reliable: true     # ✅ /cmd_vel_nav is RELIABLE
+    pub_reliable: true          # /odom output for Nav2
+    qos_depth: 10
+    gate_cmd_qos_depth: 1
+
+    

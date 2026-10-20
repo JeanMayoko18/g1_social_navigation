@@ -1,0 +1,407 @@
+# ============================================================
+# Nav2 (ROS 2 Humble) - REAL Robot - AMCL / SLAM compatible
+#
+# This configuration is tuned for RL-controlled humanoids
+# where:
+#   - small velocity commands may NOT move the physical robot
+#   - base twist from low-level odom may be noisy at rest
+#   - we must avoid "virtual progress" (TF moving but robot stuck)
+#
+# Topic chain (recommended):
+#   controller_server  -> /cmd_vel_nav     (RELIABLE)
+#   velocity_smoother  -> /cmd_vel         (RELIABLE)
+#   twist_mux          -> /cmd_vel_mux     (RELIABLE)
+#   qos_adapter        -> /cmd_vel_rlsar   (BEST_EFFORT)  -> RL controller
+#
+# Frames:
+#   map -> odom          (AMCL or slam_toolbox)
+#   odom -> base_footprint not robot_center (your bridge from /dog_odom)
+# ============================================================
+
+#bt_navigator:
+#  ros__parameters:
+#    use_sim_time: false
+#    global_frame: map
+#    robot_base_frame: base_footprint
+#    odom_topic: /odom
+#    bt_loop_duration: 10
+#    default_bt_xml_filename: "navigate_w_replanning_and_recovery.xml"
+
+bt_navigator:
+  ros__parameters:
+    use_sim_time: false
+
+    global_frame: map
+    robot_base_frame: base_footprint
+    odom_topic: /odom
+
+    bt_loop_duration: 10
+
+
+map_saver:
+  ros__parameters:
+    use_sim_time: false
+    save_map_timeout: 5.0
+    free_thresh_default: 0.25
+    occupied_thresh_default: 0.65
+    map_subscribe_transient_local: True
+
+planner_server:
+  ros__parameters:
+    expected_planner_frequency: 20.0
+    use_sim_time: false
+    planner_plugins: ["GridBased"]
+
+    GridBased:
+      plugin: "nav2_navfn_planner/NavfnPlanner"
+      tolerance: 0.5
+      use_astar: false # false: Dijkstra and true: A*
+      allow_unknown: true
+
+
+controller_server:
+  ros__parameters:
+    use_sim_time: false
+    # Local control is usually executed in odom frame
+    # (smooth, continuous, no global corrections applied here).
+    global_frame: odom
+    robot_base_frame: base_footprint
+    odom_topic: /odom
+    #odom_topic: /odometry/filtered
+    #controller_frequency: 20.0
+    controller_frequency: 10.0
+
+    failure_tolerance: 0.3
+
+    # ----------------------------------------------------------
+    # Humanoid RL "deadzone" protection:
+    # Nav2 sometimes generates tiny speeds (0.01..0.04) that
+    # do not move the real robot, but can still move the TF if
+    # you integrate odom from commands.
+    #
+    # These thresholds help Nav2 treat very small commands as zero.
+    # ----------------------------------------------------------
+    min_x_velocity_threshold: 0.02
+    min_y_velocity_threshold: 0.001
+    min_theta_velocity_threshold: 0.001
+
+
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      # Smaller radius because humanoids can move slowly / in-place adjustments
+      required_movement_radius: 0.05
+      # Give enough time to show progress (humanoids can be "sluggish")
+      movement_time_allowance: 12.0
+
+    
+    # ------------------------
+    # Local controller: DWB
+    # ------------------------
+    controller_plugins: ["FollowPath"]
+
+
+    FollowPath:
+      plugin: "dwb_core::DWBLocalPlanner"
+      debug_trajectory_details: true
+      publish_evaluation: true
+      publish_trajectories: true
+      publish_local_plan: true
+      publish_global_plan: true
+      publish_transformed_plan: true
+      
+      # ----------------------------------------------------------
+      # MIN SPEEDS (critical for humanoid deadzone):
+      # If these are too small, Nav2 outputs commands that never
+      # move the physical robot.
+      # ----------------------------------------------------------
+      # Commands below this range are poorly executed by the G1.
+
+      min_vel_x: 0.0
+      max_vel_x: 0.35
+      #max_vel_x: 0.20
+      min_vel_y: 0.0
+      max_vel_y: 0.0
+
+      min_speed_xy: 0.0
+      max_speed_xy: 0.35
+
+      min_speed_theta: 0.08
+      max_vel_theta: 0.5
+
+      # Acceleration limits should be compatible with RL controller
+
+      #acc_lim_x: 1.20
+      #decel_lim_x: -1.20
+      acc_lim_x: 0.50
+      decel_lim_x: -0.50
+
+      acc_lim_y: 0.0
+      decel_lim_y: 0.0
+
+      acc_lim_theta: 1.0
+      decel_lim_theta: -1.0
+
+      # Sampling and simulation horizon
+      vx_samples: 15
+      vy_samples: 1
+      vtheta_samples: 15
+      sim_time: 1.7
+      
+
+      transform_tolerance: 0.2     
+      linear_granularity: 0.05
+      angular_granularity: 0.025
+      #trans_stopped_velocity: 0.25
+      trans_stopped_velocity: 0.02
+
+      xy_goal_tolerance: 0.25
+
+      short_circuit_trajectory_evaluation: True
+      stateful: True
+
+      # Critics: tuned to reduce oscillations while keeping obstacle safety
+      critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
+      #critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "G1MotionFeasibility", "PathAlign", "PathDist", "GoalDist"]
+      #critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "Twirling", "PathAlign", "PathDist", "GoalDist"]
+      
+      #BaseObstacle.scale: 0.02
+      BaseObstacle.scale: 0.20
+
+      PathAlign.scale: 32.0
+      PathAlign.forward_point_distance: 0.10
+
+      GoalAlign.scale: 24.0
+      GoalAlign.forward_point_distance: 0.10
+
+      PathDist.scale: 32.0
+      GoalDist.scale: 24.0
+
+      RotateToGoal.scale: 32.0
+      RotateToGoal.slowing_factor: 5.0
+      RotateToGoal.lookahead_time: -1.0
+
+
+      G1MotionFeasibility.class: "g1_dwb_critics::MotionFeasibilityCritic"
+
+      G1MotionFeasibility.scale: 1.0
+
+      G1MotionFeasibility.minimum_effective_linear_speed: 0.11
+      G1MotionFeasibility.linear_zero_threshold: 0.01
+      G1MotionFeasibility.angular_zero_threshold: 0.02
+
+      G1MotionFeasibility.final_rotation_distance: 0.15
+      G1MotionFeasibility.path_heading_lookahead_distance: 0.30
+      G1MotionFeasibility.large_heading_error: 0.35
+
+      G1MotionFeasibility.pure_rotation_penalty: 50.0
+      G1MotionFeasibility.necessary_rotation_penalty: 5.0
+      G1MotionFeasibility.curvature_penalty: 10.0
+      G1MotionFeasibility.direction_change_penalty: 20.0
+
+      G1MotionFeasibility.reject_low_speed_translation: true
+
+
+
+
+# -----------------
+# COSTMAPS
+# -----------------
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      update_frequency: 1.0
+      publish_frequency: 1.0
+      global_frame: map
+      robot_base_frame: base_footprint
+      transform_tolerance: 0.2
+      use_sim_time: false
+      robot_radius: 0.3
+      resolution: 0.05
+      track_unknown_space: true
+      rolling_window: false
+
+
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        observation_sources: scan
+
+        scan:
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: True
+          marking: True
+          data_type: "LaserScan"
+          raytrace_max_range: 3.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 2.5
+          obstacle_min_range: 0.0
+
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: True
+        map_topic: /map
+
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        #cost_scaling_factor: 2.5
+        #inflation_radius: 0.80
+        #inflation_radius: 0.55
+        #cost_scaling_factor: 3.0
+        inflation_radius: 0.70
+        cost_scaling_factor: 2.0
+      always_send_full_costmap: True
+
+
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      update_frequency: 5.0
+      publish_frequency: 2.0
+      transform_tolerance: 0.2
+      global_frame: odom
+      robot_base_frame: base_footprint
+      use_sim_time: false
+      rolling_window: true
+      width: 3
+      height: 3
+      resolution: 0.05
+      robot_radius: 0.3
+
+      #plugins: ["obstacle_layer", "voxel_layer","camera_obstacle_layer", "social_layer", "inflation_layer"]
+      #plugins: ["obstacle_layer", "voxel_layer", "inflation_layer"]
+      plugins: [ "voxel_layer", "inflation_layer"]
+      # ----------------------------------------------------------
+      # PRIMARY OBSTACLE SOURCE — MID-360 / LaserScan
+      # ----------------------------------------------------------
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: scan
+
+        scan:
+          topic: /scan
+          data_type: "LaserScan"
+
+          marking: true
+          clearing: true
+
+          max_obstacle_height: 2.0
+          min_obstacle_height: 0.0
+
+          observation_persistence: 0.0
+          expected_update_rate: 0.0
+
+          obstacle_range: 5.0
+          raytrace_range: 8.0
+
+      # ----------------------------------------------------------
+      # SECONDARY OPTIONAL SOURCE — RealSense D435
+      # Low / close obstacles
+      # ----------------------------------------------------------
+      camera_obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+
+        # Config B: true
+        # Config A: false
+        enabled: false
+
+        observation_sources: camera_depth
+
+        camera_depth:
+          topic: /camera/obstacles
+          data_type: "PointCloud2"
+
+          marking: true
+          clearing: true
+
+          # /camera/obstacles is already filtered in base_footprint
+          # to keep only the low / close region.
+          min_obstacle_height: 0.0
+          max_obstacle_height: 0.50
+
+          obstacle_range: 1.50
+          raytrace_range: 1.80
+
+          observation_persistence: 0.0
+          expected_update_rate: 0.0
+
+          footprint_clearing_enabled: true
+
+      social_layer:
+        plugin: "g1_social_costmap::SocialLayer"
+        enabled: false
+
+        input_message_type: social_zone_array
+
+        social_zones_topic: /social_perception/social_zones
+
+        observation_timeout_sec: 0.80
+        transform_tolerance_sec: 0.20
+
+        include_tentative_tracks: false
+        include_lost_tracks: false
+
+        lethal_person_radius_m: 0.35
+
+        maximum_social_cost: 252
+        minimum_social_cost: 10
+        gaussian_cutoff: 3.0
+
+        # Apply non-lethal social costs only ahead of the robot.
+        # Physical person exclusion remains active in every direction.
+        social_cost_forward_only: true
+
+        subscription_qos_depth: 10
+        #subscription_qos_reliability: best_effort
+        subscription_qos_reliability: reliable
+
+      # ----------------------------------------------------------
+      # FINAL INFLATION
+      # ----------------------------------------------------------
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        enabled: true
+        inflation_radius: 0.55
+        cost_scaling_factor: 3.0 
+        #inflation_radius: 0.70
+        #cost_scaling_factor: 2.0  
+
+      voxel_layer:
+        plugin: "nav2_costmap_2d::VoxelLayer"
+        enabled: True
+        publish_voxel_map: False
+        footprint_clearing_enabled: true
+        origin_z: 0.0
+        z_resolution: 0.05
+        z_voxels: 16
+        max_obstacle_height: 2.0
+        mark_threshold: 0
+        observation_sources: scan
+        scan:
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: True
+          marking: True
+          data_type: "LaserScan"
+          raytrace_max_range: 3.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 2.5
+          obstacle_min_range: 0.0
+
+      always_send_full_costmap: True
+
+waypoint_follower:
+  ros__parameters:
+    use_sim_time: false
+    loop_rate: 20
+    stop_on_failure: false
+    waypoint_task_executor_plugin: "wait_at_waypoint"
+
+    wait_at_waypoint:
+      plugin: "nav2_waypoint_follower::WaitAtWaypoint"
+      enabled: True
+      waypoint_pause_duration: 200

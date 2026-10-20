@@ -1,0 +1,54 @@
+dog_odom_nav_filter:
+  ros__parameters:
+    odom_in_topic: /repub/dog_odom
+    imu_topic: /dog_imu_raw
+    cmd_vel_topic: /cmd_vel_rlsar
+    odom_out_topic: /dog_odom_filtered
+
+    use_cmd_context: true
+    publish_tf: false
+
+    odom_frame: odom
+    base_frame: base_footprint
+
+    gravity: 9.81
+    bias_calib_duration_sec: 5.0
+    bias_calib_max_samples: 1000
+
+    pert_alpha: 0.15
+    gyro_alpha: 0.20
+    gyro_bias_z: 0.0007
+
+    pert_low: 0.20
+    pert_high: 1.00
+    odom_sub_reliable: False
+    imu_sub_reliable: False
+    cmd_sub_reliable: False
+    odom_pub_reliable: False
+    qos_depth: 10
+
+
+    #g_sensitivity_k: 0.30
+    #g_sensitivity_k: 0.0
+    #g_sensitivity_k: -0.015
+    #g_sensitivity_k: -0.03
+    g_sensitivity_k: -0.020
+    max_abs_wz: 2.5
+
+    cmd_vx_walk_thresh: 0.08
+    cmd_wz_turn_thresh: 0.12
+
+    straight_motion_extra_weight: 0.20
+    turn_motion_weight_scale: 0.50
+
+    #replace_twist_wz: true
+    replace_twist_wz: false
+    debug_log_period_sec: 1.0
+    rebuild_xy: false
+    #rebuild_xy: true
+    linear_scale: 1.2545
+    hold_weight: 0.0
+    use_fixed_gyro_bias: false
+    use_signed_g_sensitivity: true
+
+    

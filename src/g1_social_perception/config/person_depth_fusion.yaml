@@ -1,0 +1,203 @@
+person_tracking:
+  ros__parameters:
+
+    input_topic: "/yolo/detections"
+    output_topic: "/yolo/detections_tracked"
+
+    person_class_id: 0
+
+    minimum_iou: 0.20
+    maximum_center_distance_px: 100.0
+
+    iou_weight: 0.70
+    center_weight: 0.30
+
+    minimum_match_score: 0.35
+
+    max_missed_frames: 10
+
+person_depth_fusion:
+  ros__parameters:
+
+    detections_topic: /yolo/detections_tracked
+    depth_topic: /camera/camera/aligned_depth_to_color/image_raw
+    camera_info_topic: /camera/camera/aligned_depth_to_color/camera_info
+    #camera_info_topic: /camera/camera/color/camera_info
+
+    person_class_id: 0
+
+    min_score: 0.50
+
+    roi_scale: 0.30
+
+    depth_scale: 0.001
+
+    min_depth_m: 0.20
+    max_depth_m: 8.0
+
+    max_sync_error_s: 0.10
+
+    depth_buffer_size: 90
+
+    log_period_s: 5.0
+  
+person_frame_transform:
+  ros__parameters:
+
+    input_topic: "/yolo/detections_3d"
+    output_topic: "/yolo/detections_3d_base"
+
+    target_frame: "base_footprint"
+
+    person_class_id: 0
+
+    tf_timestamp_policy: "latest"
+    transform_timeout_sec: 0.10
+
+    diagnostics_period_sec: 5.0
+
+
+person_3d_marker:
+  ros__parameters:
+
+    input_topic: "/yolo/detections_3d_base"
+    output_topic: "/person_3d_markers"
+    social_zones_topic: "/social_perception/social_zones"
+
+    # Native visualization is always available and does not depend
+    # on ROS4HRI.
+    marker_type: "cylinder_MZ"
+    
+    # Visualization-only floor position expressed in base_footprint.
+    # base_footprint is approximately at pelvis height, 0.78 m
+    # above the physical floor.
+    visualization_ground_z: -0.78
+
+    cylinder_height: 1.70
+    cylinder_min_diameter: 0.30
+
+    show_social_zones: true
+    social_zone_height: 0.02
+
+
+person_spatial_tracking:
+  ros__parameters:
+
+    input_topic: "/yolo/detections_3d_base"
+
+    output_topic: "/social_perception/tracked_persons"
+
+    expected_frame: "base_footprint"
+
+    person_class_id: 0
+
+    velocity_filter_alpha: 0.35
+
+    minimum_velocity_dt_sec: 0.02
+    maximum_velocity_dt_sec: 1.00
+
+    minimum_tracking_observations: 3
+
+    lost_timeout_sec: 0.75
+    delete_timeout_sec: 2.00
+
+    maximum_speed_mps: 4.0
+
+    publish_frequency_hz: 15.0
+
+social_zone_generator:
+  ros__parameters:
+
+    input_topic: "/social_perception/tracked_persons"
+    output_topic: "/social_perception/social_zones"
+
+    expected_frame: "base_footprint"
+
+    forward_only: true
+    minimum_forward_x_m: 0.10
+    maximum_distance_m: 5.00
+    forward_field_of_view_deg: 120.0
+
+    static_radius_m: 0.80
+
+    dynamic_speed_threshold_mps: 0.15
+    dynamic_base_longitudinal_radius_m: 1.50
+    dynamic_base_lateral_radius_m: 1.50
+    dynamic_speed_gain: 0.60
+    maximum_longitudinal_radius_m: 2.00
+
+    include_tentative_tracks: false
+    include_lost_tracks: false
+
+
+social_navigation_decision:
+  ros__parameters:
+
+    input_topic: "/social_perception/social_zones"
+    output_topic: "/social_navigation/decision"
+
+    expected_frame: "base_footprint"
+    
+    # Enter a conflict slightly before reaching the exact social boundary.
+    #intrusion_margin_m: 0.05
+    # Entry no longer uses this legacy margin.
+    intrusion_margin_m: 0.0
+    #release_margin_m: 0.20
+    # Release an existing conflict beyond 0.95 m.
+    release_margin_m: 0.15
+
+    # A conflict must persist before entering REPLAN.
+    conflict_confirmation_sec: 0.20
+
+    # The path must remain clear before leaving REPLAN.
+    clear_confirmation_sec: 2.00
+
+    # Explanation rate limiting only.
+    explanation_cooldown_sec: 15.0
+
+    # Allow one explanation when a previous social conflict disappears.
+    # Do not announce that the social restriction has disappeared.
+    explain_path_clear: false
+    
+
+    minimum_radius_m: 0.05
+
+    # Fixed entry distance measured from base_footprint.
+    intrusion_distance_m: 1.50
+
+
+explanation_trigger:
+  ros__parameters:
+
+    input_topic: "/social_navigation/decision"
+
+    output_topic: "/explainability/decision_request"
+
+    # Always explain entry into a social navigation conflict.
+    forward_replan: true
+
+    # May later be disabled if recovery announcements become too verbose.
+    forward_path_clear: false
+
+    drop_duplicate_decision_ids: true
+
+    decision_history_size: 100
+
+
+explanation_context:
+  ros__parameters:
+
+    input_topic: "/explainability/decision_request"
+    output_topic: "/explainability/context"
+
+    # Current default language.
+    # Later we can expose automatic language selection.
+    language: "es"
+
+    fallback_language: "es"
+
+    # Preserve useful numerical evidence for the LLM.
+    include_measurements: true
+
+    # Prefer short speech-friendly explanations.
+    brief_explanations: true

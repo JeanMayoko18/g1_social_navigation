@@ -1,0 +1,17 @@
+output_id,goal_id,transitions
+participant_A_S1a_R01_0bf4fd39,37ed3e7c154a73a03511c49ea90a3c63,46.335:executing; 89.766:succeeded
+participant_A_S1a_R01_edb32334,774361a3ed3b02a00b5320edd4328cf5,53.344:executing; 146.615:aborted
+participant_A_S1b_R01_8784e7b5,0599b1c41bbf2b03a67df6718d77012f,44.452:executing; 106.745:aborted
+participant_A_S2_R01_4047ad81,ec135d587529dc741bf666da56c2cbc8,26.156:executing; 56.218:succeeded
+participant_A_S2_R02_aa763810,615fddd60df73622fd11c8d4bb717a10,32.324:executing; 63.283:succeeded
+participant_A_S3_R01_0a21ec24,75532d8fb8933f9b9aab4a93600c7508,30.838:executing; 83.911:succeeded
+participant_D_S1a_R01_0ffaa974,3dd9fd3f3b98b0c291574b7a118b8abb,44.051:accepted; 44.051:executing; 116.229:succeeded
+participant_D_S1b_R01_74902c42,65ca527e80b856eeaaa26332e2b8aa39,41.644:accepted; 41.644:executing
+participant_D_S1b_R02_1fa271cd,ce977554546afacd7b3f09a12e1646e7,47.756:accepted; 47.756:executing
+participant_D_S1b_R03_3108810b,3faee3aaed7dddd910ee24e1d710158a,211.000:accepted; 211.000:executing; 237.673:succeeded
+participant_D_S1b_R03_3108810b,e05339fb3aadbda0b020d238762c9503,73.612:accepted; 73.613:executing
+participant_D_S2_R01_4e1e674b,51154c60a1f8e966ee468ff708fdcc66,73.131:accepted; 73.132:executing
+participant_D_S2_R01_4e1e674b,ee3894ad903457620efdf177117cb120,207.751:accepted; 207.752:executing; 223.997:succeeded
+participant_D_S3_R01_df1b80bb,697916d93a044742cfb31bb2d5124ccd,30.880:accepted; 30.881:executing
+participant_D_S3_R02_118cc4ae,7c73c8dc820ac8e2486d045f24021063,258.335:accepted; 258.335:executing; 289.921:succeeded
+participant_D_S3_R02_118cc4ae,d2198b0a8cb7f4ebdb62eeee345bb8c9,43.196:accepted; 43.196:executing

@@ -1,0 +1,141 @@
+dog_odom_normalizer:
+  ros__parameters:
+
+    # ==========================================================
+    # ROS interfaces and frames
+    # ==========================================================
+    input_odom_topic: "/repub/dog_odom"
+    output_odom_topic: "/odom"
+    cmd_vel_topic: "/cmd_vel_rlsar"
+
+    odom_frame: "odom"
+    base_frame: "base_footprint"
+
+    publish_tf: true
+
+    # ==========================================================
+    # Time, QoS and planar projection
+    # ==========================================================
+    use_node_time: true
+
+    sub_reliable: false
+    cmd_reliable: true
+    pub_reliable: true
+    qos_depth: 1
+
+    tf_reliable: true
+    tf_pub_depth: 1
+
+    force_2d: true
+    zero_z: true
+    zero_roll_pitch: true
+    remap_yawrate_y_to_z: false
+
+    cmd_timeout_sec: 0.35
+
+    #debug_publish_rate_hz: 5.0
+    enable_debug_publish: true
+    debug_publish_rate_hz: 1.0
+
+    # ==========================================================
+    # Startup calibration
+    #
+    # Replace these values by the resolved launch values if the
+    # current launch variables differ.
+    # ==========================================================
+    startup_freeze_sec: 5.0
+    startup_ramp_sec: 2.0
+
+    # ==========================================================
+    # MPM — Motion Prediction Model
+    # ==========================================================
+    response_learning_alpha: 0.02
+
+    initial_vx_gain: 0.60
+    initial_wz_gain: 0.60
+
+    straight_cmd_vx_min: 0.08
+    straight_cmd_wz_max: 0.03
+    turn_cmd_wz_min: 0.08
+
+    vx_gain_min: 0.35
+    vx_gain_max: 1.20
+
+    wz_gain_min: 0.30
+    wz_gain_max: 1.30
+
+    max_expected_vx_margin: 0.06
+    max_expected_vy: 0.025
+    max_expected_wz_margin: 0.08
+    max_expected_wz_straight: 0.008
+
+    # ==========================================================
+    # AMCE — Adaptive Motion Consistency Estimator
+    # ==========================================================
+    amce_alpha: 0.02
+
+    mci_x_min: 0.45
+    mci_y_min: 0.10
+    mci_yaw_min: 0.01
+
+    mci_x_sensitivity: 8.0
+    mci_y_sensitivity: 16.0
+    mci_yaw_sensitivity: 25.0
+
+    # ==========================================================
+    # Framework-level increment limiter
+    # ==========================================================
+    max_step_m: 0.35
+    max_step_yaw: 0.35
+
+    # ==========================================================
+    # Stationary hold
+    # ==========================================================
+    stationary_cmd_vx_max: 0.02
+    stationary_cmd_wz_max: 0.02
+
+    stationary_raw_step_max: 0.003
+    stationary_raw_yaw_max: 0.003
+
+    stationary_zero_twist: true
+
+    # ==========================================================
+    # Optional increment attenuation
+    #
+    # Keep disabled during the principal campaign.
+    # ==========================================================
+    enable_lowpass: false
+    position_alpha: 0.70
+    yaw_alpha: 0.70
+
+    # ==========================================================
+    # AHC — Adaptive Heading Calibration
+    # ==========================================================
+    yaw_correction_mode: "raw_increment"
+
+    enable_straight_yaw_gate: true
+    straight_yaw_gate_wz: 0.005
+
+    yaw_observation_gain: 0.02
+    max_yaw_observation_correction: 0.001
+
+    # ==========================================================
+    # ATC — Adaptive Twist Calibration
+    # ==========================================================
+    compute_twist_from_corrected_pose: true
+
+    max_vx: 0.80
+    max_vy: 0.40
+    max_wz: 1.20
+
+    filter_output_vx: true
+    ema_vx_alpha: 0.20
+    max_output_vx: 0.22
+
+    filter_output_vy: true
+    ema_vy_alpha: 0.15
+    max_output_vy: 0.06
+
+    filter_output_wz: true
+    ema_wz_alpha: 0.25
+    max_output_wz: 0.35

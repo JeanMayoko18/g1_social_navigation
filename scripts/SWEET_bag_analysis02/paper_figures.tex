@@ -1,0 +1,39 @@
+% Copy selected generated PDF figures to the figures/ directory in Overleaf.
+% Rename them to the filenames below. Requires graphicx, booktabs, tabularx.
+% These blocks contain no invented results or synthetic images.
+
+\begin{figure}[t]
+\centering
+\IfFileExists{figures/corridor_setup.pdf}{%
+  \includegraphics[width=\columnwidth]{figures/corridor_setup.pdf}%
+}{\fbox{\parbox{0.9\columnwidth}{Insert the real corridor photograph and annotated layout.}}}
+\caption{Corridor test environment used to reproduce service-route encounters. Mark the robot start, navigation goal, and human positions. The target application is restaurant service; the experiments were conducted in a corridor.}
+\label{fig:experimental_setup}
+\end{figure}
+
+\begin{figure*}[t]
+\centering
+\IfFileExists{figures/trajectory_A.pdf}{\includegraphics[width=.48\textwidth]{figures/trajectory_A.pdf}}{}
+\IfFileExists{figures/trajectory_D.pdf}{\includegraphics[width=.48\textwidth]{figures/trajectory_D.pdf}}{}
+\caption{Estimated robot trajectories for the selected reference and enriched trials. Specify trial IDs, scenario, coordinate frames, and selection criterion. Each panel uses its recorded frame; compare geometry only after confirming common initial conditions and frame alignment.}
+\label{fig:trajectory_comparison}
+\end{figure*}
+
+\begin{figure*}[t]
+\centering
+\IfFileExists{figures/comparison.pdf}{\includegraphics[width=\textwidth]{figures/comparison.pdf}}{}
+\caption{Descriptive navigation outcomes by scenario and configuration. Points represent trials and horizontal segments denote medians. Report analysis-window definitions, sample counts, and recording coverage.}
+\label{fig:quantitative_navigation}
+\end{figure*}
+
+\begin{figure*}[t]
+\centering
+\IfFileExists{figures/motion_distance.pdf}{\includegraphics[width=.58\textwidth]{figures/motion_distance.pdf}}{}
+\IfFileExists{figures/event_timeline.pdf}{\includegraphics[width=.40\textwidth]{figures/event_timeline.pdf}}{}
+\caption{Measured motion, estimated interpersonal distances, and recorded interaction events from one selected encounter. Missing observations are not interpreted as clearance. Identify the trial and associate message markers with the verbatim excerpts.}
+\label{fig:interaction_example}
+\end{figure*}
+
+% After review, include generated tables with:
+% \input{results/navigation_summary}
+% \input{results/hri_examples}

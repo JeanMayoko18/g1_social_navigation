@@ -1,0 +1,423 @@
+# ==============================================================================
+# RVIZ CONFIGURATION
+# File:
+#   g1_social_perception/rviz/person_depth_fusion.template.rviz
+#
+# Purpose:
+#   Visualize the RGB stream, aligned depth stream, 3D person markers,
+#   and TF tree for the G1 social perception pipeline.
+#
+# Current perception chain:
+#
+#   RealSense RGB
+#       /camera/camera/color/image_raw
+#                 |
+#                 v
+#              YOLOv11
+#                 |
+#                 v
+#          /yolo/detections
+#                 |
+#                 +-----------------------------+
+#                 |                             |
+#                 v                             v
+#      person_depth_fusion       aligned RealSense depth
+#                 ^             /camera/camera/aligned_depth_to_color/image_raw
+#                 |
+#      /camera/camera/aligned_depth_to_color/camera_info
+#                 |
+#                 v
+#          /yolo/detections_3d
+#                 |
+#                 v
+#          /person_3d_markers
+#
+# Important QoS:
+#   RealSense image topics:
+#       Reliability = Best Effort
+#       Durability  = Volatile
+#       History     = Keep Last
+#
+#   MarkerArray:
+#       Currently expected as Reliable.
+#
+# Fixed frame:
+#   camera_color_optical_frame
+# ==============================================================================
+
+
+Panels:
+
+  # ============================================================================
+  # DISPLAY TREE
+  #
+  # Main RViz panel used to enable/disable individual visualizations.
+  # ============================================================================
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+        - /Grid1
+        - /RGB Image1
+        - /Aligned Depth1
+        - /Person 3D Markers1
+        - /TF1
+      Splitter Ratio: 0.5
+    Tree Height: 700
+
+  # ============================================================================
+  # SELECTION PANEL
+  # ============================================================================
+  - Class: rviz_common/Selection
+    Name: Selection
+
+  # ============================================================================
+  # TOOL PROPERTIES PANEL
+  # ============================================================================
+  - Class: rviz_common/Tool Properties
+    Name: Tool Properties
+    Expanded:
+      - /2D Goal Pose1
+      - /Publish Point1
+
+
+Visualization Manager:
+  Class: ""
+
+  Displays:
+
+    # ==========================================================================
+    # GLOBAL GRID
+    #
+    # Provides a simple spatial reference around the camera coordinate frame.
+    #
+    # Since the current Fixed Frame is camera_color_optical_frame, the grid is
+    # primarily useful as a local reference during the RGB-D fusion validation.
+    # ==========================================================================
+    - Alpha: 0.5
+      Cell Size: 0.5
+      Class: rviz_default_plugins/Grid
+      Color: 160; 160; 164
+      Enabled: true
+
+      Line Style:
+        Line Width: 0.03
+        Value: Lines
+
+      Name: Grid
+      Normal Cell Count: 0
+
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+
+      Plane: XY
+      Plane Cell Count: 20
+      Reference Frame: <Fixed Frame>
+      Value: true
+
+
+    # ==========================================================================
+    # RGB CAMERA IMAGE
+    #
+    # Topic and QoS are injected dynamically by g1_qos_manager.
+    #
+    # In distributed perception this normally resolves to:
+    #
+    #   /perception/ingress/color/image_raw
+    #
+    # The ingress may intentionally expose a RELIABLE local contract for
+    # consumers such as YOLO even when the hardware-facing RealSense stream is
+    # BEST_EFFORT.
+    # ==========================================================================
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Name: RGB Image
+
+      Normalize Range: true
+
+      Topic:
+        Depth: __RGB_DEPTH__
+        Durability Policy: __RGB_DURABILITY__
+        History Policy: __RGB_HISTORY__
+        Reliability Policy: __RGB_RELIABILITY__
+        Value: __RGB_TOPIC__
+
+      Value: true
+
+
+    # ==========================================================================
+    # DEPTH IMAGE ALIGNED TO RGB
+    #
+    # Topic and QoS are injected dynamically by g1_qos_manager.
+    #
+    # In distributed perception this normally resolves to:
+    #
+    #   /perception/ingress/aligned_depth/image_raw
+    #
+    # Depth is a real-time sensor stream and may therefore resolve to
+    # BEST_EFFORT when that is the QoS exposed by ImageIngress.
+    #
+    # Encoding:
+    #   16UC1
+    #
+    # Resolution:
+    #   640 x 480
+    # ==========================================================================
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Name: Aligned Depth
+
+      Max Value: 5000
+      Min Value: 0
+
+      Normalize Range: true
+
+      Topic:
+        Depth: __DEPTH_DEPTH__
+        Durability Policy: __DEPTH_DURABILITY__
+        History Policy: __DEPTH_HISTORY__
+        Reliability Policy: __DEPTH_RELIABILITY__
+        Value: __DEPTH_TOPIC__
+
+      Value: true
+
+    # ==========================================================================
+    # YOLO ANNOTATED IMAGE
+    #
+    # QoS is injected dynamically by g1_qos_manager.
+    # Current publisher:
+    #   /yolo/dbg_image
+    #   Reliability: RELIABLE
+    #   Durability : VOLATILE
+    # ==========================================================================
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Name: YOLO Image
+      Normalize Range: true
+
+      Topic:
+        Depth: __YOLO_DEPTH__
+        Durability Policy: __YOLO_DURABILITY__
+        History Policy: __YOLO_HISTORY__
+        Reliability Policy: __YOLO_RELIABILITY__
+        Value: __YOLO_TOPIC__
+
+      Value: true
+
+    # ==========================================================================
+    # PERSON 3D MARKERS
+    #
+    # Expected input:
+    #   /person_3d_markers
+    #
+    # Message type:
+    #   visualization_msgs/msg/MarkerArray
+    #
+    # This display will represent people detected by YOLO after RGB + depth
+    # fusion.
+    #
+    # The marker publisher is expected to use RELIABLE QoS because marker
+    # messages are lightweight compared with image streams and dropping them
+    # unnecessarily is not desirable.
+    #
+    # If the marker publisher is later changed to BEST_EFFORT, this RViz QoS
+    # must be changed accordingly.
+    # ==========================================================================
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Person 3D Markers
+
+      Namespaces:
+        {}
+
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /person_3d_markers
+
+      Value: true
+
+
+    # ==========================================================================
+    # TF TREE
+    #
+    # Displays all transforms currently available to RViz.
+    #
+    # During the current RGB-D validation phase, the most important frame is:
+    #
+    #   camera_color_optical_frame
+    #
+    # Later, once the perception output is transformed into the robot/navigation
+    # coordinate system, this display will also help verify transforms toward:
+    #
+    #   base_footprint
+    #   odom
+    #   map
+    # ==========================================================================
+    - Class: rviz_default_plugins/TF
+      Enabled: true
+
+      Frame Timeout: 15
+
+      Frames:
+        All Enabled: true
+
+      Marker Scale: 0.5
+      Name: TF
+
+      Show Arrows: true
+      Show Axes: true
+      Show Names: true
+
+      Tree:
+        {}
+
+      Update Interval: 0
+      Value: true
+
+__ROS4HRI_DISPLAYS__
+
+  # ============================================================================
+  # VISUALIZATION MANAGER STATE
+  # ============================================================================
+  Enabled: true
+
+
+  # ============================================================================
+  # GLOBAL OPTIONS
+  #
+  # Current person 3D positions are expressed in camera_color_optical_frame.
+  #
+  # Therefore this frame is used as the fixed frame while validating:
+  #
+  #   YOLO detection
+  #       +
+  #   aligned depth
+  #       +
+  #   2D -> 3D projection
+  #
+  # Later, when the detections are transformed into base/map coordinates for
+  # Nav2 social-awareness integration, this can be changed to "map".
+  # ============================================================================
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: __FIXED_FRAME__
+    Frame Rate: 30
+
+
+  Name: root
+
+
+  # ============================================================================
+  # RVIZ INTERACTION TOOLS
+  # ============================================================================
+  Tools:
+
+    # Allows interaction with interactive RViz objects.
+    - Class: rviz_default_plugins/Interact
+
+    # Move the RViz camera.
+    - Class: rviz_default_plugins/MoveCamera
+
+    # Select displayed objects.
+    - Class: rviz_default_plugins/Select
+
+    # Focus the camera on a selected object.
+    - Class: rviz_default_plugins/FocusCamera
+
+    # Distance measurement tool.
+    - Class: rviz_default_plugins/Measure
+
+    # Standard ROS 2 initial pose tool.
+    #
+    # Not required by person_depth_fusion itself but useful when this RViz
+    # configuration is later combined with Nav2.
+    - Class: rviz_default_plugins/SetInitialPose
+      Topic:
+        Value: /initialpose
+
+    # Standard goal tool.
+    #
+    # Kept for later integration with Nav2.
+    - Class: rviz_default_plugins/SetGoal
+      Topic:
+        Value: /goal_pose
+
+    # Publish a PointStamped interactively from RViz.
+    - Class: rviz_default_plugins/PublishPoint
+      Single click: true
+      Topic:
+        Value: /clicked_point
+
+
+
+  # ============================================================================
+  # TRANSFORMER
+  # ============================================================================
+  Transformation:
+    Current:
+      Class: rviz_default_plugins/TF
+
+  Value: true
+
+
+# ==============================================================================
+# CAMERA VIEW
+#
+# Orbit view is convenient for visualizing the future 3D person markers around
+# the camera reference frame.
+# ==============================================================================
+Views:
+
+  Current:
+    Class: rviz_default_plugins/Orbit
+
+    # Initial viewing distance from the focal point.
+    Distance: 4
+
+    Enable Stereo Rendering:
+      Stereo Eye Separation: 0.06
+      Stereo Focal Distance: 1
+      Swap Stereo Eyes: false
+      Value: false
+
+    # Initial camera focal point.
+    Focal Point:
+      X: 0
+      Y: 0
+      Z: 1
+
+    Focal Shape Fixed Size: true
+    Focal Shape Size: 0.05
+
+    Invert Z Axis: false
+
+    Name: Current View
+
+    Near Clip Distance: 0.01
+
+    # Initial viewing orientation.
+    Pitch: 0.35
+
+    Target Frame: <Fixed Frame>
+
+    Value: Orbit
+
+    Yaw: 3.14
+
+
+# ==============================================================================
+# RVIZ WINDOW GEOMETRY
+# ==============================================================================
+Window Geometry:
+
+  Height: 900
+  Width: 1600
+
+  X: 100
+  Y: 100

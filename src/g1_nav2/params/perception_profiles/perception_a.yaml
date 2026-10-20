@@ -1,0 +1,12 @@
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      plugins:
+        - voxel_layer
+        - inflation_layer
+
+      camera_obstacle_layer:
+        enabled: false
+
+      social_layer:
+        enabled: false

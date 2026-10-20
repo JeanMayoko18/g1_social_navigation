@@ -1,0 +1,116 @@
+<?xml version="1.0"?>
+
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+
+    <!--
+      Recovery strategy:
+
+        First failure:
+          clear local costmap
+          clear global costmap
+          wait
+          replan
+
+        Repeated failure:
+          perform a limited spin
+          replan
+    -->
+    <RecoveryNode
+      number_of_retries="4"
+      name="NavigateWithProgressiveRecovery">
+
+      <!-- ============================================================= -->
+      <!-- MAIN NAVIGATION PIPELINE                                      -->
+      <!-- ============================================================= -->
+
+      <PipelineSequence name="NavigateWithReplanning">
+
+        <!-- Recompute the global path periodically. -->
+        <RateController hz="1.0">
+
+          <RecoveryNode
+            number_of_retries="1"
+            name="ComputePathToPose">
+
+            <ComputePathToPose
+              goal="{goal}"
+              path="{path}"
+              planner_id="GridBased"/>
+
+            <!-- Context-specific recovery after a planning failure. -->
+            <ClearEntireCostmap
+              name="ClearGlobalCostmapAfterPlanningFailure"
+              service_name="global_costmap/clear_entirely_global_costmap"/>
+
+          </RecoveryNode>
+
+        </RateController>
+
+
+        <!-- Follow the current global path. -->
+        <RecoveryNode
+          number_of_retries="1"
+          name="FollowPath">
+
+          <FollowPath
+            path="{path}"
+            controller_id="FollowPath"/>
+
+          <!-- Context-specific recovery after a controller failure. -->
+          <ClearEntireCostmap
+            name="ClearLocalCostmapAfterControlFailure"
+            service_name="local_costmap/clear_entirely_local_costmap"/>
+
+        </RecoveryNode>
+
+      </PipelineSequence>
+
+
+      <!-- ============================================================= -->
+      <!-- SYSTEM-LEVEL RECOVERY                                         -->
+      <!-- ============================================================= -->
+
+      <ReactiveFallback name="RecoveryFallback">
+
+        <!-- Cancel the current recovery when a new goal is received. -->
+        <GoalUpdated/>
+
+
+        <!--
+          RoundRobin selects the next recovery action after each repeated
+          navigation failure.
+        -->
+        <RoundRobin name="ProgressiveRecoveryActions">
+
+          <!-- First system-level recovery: no physical motion. -->
+          <Sequence name="ClearCostmapsAndWait">
+
+            <ClearEntireCostmap
+              name="ClearLocalCostmap"
+              service_name="local_costmap/clear_entirely_local_costmap"/>
+
+            <ClearEntireCostmap
+              name="ClearGlobalCostmap"
+              service_name="global_costmap/clear_entirely_global_costmap"/>
+
+            <Wait wait_duration="2.0"/>
+
+          </Sequence>
+
+
+          <!--
+            Second system-level recovery: limited physical rotation.
+
+            0.35 rad is approximately 20 degrees.
+          -->
+          <Spin spin_dist="0.35"/>
+
+        </RoundRobin>
+
+      </ReactiveFallback>
+
+    </RecoveryNode>
+
+  </BehaviorTree>
+</root>

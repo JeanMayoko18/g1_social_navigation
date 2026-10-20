@@ -1,0 +1,50 @@
+scenario:
+  id: "S2_STRAIGHT"
+  title: "Straight-line walking"
+
+  description: >
+    The robot follows a physically marked straight line to evaluate
+    longitudinal scale, lateral drift and heading stability.
+
+  command_source: "manual_or_controlled"
+  navigation_enabled: false
+
+  distances_m:
+    preliminary:
+      - 2.0
+    final:
+      - 5.0
+      - 10.0
+
+  variants:
+    - id: "FWD"
+      direction: "forward"
+
+    - id: "RETURN"
+      direction: "return"
+
+  ground_truth:
+    method: "floor_markers_and_laser_measurement"
+    expected_lateral_offset_m: 0.0
+    expected_heading_change_deg: 0.0
+
+  configurations:
+    - "B0_RAW"
+    - "B1_SAFE"
+    - "A1_NO_RESPONSE_LEARNING"
+    - "A2_NO_AMCE"
+    - "A3_NO_AFI"
+    - "A5_NO_AHC"
+    - "FULL"
+
+  repetitions_preliminary: 3
+  repetitions_final: 10
+
+  primary_metrics:
+    - "longitudinal_error"
+    - "relative_distance_error"
+    - "lateral_drift"
+    - "straight_heading_rmse"
+    - "final_heading_error"
+    - "mci_mean"
+    - "afi_correction"

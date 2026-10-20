@@ -1,0 +1,41 @@
+# ============================================================================
+# PREVIOUS REFERENCE-SCALED LATERAL COMPENSATION
+#
+# Formula:
+#
+#   C(vx) = Cref * min(vx / vxref, 1)
+#
+# with:
+#
+#   Cref  = 0.003491403315154268 m/s
+#   vxref = 0.12 m/s
+#
+# Equivalent piecewise-linear representation:
+#
+#   (0.00, 0.000000000000000000)
+#   (0.12, 0.003491403315154268)
+#   (1.00, 0.003491403315154268)
+# ============================================================================
+
+locomotion_calibration_node:
+
+  ros__parameters:
+
+    enable_forward_lateral_compensation: true
+
+    forward_lateral_compensation_model_type: piecewise_linear
+
+    forward_lateral_compensation_input_points:
+      - 0.0
+      - 0.12
+      - 1.0
+
+    forward_lateral_compensation_output_points:
+      - 0.0
+      - 0.003491403315154268
+      - 0.003491403315154268
+
+    forward_lateral_compensation_domain_min: 0.08
+    forward_lateral_compensation_domain_max: 1.0
+
+    forward_lateral_compensation_outside_domain_policy: disable

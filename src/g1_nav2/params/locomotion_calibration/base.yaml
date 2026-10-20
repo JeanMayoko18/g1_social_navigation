@@ -1,0 +1,228 @@
+# ============================================================================
+# G1 LOCOMOTION CALIBRATION BASE PARAMETERS
+# ============================================================================
+#
+# Purpose:
+#   Store the stable G1 command-calibration parameters independently from the
+#   forward lateral compensation model selected for physical validation.
+#
+# Resolution order:
+#
+#   base.yaml
+#       -> selected forward lateral profile
+#       -> launch arguments
+#
+# Therefore:
+#   - the profile overrides only lateral-model parameters;
+#   - the launch controls global activation and topic routing;
+#   - every other calibration remains identical between candidate tests.
+#
+# The default global state remains disabled for safety.
+# ============================================================================
+
+locomotion_calibration_node:
+
+  ros__parameters:
+
+    # =========================================================================
+    # ROS
+    # =========================================================================
+
+    use_sim_time: false
+
+    input_topic: /cmd_vel
+    output_topic: /cmd_vel_nav_scaled
+
+
+    # =========================================================================
+    # LATENCY DIAGNOSTICS
+    # =========================================================================
+
+    enable_latency_diagnostics: true
+
+    computation_latency_topic: >-
+      /locomotion_calibration/computation_latency_ms
+
+    callback_latency_topic: >-
+      /locomotion_calibration/callback_latency_ms
+
+
+    # =========================================================================
+    # CALIBRATION REFERENCE COMMANDS
+    # =========================================================================
+    #
+    # Legacy reference-scaled law:
+    #
+    #   ratio = min(command_magnitude / reference_magnitude, 1)
+    #
+    # when extrapolation is disabled.
+    # =========================================================================
+
+    forward_compensation_reference_vx: 0.12
+    rotation_translation_reference_wz: 0.20
+
+    allow_compensation_extrapolation: false
+
+
+    # =========================================================================
+    # FORWARD HEADING COMPENSATION
+    # =========================================================================
+    #
+    # This configuration must remain identical during constant and affine
+    # lateral-model validation so that only the lateral law changes.
+    #
+    # Legacy runtime formula:
+    #
+    #   wz_comp(vx) = wz_ref * min(vx / vx_ref, 1)
+    # =========================================================================
+
+    enable_forward_heading_compensation: false
+
+    forward_heading_compensation_wz: 0.009887956027345258
+
+    forward_heading_compensation_min_vx: 0.08
+
+
+    # =========================================================================
+    # GENERIC FORWARD HEADING COMPENSATION MODEL
+    # =========================================================================
+    #
+    # The legacy model preserves the historical reference-scaled behavior:
+    #
+    #   C(vx) = C_ref * min(vx / vx_ref, 1)
+    #
+    # Generic profiles may override this section with polynomial or
+    # piecewise-linear models.
+    # =========================================================================
+
+    forward_heading_compensation_model_type: legacy_reference_scaled
+
+    forward_heading_compensation_coefficients:
+      - 0.0
+
+    forward_heading_compensation_input_points:
+      - 0.0
+      - 1.0
+
+    forward_heading_compensation_output_points:
+      - 0.0
+      - 0.0
+
+    forward_heading_compensation_domain_min: 0.0
+    forward_heading_compensation_domain_max: 1.0
+
+    forward_heading_compensation_outside_domain_policy: disable
+
+
+    # =========================================================================
+    # FORWARD LATERAL COMPENSATION
+    # =========================================================================
+    #
+    # These legacy parameters remain for backward compatibility.
+    #
+    # When model_type is legacy_reference_scaled:
+    #
+    #   vy_comp(vx) = vy_ref * min(vx / vx_ref, 1)
+    #
+    # A selected profile overrides model_type and the corresponding generic
+    # model parameters.
+    # =========================================================================
+
+    enable_forward_lateral_compensation: true
+
+    forward_lateral_compensation_vy: 0.003491403315154268
+
+    forward_lateral_compensation_min_vx: 0.08
+
+    forward_lateral_compensation_model_type: legacy_reference_scaled
+
+
+    # =========================================================================
+    # GENERIC POLYNOMIAL MODEL
+    # =========================================================================
+    #
+    # Coefficients use increasing power order:
+    #
+    #   C(vx) = c0 + c1*vx + c2*vx^2 + ...
+    #
+    # The selected model profile overrides these placeholder values.
+    # =========================================================================
+
+    forward_lateral_compensation_coefficients:
+      - 0.0
+
+
+    # =========================================================================
+    # GENERIC PIECEWISE-LINEAR MODEL
+    # =========================================================================
+    #
+    # Between points (x0, y0) and (x1, y1):
+    #
+    #   ratio = (vx - x0) / (x1 - x0)
+    #
+    #   C(vx) = y0 + ratio * (y1 - y0)
+    #
+    # The selected model profile overrides these placeholder values.
+    # =========================================================================
+
+    forward_lateral_compensation_input_points:
+      - 0.0
+      - 1.0
+
+    forward_lateral_compensation_output_points:
+      - 0.0
+      - 0.0
+
+
+    # =========================================================================
+    # MODEL DOMAIN
+    # =========================================================================
+
+    forward_lateral_compensation_domain_min: 0.0
+    forward_lateral_compensation_domain_max: 1.0
+
+    forward_lateral_compensation_outside_domain_policy: disable
+
+
+    # =========================================================================
+    # ROTATION TRANSLATION COMPENSATION
+    # =========================================================================
+    #
+    # These parameters remain unchanged during straight-model validation.
+    # They are applied only when the node detects intended pure rotation.
+    # =========================================================================
+
+    enable_rotation_translation_compensation: false
+
+    # Right or clockwise rotation
+    clockwise_rotation_vx_compensation: 0.03738548769622477
+    clockwise_rotation_vy_compensation: 0.025340145547797777
+
+    # Left or counterclockwise rotation
+    counterclockwise_rotation_vx_compensation: -0.016206228428362657
+    counterclockwise_rotation_vy_compensation: 0.013911252254673667
+
+    rotation_translation_max_linear_command: 1.0e-6
+    rotation_translation_min_wz: 1.0e-6
+
+
+    # =========================================================================
+    # ROTATION SCALING
+    # =========================================================================
+
+    enable_rotation_scaling: false
+
+    clockwise_rotation_scale: 1.066228
+    counterclockwise_rotation_scale: 0.964944
+
+
+    # =========================================================================
+    # TRANSLATION SCALING
+    # =========================================================================
+    #
+    # Physical evidence does not justify command-side longitudinal scaling.
+    # DOG odometry scaling remains an independent calibration.
+    # =========================================================================
+
+    enable_translation_scaling: false
+    translation_scale: 1.0

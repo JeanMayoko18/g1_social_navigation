@@ -1,0 +1,101 @@
+<?xml version="1.0"?>
+
+<?xml-model
+  href="http://download.ros.org/schema/package_format3.xsd"
+  schematypens="http://www.w3.org/2001/XMLSchema"?>
+
+<package format="3">
+
+  <name>g1_nav2</name>
+  <version>0.1.0</version>
+
+  <description>
+    Navigation bringup and experimental perception profiles for the
+    Unitree G1 robot using Nav2, RGB-D perception, and social navigation.
+  </description>
+
+  <maintainer email="icmayoko18@gmail.com">Jean Mayoko</maintainer>
+
+  <license>Apache-2.0</license>
+
+  <!-- =================================================================== -->
+  <!-- BUILD SYSTEM                                                        -->
+  <!-- =================================================================== -->
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <!-- =================================================================== -->
+  <!-- PYTHON AND ROS 2 LAUNCH                                             -->
+  <!-- =================================================================== -->
+
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+
+  <!-- =================================================================== -->
+  <!-- NAV2                                                                -->
+  <!-- =================================================================== -->
+
+  <exec_depend>nav2_bringup</exec_depend>
+  <exec_depend>nav2_map_server</exec_depend>
+  <exec_depend>nav2_amcl</exec_depend>
+  <exec_depend>nav2_lifecycle_manager</exec_depend>
+  <exec_depend>twist_mux</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+  
+  <depend>g1_social_msgs</depend>
+  <depend>rclpy_action</depend>
+  <depend>action_msgs</depend>
+  <depend>nav2_msgs</depend>
+  
+
+  <!-- =================================================================== -->
+  <!-- G1 BRIDGE AND COMMAND PIPELINE                                      -->
+  <!-- =================================================================== -->
+
+  <exec_depend>humanoid_nav_bridge</exec_depend>
+  <exec_depend>cmd_vel_qos_adapter</exec_depend>
+
+  <!-- =================================================================== -->
+  <!-- G1 SOCIAL NAVIGATION                                                -->
+  <!-- =================================================================== -->
+
+  <!--
+    Starts the social-perception and optional explainability pipelines.
+  -->
+  <exec_depend>g1_social_bringup</exec_depend>
+
+  <!--
+    Nav2 costmap plugin loaded inside local_costmap/local_costmap.
+  -->
+  <exec_depend>g1_social_costmap</exec_depend>
+
+  <!-- =================================================================== -->
+  <!-- ROS INTERFACES USED BY LOCAL PYTHON NODES                           -->
+  <!-- =================================================================== -->
+
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+
+  <!-- =================================================================== -->
+  <!-- TESTING                                                             -->
+  <!-- =================================================================== -->
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <!-- =================================================================== -->
+  <!-- EXPORT                                                              -->
+  <!-- =================================================================== -->
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+
+</package>

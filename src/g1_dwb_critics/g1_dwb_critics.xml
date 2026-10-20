@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<library path="g1_dwb_critics">
+  <class
+    name="g1_dwb_critics::MotionFeasibilityCritic"
+    type="g1_dwb_critics::MotionFeasibilityCritic"
+    base_class_type="dwb_core::TrajectoryCritic">
+
+    <description>
+      DWB trajectory critic adapted to the motion constraints of the Unitree G1.
+    </description>
+  </class>
+</library>

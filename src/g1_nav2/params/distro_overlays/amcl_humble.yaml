@@ -1,0 +1,4 @@
+amcl:
+  ros__parameters:
+    robot_model_type: "nav2_amcl::OmniMotionModel"
+    #robot_model_type: "nav2_amcl::DifferentialMotionModel"

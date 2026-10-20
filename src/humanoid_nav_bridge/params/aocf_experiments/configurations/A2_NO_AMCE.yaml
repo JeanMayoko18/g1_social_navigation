@@ -1,0 +1,11 @@
+dog_odom_normalizer:
+  ros__parameters:
+    enable_mpm: true
+    enable_response_learning: true
+    enable_amce: false
+    enable_afi: true
+    enable_ahc: true
+    enable_atc: true
+
+    enable_increment_limiter: true
+    stationary_hold_enabled: true

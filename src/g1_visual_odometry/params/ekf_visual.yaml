@@ -1,0 +1,210 @@
+/**:
+  ros__parameters:
+
+    # ----------------------------------------------------------------------
+    # General filter settings
+    # ----------------------------------------------------------------------
+
+    # Frequency at which the EKF publishes the filtered odometry output.
+    # 20 Hz is a reasonable starting point even if the visual odometry is slower.
+    
+    #frequency: 20.0
+    frequency: 10.0
+   
+
+    # The EKF runs in 2D mode:
+    # - z, roll, and pitch are constrained / ignored
+    # - only x, y, yaw and their velocities matter
+    two_d_mode: true
+
+    # Whether the filter should publish the transform odom -> base_footprint.
+    # We keep this true so the EKF becomes the main TF provider for odometry.
+    publish_tf: true
+
+    # Publish accelerations if available in the state estimate.
+    publish_acceleration: false
+
+    # If true, the filter waits until at least one message is received before
+    # publishing anything.
+    
+    #permit_corrected_publication: true
+    permit_corrected_publication: false
+
+    # Time offset applied to the transform publication.
+    transform_time_offset: 0.0
+
+    # Tolerance for transform lookup / publication.
+    transform_timeout: 0.2
+
+    # If no sensor data arrives for too long, the filter stops updating.
+    
+    #sensor_timeout: 0.5
+    sensor_timeout: 0.3
+
+    # Whether to reset on large time jumps. Usually false on real robot unless
+    # you expect clock discontinuities.
+    reset_on_time_jump: false
+
+    # ----------------------------------------------------------------------
+    # Frames
+    # ----------------------------------------------------------------------
+
+    # World-fixed odometry frame.
+    map_frame: map
+
+    # Local odometry frame used by the EKF.
+    odom_frame: odom
+
+    # Robot body frame.
+    base_link_frame: base_footprint
+
+    # Since this EKF is intended to provide odom-relative motion,
+    # the world frame is set to odom.
+    world_frame: odom
+
+    # ----------------------------------------------------------------------
+    # Input 1: Visual odometry
+    # Topic: /odom/visual
+    # ----------------------------------------------------------------------
+
+    odom0: /odom/visual
+
+    # State vector order in robot_localization is:
+    # [x, y, z,
+    #  roll, pitch, yaw,
+    #  vx, vy, vz,
+    #  vroll, vpitch, vyaw,
+    #  ax, ay, az]
+    #
+    # We enable only the variables that are meaningful from the bootstrap VO:
+    # - x, y
+    # - yaw
+    # - vx, vy
+    # - vyaw
+    #
+    # We disable z, roll, pitch, and 3D velocities/accelerations.
+    
+    #odom0_config: [
+    #  true,  true,  false,
+    #  false, false, true,
+    #  true,  true,  false,
+    #  false, false, true,
+    #  false, false, false
+    #]
+
+    odom0_config: [
+      true,  true,  false,
+      false, false, true,
+      false, false, false,
+      false, false, false,
+      false, false, false
+    ]
+
+    # Do not treat the visual odometry as differential input because it already
+    # provides integrated pose and twist.
+    odom0_differential: false
+
+    # Do not treat it as relative pose reset input.
+    odom0_relative: false
+
+    # Queue size for the visual odometry subscription.
+    odom0_queue_size: 10
+
+    # Visual odometry may arrive irregularly; keep nodelay false unless latency
+    # becomes a problem.
+    odom0_nodelay: false
+
+    # ----------------------------------------------------------------------
+    # Input 2: IMU
+    # Topic: /dog_imu_raw
+    # ----------------------------------------------------------------------
+
+    imu0: /dog_imu_raw
+
+    # From the IMU we mainly want yaw and yaw rate.
+    # In two_d_mode, roll and pitch are constrained anyway.
+    #
+    # Here we enable:
+    # - yaw
+    # - vyaw
+    #
+    # Optionally, linear acceleration could be enabled later, but for now we
+    # keep it disabled to stay conservative and stable.
+    imu0_config: [
+      false, false, false,
+      false, false, true,
+      false, false, false,
+      false, false, true,
+      false, false, false
+    ]
+
+    # IMU orientation is absolute, so do not use differential mode.
+    imu0_differential: false
+
+    # Do not interpret IMU as a relative pose source.
+    imu0_relative: false
+
+    # Queue size for the IMU subscription.
+    imu0_queue_size: 50
+
+    # Remove gravity from acceleration only if you later fuse accelerations.
+    imu0_remove_gravitational_acceleration: false
+
+    # If the IMU frame is slightly delayed, nodelay=false is usually safer.
+    imu0_nodelay: false
+
+    # ----------------------------------------------------------------------
+    # Process noise covariance
+    # ----------------------------------------------------------------------
+    #
+    # This matrix controls how much the filter trusts its internal motion model.
+    # Larger values = the filter trusts incoming measurements more.
+    # Smaller values = the filter trusts its internal prediction more.
+    #
+    # This is a conservative initial tuning for planar navigation.
+    process_noise_covariance: [
+      0.05, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+      0.0,  0.05, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+      0.0,  0.0,  0.10, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+      0.0,  0.0,  0.0,  0.10, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+      0.0,  0.0,  0.0,  0.0,  0.10, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+      0.0,  0.0,  0.0,  0.0,  0.0,  0.08, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+
+      0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.08, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+      0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.08, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+      0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.10, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+      0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.10, 0.0,  0.0,  0.0,  0.0,  0.0,
+      0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.10, 0.0,  0.0,  0.0,  0.0,
+      0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.08, 0.0,  0.0,  0.0,
+
+      0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.20, 0.0,  0.0,
+      0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.20, 0.0,
+      0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.20
+    ]
+
+    # ----------------------------------------------------------------------
+    # Initial estimate covariance
+    # ----------------------------------------------------------------------
+    #
+    # This matrix describes how uncertain the filter is at startup.
+    # Slightly larger values allow the filter to adapt more quickly to the
+    # first measurements.
+    initial_estimate_covariance: [
+      1e-3, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+      0.0,  1e-3, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+      0.0,  0.0,  1e-3, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+      0.0,  0.0,  0.0,  1e-3, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+      0.0,  0.0,  0.0,  0.0,  1e-3, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+      0.0,  0.0,  0.0,  0.0,  0.0,  1e-3, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+
+      0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  1e-3, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+      0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  1e-3, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+      0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  1e-3, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+      0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  1e-3, 0.0,  0.0,  0.0,  0.0,  0.0,
+      0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  1e-3, 0.0,  0.0,  0.0,  0.0,
+      0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  1e-3, 0.0,  0.0,  0.0,
+
+      0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  1e-3, 0.0,  0.0,
+      0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  1e-3, 0.0,
+      0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  1e-3
+    ]

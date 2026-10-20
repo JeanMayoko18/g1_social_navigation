@@ -1,0 +1,69 @@
+locomotion_calibration_node:
+  ros__parameters:
+
+    # -------------------------------------------------------------------------
+    # FORWARD LATERAL COMPENSATION
+    # -------------------------------------------------------------------------
+    #
+    # The lateral model is held constant so that only the heading law changes
+    # between physical-validation profiles.
+    # -------------------------------------------------------------------------
+
+    enable_forward_lateral_compensation: true
+
+    forward_lateral_compensation_model_type: polynomial
+
+    forward_lateral_compensation_coefficients:
+      - 0.012217431368379918
+
+    forward_lateral_compensation_input_points:
+      - 0.0
+      - 1.0
+
+    forward_lateral_compensation_output_points:
+      - 0.0
+      - 0.0
+
+    forward_lateral_compensation_domain_min: 0.11
+    forward_lateral_compensation_domain_max: 0.20
+
+    forward_lateral_compensation_outside_domain_policy: disable
+
+
+    # -------------------------------------------------------------------------
+    # FORWARD HEADING COMPENSATION
+    # -------------------------------------------------------------------------
+    #
+    # Experimental threshold hypothesis:
+    #
+    #             0                                     vx <= 0.16
+    #   C(vx) = {
+    #             0.006057141 * (vx - 0.16) / 0.04      0.16 < vx <= 0.20
+    #
+    # The value at 0.20 m/s is the mean opposing angular correction derived
+    # from the five uncalibrated estimation trials at that velocity.
+    #
+    # This is a candidate for physical validation, not a selected model.
+    # -------------------------------------------------------------------------
+
+    enable_forward_heading_compensation: true
+
+    forward_heading_compensation_model_type: piecewise_linear
+
+    forward_heading_compensation_coefficients:
+      - 0.0
+
+    forward_heading_compensation_input_points:
+      - 0.0
+      - 0.16
+      - 0.20
+
+    forward_heading_compensation_output_points:
+      - 0.0
+      - 0.0
+      - 0.006057141
+
+    forward_heading_compensation_domain_min: 0.11
+    forward_heading_compensation_domain_max: 0.20
+
+    forward_heading_compensation_outside_domain_policy: disable

@@ -1,0 +1,17 @@
+string interaction_id
+
+string intent
+
+string direction
+
+string target
+
+string constraint
+
+float32 confidence
+
+string utterance
+
+---
+bool success
+string message

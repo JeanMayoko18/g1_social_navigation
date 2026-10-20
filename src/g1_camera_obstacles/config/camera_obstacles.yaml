@@ -1,0 +1,32 @@
+camera_obstacle_node:
+  ros__parameters:
+
+    depth_topic: "/camera/camera/aligned_depth_to_color/image_raw"
+    camera_info_topic: "/camera/camera/aligned_depth_to_color/camera_info"
+
+    output_topic: "/camera/obstacles"
+    output_frame: "base_footprint"
+
+    # ROI in base_footprint.
+    #
+    # x: forward
+    # y: left/right
+    # z: height above base_footprint
+    min_x: 0.15
+    max_x: 1.50
+
+    min_y: -0.60
+    max_y: 0.60
+
+    min_z: 0.02
+    max_z: 0.45
+
+    # Valid RealSense depth interval.
+    min_depth: 0.10
+    max_depth: 2.00
+
+    # Process 1 pixel every N pixels.
+    pixel_stride: 4
+
+    # RealSense Z16: millimetres -> metres.
+    depth_scale: 0.001

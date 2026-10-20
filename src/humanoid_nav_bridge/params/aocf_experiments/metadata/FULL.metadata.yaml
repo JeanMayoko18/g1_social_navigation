@@ -1,0 +1,40 @@
+configuration:
+  id: "FULL"
+  family: "AOCF"
+  category: "proposed_method"
+
+  title: "Complete AOCF"
+
+  description: >
+    Complete Adaptive Odometry Calibration Framework with
+    command-conditioned motion prediction, online response learning,
+    adaptive motion consistency estimation, adaptive increment fusion,
+    heading calibration, twist calibration, increment limiting and
+    stationary hold.
+
+  active_modules:
+    tmir: true
+    mpm: true
+    response_learning: true
+    amce: true
+    afi: true
+    ahc: true
+    atc: true
+    increment_limiter: true
+    stationary_hold: true
+    increment_lowpass: false
+
+  scientific_role: >
+    Reference implementation of the complete proposed framework.
+
+  primary_comparisons:
+    - "B0_RAW"
+    - "B1_SAFE"
+    - "A1_NO_RESPONSE_LEARNING"
+    - "A3_NO_AFI"
+    - "A5_NO_AHC"
+    - "A6_NO_ATC"
+
+  safety_level: "normal"
+  allowed_on_robot: true
+  allowed_with_nav2: true

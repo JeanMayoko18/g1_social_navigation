@@ -1,0 +1,5 @@
+rosbags>=0.10,<0.12
+numpy>=1.23
+pandas>=1.5
+matplotlib>=3.6
+PyYAML>=6.0

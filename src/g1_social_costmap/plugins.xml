@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+
+<library path="g1_social_costmap_layer">
+
+  <class
+    name="g1_social_costmap::SocialLayer"
+    type="g1_social_costmap::SocialLayer"
+    base_class_type="nav2_costmap_2d::Layer">
+
+    <description>
+      Social costmap layer consuming G1 tracked-person or social-zone
+      observations and injecting proxemic costs into a Nav2 layered costmap.
+    </description>
+
+  </class>
+
+</library>

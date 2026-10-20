@@ -1,0 +1,423 @@
+# ============================================================
+# Nav2 (ROS 2 Humble) - REAL Robot - AMCL / SLAM compatible
+#
+# This configuration is tuned for RL-controlled humanoids
+# where:
+#   - small velocity commands may NOT move the physical robot
+#   - base twist from low-level odom may be noisy at rest
+#   - we must avoid "virtual progress" (TF moving but robot stuck)
+#
+# Topic chain (recommended):
+#   controller_server  -> /cmd_vel_nav     (RELIABLE)
+#   velocity_smoother  -> /cmd_vel         (RELIABLE)
+#   twist_mux          -> /cmd_vel_mux     (RELIABLE)
+#   qos_adapter        -> /cmd_vel_rlsar   (BEST_EFFORT)  -> RL controller
+#
+# Frames:
+#   map -> odom          (AMCL or slam_toolbox)
+#   odom -> base_footprint not robot_center (your bridge from /dog_odom)
+# ============================================================
+
+#bt_navigator:
+#  ros__parameters:
+#    use_sim_time: false
+#    global_frame: map
+#    robot_base_frame: base_footprint
+#    odom_topic: /odom
+#    bt_loop_duration: 10
+#    default_bt_xml_filename: "navigate_w_replanning_and_recovery.xml"
+
+bt_navigator:
+  ros__parameters:
+    use_sim_time: false
+    global_frame: map
+    robot_base_frame: base_footprint
+    odom_topic: /odom
+    bt_loop_duration: 10
+    default_bt_xml_filename: "/opt/ros/foxy/share/nav2_bt_navigator/behavior_trees/navigate_w_replanning_and_recovery.xml"
+    plugin_lib_names:
+      - nav2_compute_path_to_pose_action_bt_node
+      - nav2_follow_path_action_bt_node
+      - nav2_back_up_action_bt_node
+      - nav2_spin_action_bt_node
+      - nav2_wait_action_bt_node
+      - nav2_clear_costmap_service_bt_node
+      - nav2_is_stuck_condition_bt_node
+      - nav2_goal_reached_condition_bt_node
+      - nav2_goal_updated_condition_bt_node
+      - nav2_initial_pose_received_condition_bt_node
+      - nav2_reinitialize_global_localization_service_bt_node
+      - nav2_rate_controller_bt_node
+      - nav2_distance_controller_bt_node
+      - nav2_speed_controller_bt_node
+      - nav2_truncate_path_action_bt_node
+      - nav2_goal_updater_node_bt_node
+      - nav2_recovery_node_bt_node
+      - nav2_pipeline_sequence_bt_node
+      - nav2_round_robin_node_bt_node
+      - nav2_transform_available_condition_bt_node
+      - nav2_time_expired_condition_bt_node
+
+planner_server:
+  ros__parameters:
+    use_sim_time: false
+    expected_planner_frequency: 5.0
+    global_frame: map
+    robot_base_frame: base_footprint
+    planner_plugins: ["GridBased"]
+
+    GridBased:
+      plugin: "nav2_navfn_planner/NavfnPlanner"
+      tolerance: 0.5
+      use_astar: false # false: Dijkstra and true: A*
+      allow_unknown: true
+
+
+controller_server:
+  ros__parameters:
+    use_sim_time: false
+
+    # Local control is usually executed in odom frame
+    # (smooth, continuous, no global corrections applied here).
+    global_frame: odom
+    robot_base_frame: base_footprint
+    odom_topic: /odom
+    #odom_topic: /odometry/filtered
+
+    # IMPORTANT: do NOT output directly to /cmd_vel (reserved for smoother output).
+    cmd_vel_topic: /cmd_vel_nav
+
+    controller_frequency: 20.0
+
+    # ----------------------------------------------------------
+    # Humanoid RL "deadzone" protection:
+    # Nav2 sometimes generates tiny speeds (0.01..0.04) that
+    # do not move the real robot, but can still move the TF if
+    # you integrate odom from commands.
+    #
+    # These thresholds help Nav2 treat very small commands as zero.
+    # ----------------------------------------------------------
+    #min_x_velocity_threshold: 0.05
+    #min_theta_velocity_threshold: 0.15
+    min_theta_velocity_threshold: 0.02
+    min_x_velocity_threshold: 0.01
+
+    # Allow some failure tolerance while the humanoid reacts / stabilizes
+    #failure_tolerance: 2.0
+
+    #progress_checker_plugins: ["progress_checker"]
+    #goal_checker_plugins: ["general_goal_checker"]
+
+    progress_checker_plugin: "progress_checker"
+    goal_checker_plugin: "goal_checker"
+
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      # Smaller radius because humanoids can move slowly / in-place adjustments
+      required_movement_radius: 0.02
+      # Give enough time to show progress (humanoids can be "sluggish")
+      movement_time_allowance: 20.0
+
+    goal_checker:
+      plugin: "nav2_controller::SimpleGoalChecker"
+      stateful: true #false          
+      #xy_goal_tolerance: 0.12  # 
+      #yaw_goal_tolerance: 0.25 # 
+      xy_goal_tolerance: 0.20 #0.40 # 0.18
+      yaw_goal_tolerance: 0.20 #3.14 #0.70
+    
+    # ------------------------
+    # Local controller: DWB
+    # ------------------------
+    controller_plugins: ["FollowPath"]
+
+    FollowPath:
+      plugin: "dwb_core::DWBLocalPlanner"
+      debug_trajectory_details: true
+
+      # ----------------------------------------------------------
+      # MIN SPEEDS (critical for humanoid deadzone):
+      # If these are too small, Nav2 outputs commands that never
+      # move the physical robot.
+      # ----------------------------------------------------------
+      min_vel_x: 0.0
+      max_vel_x: 0.35
+
+      min_speed_xy: 0.0
+      max_speed_xy: 0.30
+
+      max_vel_theta: 0.12
+      min_speed_theta: 0.05
+
+      vx_samples: 20
+      vtheta_samples: 20
+
+      sim_time: 1.7
+
+      # Acceleration limits should be compatible with RL controller
+      #acc_lim_x: 1.0
+      #acc_lim_theta: 0.7
+      #decel_lim_x: -1.0
+      #decel_lim_theta: -0.7
+
+      acc_lim_x: 0.5
+      decel_lim_x: -0.5
+      acc_lim_theta: 0.20
+      decel_lim_theta: -0.20
+
+      # Sampling and simulation horizon
+      #vx_samples: 10
+      #vtheta_samples: 12
+      #sim_time: 1.2
+
+      linear_granularity: 0.05
+      angular_granularity: 0.025
+      transform_tolerance: 1.0
+
+
+      # Critics: tuned to reduce oscillations while keeping obstacle safety
+      critics: ["Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist", "RotateToGoal"]
+
+      # Critic weights:
+      # - Increase obstacle cost a bit (avoid clipping)
+      # - Reduce over-aggressive path alignment that can cause oscillations
+      BaseObstacle.scale: 0.35
+      PathAlign.scale: 8.0
+      GoalAlign.scale: 2.0
+      PathDist.scale: 12.0
+      GoalDist.scale: 8.0
+      Oscillation.scale: 1.0
+      RotateToGoal.scale: 8.0
+      RotateToGoal.slowing_factor: 5.0
+      RotateToGoal.lookahead_time: -1.0
+
+
+recoveries_server:
+  ros__parameters:
+    use_sim_time: false
+    cycle_frequency: 5.0
+    global_frame: odom
+    robot_base_frame: base_footprint
+    #recovery_plugins: ["backup", "wait"]
+    recovery_plugins: ["spin", "backup", "wait"]
+
+    spin:
+      plugin: "nav2_recoveries/Spin"
+    backup:
+      plugin: "nav2_recoveries/BackUp"
+    wait:
+      plugin: "nav2_recoveries/Wait"
+      
+    max_rotational_vel: 0.12
+    min_rotational_vel: 0.05
+    rotational_acc_lim: 0.20
+
+# -----------------
+# COSTMAPS
+# -----------------
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      use_sim_time: false
+      always_send_full_costmap: true
+      map_subscribe_transient_local: true
+      global_frame: map
+      robot_base_frame: base_footprint
+      update_frequency: 2.0
+      publish_frequency: 1.0
+      #transform_tolerance: 1.5
+      transform_tolerance: 0.2
+      resolution: 0.05
+      track_unknown_space: true
+      rolling_window: false
+
+      #footprint: "[[0.22,0.16],[0.22,-0.16],[-0.22,-0.16],[-0.22,0.16]]"
+      footprint: "[[0.30,0.30],[0.30,-0.30],[-0.25,-0.30],[-0.25,0.30]]"
+      robot_radius: 0.3
+
+      #plugins: ["static_layer", "inflation_layer"]
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_topic: /map_runtime
+        map_subscribe_transient_local: true
+
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        observation_sources: scan
+        scan:
+          topic: /scan
+          data_type: "LaserScan"
+          marking: true
+          clearing: true
+          max_obstacle_height: 2.0
+          min_obstacle_height: 0.0
+          obstacle_range: 5.0
+          raytrace_range: 8.0
+          #obstacle_min_range: 0.30
+          #raytrace_min_range: 0.30
+          footprint_clearing_enabled: true
+
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        inflation_radius: 0.80
+        cost_scaling_factor: 2.5
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      use_sim_time: false
+      transform_tolerance: 0.2
+
+      global_frame: odom
+      robot_base_frame: base_footprint
+
+      update_frequency: 8.0
+      publish_frequency: 4.0
+
+      rolling_window: true
+      width: 6
+      height: 6
+      resolution: 0.05
+
+      #footprint: "[[0.22,0.16],[0.22,-0.16],[-0.22,-0.16],[-0.22,0.16]]"
+      footprint: "[[0.30,0.30],[0.30,-0.30],[-0.25,-0.30],[-0.25,0.30]]"
+
+      plugins:
+        - obstacle_layer
+        - camera_obstacle_layer
+        - social_layer
+        - inflation_layer
+
+      # ----------------------------------------------------------
+      # PRIMARY OBSTACLE SOURCE — MID-360 / LaserScan
+      # ----------------------------------------------------------
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: scan
+
+        scan:
+          topic: /scan
+          data_type: "LaserScan"
+
+          marking: true
+          clearing: true
+
+          max_obstacle_height: 2.0
+          min_obstacle_height: 0.0
+
+          observation_persistence: 0.0
+          expected_update_rate: 0.0
+
+          obstacle_range: 5.0
+          raytrace_range: 8.0
+
+          footprint_clearing_enabled: true
+
+      # ----------------------------------------------------------
+      # SECONDARY OPTIONAL SOURCE — RealSense D435
+      # Low / close obstacles
+      # ----------------------------------------------------------
+      camera_obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+
+        # Config B: true
+        # Config A: false
+        enabled: false
+
+        observation_sources: camera_depth
+
+        camera_depth:
+          topic: /camera/obstacles
+          data_type: "PointCloud2"
+
+          marking: true
+          clearing: true
+
+          # /camera/obstacles is already filtered in base_footprint
+          # to keep only the low / close region.
+          min_obstacle_height: 0.0
+          max_obstacle_height: 0.50
+
+          obstacle_range: 1.50
+          raytrace_range: 1.80
+
+          observation_persistence: 0.0
+          expected_update_rate: 0.0
+
+          footprint_clearing_enabled: true
+
+      social_layer:
+        plugin: "g1_social_costmap::SocialLayer"
+        enabled: false
+
+        input_message_type: social_zone_array
+
+        social_zones_topic: /social_perception/social_zones
+
+        observation_timeout_sec: 0.80
+        transform_tolerance_sec: 0.20
+
+        include_tentative_tracks: false
+        include_lost_tracks: false
+
+        lethal_person_radius_m: 0.35
+
+        maximum_social_cost: 252
+        minimum_social_cost: 10
+        gaussian_cutoff: 3.0
+
+        subscription_qos_depth: 10
+        #subscription_qos_reliability: best_effort
+        subscription_qos_reliability: reliable
+
+      # ----------------------------------------------------------
+      # FINAL INFLATION
+      # ----------------------------------------------------------
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        inflation_radius: 0.25 #0.35
+        cost_scaling_factor: 8.0 #6.0
+
+waypoint_follower:
+  ros__parameters:
+    use_sim_time: false
+
+# -----------------
+# Velocity smoother
+# -----------------
+velocity_smoother:
+  ros__parameters:
+    use_sim_time: false
+    smoothing_frequency: 20.0
+    scale_velocities: false
+    feedback: "OPEN_LOOP"
+
+    # Controller output -> smoother input
+    cmd_vel_in_topic: /cmd_vel_nav
+    # Smoother output -> used by twist_mux as "nav" input
+    cmd_vel_out_topic: /cmd_vel
+    #cmd_vel_out_topic: cmd_vel_smooth
+
+    odom_topic: /odom
+
+    # Keep accel/decel reactive enough to cross deadzone quickly
+    max_accel: [1.0, 0.0, 1.0]
+    max_decel: [-1.0, 0.0, -1.0]
+
+    max_velocity: [0.25, 0.0, 0.35]
+    min_velocity: [-0.10, 0.0, -0.35]
+
+
+lifecycle_manager_navigation:
+  ros__parameters:
+    use_sim_time: false
+    autostart: true
+    node_names:
+      - controller_server
+      - planner_server
+      - recoveries_server
+      - bt_navigator
+      - waypoint_follower

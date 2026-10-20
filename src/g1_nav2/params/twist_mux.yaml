@@ -1,0 +1,14 @@
+/**:
+  ros__parameters:
+    topics:
+      nav:
+        #topic: /cmd_vel
+        #topic: cmd_vel_smooth
+        topic: cmd_vel_nav_scaled
+        timeout: 0.3
+        priority: 50
+      teleop:
+        topic: /cmd_vel_teleop
+        timeout: 0.3
+        priority: 100
+    output_topic: /cmd_vel_mux

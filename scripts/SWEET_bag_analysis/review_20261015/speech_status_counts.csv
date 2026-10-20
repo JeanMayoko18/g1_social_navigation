@@ -1,0 +1,8 @@
+output_id,trial,STARTED,COMPLETED,FAILED
+participant_D_S1a_R01_0ffaa974,participant_D_S1a_R01,5,5,0
+participant_D_S1b_R01_74902c42,participant_D_S1b_R01,10,10,0
+participant_D_S1b_R02_1fa271cd,participant_D_S1b_R02,7,6,1
+participant_D_S1b_R03_3108810b,participant_D_S1b_R03,6,6,0
+participant_D_S2_R01_4e1e674b,participant_D_S2_R01,0,0,46
+participant_D_S3_R01_df1b80bb,participant_D_S3_R01,0,0,35
+participant_D_S3_R02_118cc4ae,participant_D_S3_R02,11,11,0

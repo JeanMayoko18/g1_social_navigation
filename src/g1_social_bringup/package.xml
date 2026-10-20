@@ -1,0 +1,89 @@
+<?xml version="1.0"?>
+<?xml-model
+  href="http://download.ros.org/schema/package_format3.xsd"
+  schematypens="http://www.w3.org/2001/XMLSchema"?>
+
+<package format="3">
+
+  <name>g1_social_bringup</name>
+
+  <version>0.1.0</version>
+
+  <description>
+    Bringup package for the deterministic social-perception,
+    social-navigation, explainability, and speech pipelines of the
+    Unitree G1 navigation system.
+  </description>
+
+  <maintainer email="icmayoko18@gmail.com">
+    Jean Mayoko
+  </maintainer>
+
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>
+    ament_cmake
+  </buildtool_depend>
+
+  <!-- ROS 2 launch framework. -->
+  <exec_depend>
+    ament_index_python
+  </exec_depend>
+
+  <exec_depend>
+    launch
+  </exec_depend>
+
+  <exec_depend>
+    launch_ros
+  </exec_depend>
+
+  <!-- G1 social-navigation packages. -->
+  <exec_depend>
+    g1_social_msgs
+  </exec_depend>
+
+  <exec_depend>
+    g1_social_perception
+  </exec_depend>
+
+  <exec_depend>
+    g1_robot_collaboration
+  </exec_depend>
+
+  <exec_depend>
+    g1_robot_explainability
+  </exec_depend>
+
+  <!-- The plugin is loaded by the Nav2 local costmap. -->
+  <exec_depend>
+    g1_social_costmap
+  </exec_depend>
+
+
+  <!-- Runtime message and transform dependencies. -->
+  <exec_depend>
+    geometry_msgs
+  </exec_depend>
+
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+
+  <exec_depend>
+    std_msgs
+  </exec_depend>
+
+  <exec_depend>
+    tf2_ros
+  </exec_depend>
+  <depend>tf2_geometry_msgs</depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+  <export>
+    <build_type>
+      ament_cmake
+    </build_type>
+  </export>
+
+</package>

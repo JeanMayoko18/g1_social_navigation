@@ -1,0 +1,141 @@
+# Copyright (c) 2024-2025 Ziqi Fan
+# SPDX-License-Identifier: Apache-2.0
+
+g1_dimos:
+  dt: 0.005
+  decimation: 4
+  num_of_dofs: 29          # espace RL/FSM
+  hw_active_dofs: 23       # info HW seulement
+  ms_total: 35
+  wheel_indices: []
+
+  # -----------------------------
+  # EDU23 joint lists (23)
+  # -----------------------------
+  joint_names:
+    - left_hip_pitch_joint
+    - left_hip_roll_joint
+    - left_hip_yaw_joint
+    - left_knee_joint
+    - left_ankle_pitch_joint
+    - left_ankle_roll_joint
+    - right_hip_pitch_joint
+    - right_hip_roll_joint
+    - right_hip_yaw_joint
+    - right_knee_joint
+    - right_ankle_pitch_joint
+    - right_ankle_roll_joint
+    - waist_yaw_joint
+    - left_shoulder_pitch_joint
+    - left_shoulder_roll_joint
+    - left_shoulder_yaw_joint
+    - left_elbow_joint
+    - left_wrist_roll_joint
+    - right_shoulder_pitch_joint
+    - right_shoulder_roll_joint
+    - right_shoulder_yaw_joint
+    - right_elbow_joint
+    - right_wrist_roll_joint
+
+  joint_controller_names:
+    - left_hip_pitch_controller
+    - left_hip_roll_controller
+    - left_hip_yaw_controller
+    - left_knee_controller
+    - left_ankle_pitch_controller
+    - left_ankle_roll_controller
+    - right_hip_pitch_controller
+    - right_hip_roll_controller
+    - right_hip_yaw_controller
+    - right_knee_controller
+    - right_ankle_pitch_controller
+    - right_ankle_roll_controller
+    - waist_yaw_controller
+    - left_shoulder_pitch_controller
+    - left_shoulder_roll_controller
+    - left_shoulder_yaw_controller
+    - left_elbow_controller
+    - left_wrist_roll_controller
+    - right_shoulder_pitch_controller
+    - right_shoulder_roll_controller
+    - right_shoulder_yaw_controller
+    - right_elbow_controller
+    - right_wrist_roll_controller
+
+  # hw23 index -> internal order (identity)
+  joint_mapping: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
+
+  # hw23 index -> Unitree motor index (motor_state / motor_cmd)
+  hw23_to_ms: [0,1,2,3,4,5,
+               6,7,8,9,10,11,
+               12,
+               15,16,17,18,19,
+               22,23,24,25,26]
+
+  # -----------------------------
+  # Stand / GetUp posture (23) derived from policy default_dof_pos (29)
+  # -----------------------------
+  default_dof_pos_hw23: [
+    -0.20, -0.20,  0.00,   0.00, 0.00, 0.00,
+     0.00,  0.00,  0.00,   0.42, 0.42, 0.35,
+    -0.23,
+     0.18, -0.18,  0.00,   0.00, 0.87,
+     0.00,  0.00,  0.00,   0.00, 0.00
+  ]
+
+  # Use same as default as a first stable target
+  getup_target_hw23: [
+    -0.20, -0.20,  0.00,   0.00, 0.00, 0.00,
+     0.00,  0.00,  0.00,   0.42, 0.42, 0.35,
+    -0.23,
+     0.18, -0.18,  0.00,   0.00, 0.87,
+     0.00,  0.00,  0.00,   0.00, 0.00
+  ]
+
+  edu23_getup_dof_pos: [
+    -0.20, -0.20,  0.00,   0.00, 0.00, 0.00,
+    0.00,  0.00,  0.00,   0.42, 0.42, 0.35,
+    -0.23,
+    -0.23, -0.23,          # waist roll/pitch (absents) -> garder policy default
+    0.18, -0.18,  0.00,   0.00, 0.87,
+    0.00,  0.00,          # left wrist pitch/yaw (absents) -> policy default
+    0.00,  0.00,  0.00,   0.00, 0.00,
+    0.00,  0.00           # right wrist pitch/yaw (absents) -> policy default
+  ]
+
+  edu23_getup_dof_pos_dimos: [-0.312, 0.0, 0.0,
+                  0.669, -0.363, 0.0,
+                  -0.312, 0.0, 0.0,
+                  0.669, -0.363, 0.0,
+                  0.0, 0.0, 0.073,
+                  0.2, 0.2, 0.0, 0.6, 0.0, 0.0, 0.0,
+                  0.2, -0.2, 0.0, 0.6, 0.0, 0.0, 0.0]
+  # -----------------------------
+  # GetUp gains (23) projected from base fixed gains (29) + softer arms
+  # Legs same-ish, arms softer to avoid oscillation.
+  # -----------------------------
+  getup_kp_hw23: [
+    100.0, 100.0, 100.0, 150.0, 40.0, 40.0,
+    100.0, 100.0, 100.0, 150.0, 40.0, 40.0,
+    300.0,
+     60.0,  60.0,  30.0,  30.0, 12.0,
+     60.0,  60.0,  30.0,  30.0, 12.0
+  ]
+
+  getup_kd_hw23: [
+     2.0, 2.0, 2.0, 4.0, 2.0, 2.0,
+     2.0, 2.0, 2.0, 4.0, 2.0, 2.0,
+     3.0,
+     1.2, 1.2, 1.2, 1.2, 0.6,
+     1.2, 1.2, 1.2, 1.2, 0.6
+  ]
+
+  # Optional safety: torque limits for 23 (keep conservative)
+  torque_limits: [
+    300.0, 300.0, 300.0, 300.0, 20.0, 20.0,
+    300.0, 300.0, 300.0, 300.0, 20.0, 20.0,
+    300.0,
+    120.0, 120.0, 120.0, 120.0, 60.0,
+    120.0, 120.0, 120.0, 120.0, 60.0
+  ]
+  

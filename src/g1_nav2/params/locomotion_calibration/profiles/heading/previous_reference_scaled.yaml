@@ -1,0 +1,16 @@
+locomotion_calibration_node:
+  ros__parameters:
+
+    # Historical runtime model:
+    #
+    #   C(vx) = C_ref * min(vx / vx_ref, 1)
+    #
+    #   C_ref = 0.009887956027345258 rad/s
+    #   vx_ref = 0.12 m/s
+
+    enable_forward_heading_compensation: true
+
+    forward_heading_compensation_model_type: legacy_reference_scaled
+
+    forward_heading_compensation_wz: 0.009887956027345258
+    forward_heading_compensation_min_vx: 0.08

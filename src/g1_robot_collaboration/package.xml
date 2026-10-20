@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd"
+  schematypens="http://www.w3.org/2001/XMLSchema"?>
+
+<package format="3">
+
+  <name>g1_robot_collaboration</name>
+
+  <version>0.0.0</version>
+
+  <description>
+    Collaborative decision management between social navigation
+    and human-robot interaction for the Unitree G1.
+  </description>
+
+  <maintainer email="icmayoko18@gmail.com">jean</maintainer>
+
+  <license>Proprietary</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <!-- ROS 2 Python -->
+  <depend>rclpy</depend>
+
+  <!-- G1 interfaces -->
+  <depend>g1_social_msgs</depend>
+
+  <!-- ROS messages -->
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>action_msgs</depend>
+
+  <!-- Nav2 actions -->
+  <depend>nav2_msgs</depend>
+
+  <!-- TF -->
+  <depend>tf2_ros</depend>
+  <depend>tf2_geometry_msgs</depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+
+</package>
