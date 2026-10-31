@@ -202,3 +202,13 @@ float32 occupancy_ratio
 # any detection announcement occurs only after the required stop sequence
 # and confirmed physical immobilization.
 bool requires_explanation
+
+# Tracker session of the primary person associated with this event.
+string tracking_session_id
+
+# Current observation covers every participant of this episode.
+# This is not navigation authorization.
+bool observation_complete
+
+# Complete membership of the unresolved or just-cleared episode.
+SocialParticipant[] participants

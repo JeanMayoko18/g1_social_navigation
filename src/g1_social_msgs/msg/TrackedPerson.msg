@@ -32,3 +32,10 @@ uint32 observation_count
 #   TRACKED
 #   LOST
 string tracking_state
+
+# Identity-authority session, not the spatial node process session.
+string tracking_session_id
+builtin_interfaces/Time last_observation_stamp
+bool observed_in_current_array
+# True only for a current admissible derivative in the stated frame.
+bool velocity_valid

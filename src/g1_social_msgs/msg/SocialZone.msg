@@ -27,3 +27,9 @@ string zone_type
 
 # Source spatial tracking state.
 string tracking_state
+
+# Tracking producer session associated with person_id.
+string tracking_session_id
+
+# Source timestamp of the actual observation used to build this zone.
+builtin_interfaces/Time observation_stamp
