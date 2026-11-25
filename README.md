@@ -8,7 +8,28 @@
   <img src="https://img.shields.io/badge/Nav2-Navigation-success" alt="Nav2 navigation">
 </p>
 
+<p align="center">
+  <img src="img/g1_23dof.png" width="540" alt="Unitree G1 humanoid, 23-degree-of-freedom model">
+</p>
+
+*G1 model rendering from [Unitree Robotics](https://github.com/unitreerobotics/unitree_ros/blob/master/robots/g1_description/images/g1_23dof.png).*
+
 This ROS 2 workspace connects Nav2 to the Unitree G1 EDU+ locomotion system. The navigation stack uses a LiDAR scan, odometry and a map to localize the robot and follow a goal. Social navigation adds person perception and coordinates stopping, communication and resumption when someone is in the robot’s path. OM integration is planned.
+
+## System architecture
+
+![Operational modes and navigation configurations connected through shared coordination, execution validation and the G1 locomotion stack](img/architecture/system-overview.png)
+
+The overview shows the target architecture. Navigation configurations describe how the robot perceives and interacts during travel. High-level operational modes describe how it chooses and supervises actions. Shared OM coordination is part of the [integration roadmap](docs/oms.md). For the current execution paths, see [navigation](docs/navigation.md) and [social navigation](docs/social-navigation.md).
+
+<details>
+<summary><strong>Social navigation architecture</strong></summary>
+
+![Human-aware perception, temporal interpretation, collaboration and execution guards, with encounter memory feeding back to temporal interpretation](img/architecture/social-navigation.svg)
+
+[Read the social navigation guide](docs/social-navigation.md#social-navigation-architecture)
+
+</details>
 
 ## Workspace at a glance
 

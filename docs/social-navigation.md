@@ -9,6 +9,19 @@ Start with a working [mapped-navigation session](navigation.md). The [system lau
 | How are speech and explanations produced? | [HRI](../src/g1_hri/) and [explainability](../src/g1_robot_explainability/) |
 | Where are directional costmap constraints implemented? | [Social costmap](../src/g1_social_costmap/) |
 
+## Social navigation architecture
+
+![Social navigation architecture from human-aware perception to the Unitree G1, with encounter memory feeding back from execution guards to temporal interpretation](../img/architecture/social-navigation.svg)
+
+Perception supplies tracks and social zones. Temporal interpretation uses memory, pairing and freshness to maintain encounter context. The collaboration state machine and dialogue inform the execution guards. The feedback arrow returns interaction and encounter memory to temporal interpretation.
+
+<details>
+<summary>View the original project poster with the architecture and encounter scenarios</summary>
+
+![Research poster on human-aware humanoid navigation through verbal interaction and permission-based decision making](../img/architecture/social-navigation-poster.png)
+
+</details>
+
 ## Observe one encounter
 
 For an announcement-only trial, inspect the sequence from detection to stop, announcement and clearance or replanning. For a negotiated trial, also record the person’s response, permission decision and any directional constraint before resumption. Record the selected profile and interaction setting with the trial.
