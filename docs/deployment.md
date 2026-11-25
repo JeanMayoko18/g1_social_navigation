@@ -23,6 +23,8 @@ Complete [environment setup](environment.md), [locomotion bring-up](locomotion.m
 
 For hybrid runs that send RealSense images across Ethernet, the robot compresses the streams and the PC decompresses them. Use `camera_transport:=compressed` on both participating instances. When acquisition and consumption are on the same machine, the network compression step is unnecessary.
 
+For mapping, select `navigation_mode:=slam` at this same system entry point. See [mapping and autonomous navigation](navigation.md) for mapping, map saving and switching to Nav2.
+
 ## Profile A · navigation on PC
 
 The recorded PC example uses `pc_perception`. Profile A requires only the PC system launch in this deployment. The map path refers to the host running Nav2.

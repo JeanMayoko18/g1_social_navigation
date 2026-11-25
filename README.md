@@ -46,7 +46,7 @@ g1_ws/
 | Launch locomotion from the robot or PC | [Unitree LOCO or custom policy](docs/locomotion.md) |
 | Start hardware and select sensors and odometry | [Integrated or separate hardware bring-up](docs/hardware.md) |
 | Choose where to launch components | [Robot, PC and hybrid deployment](docs/deployment.md) |
-| Localize on a map, navigate to a goal or record a trial | [Autonomous navigation](docs/navigation.md) |
+| Build a map with SLAM Toolbox or navigate on a saved map | [Mapping and autonomous navigation](docs/navigation.md) |
 | Calibrate locomotion commands and odometry | [g1_navigation_calibration](https://github.com/JeanMayoko18/g1_navigation_calibration) |
 | Run an encounter with a person and inspect the robot’s response | [Social navigation](docs/social-navigation.md) |
 | Follow the planned OM integration | [OM roadmap](docs/oms.md) |

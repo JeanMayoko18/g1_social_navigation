@@ -1,13 +1,36 @@
-# Autonomous navigation
+# Mapping and autonomous navigation
 
-For a mapped indoor route, start with [deployment](deployment.md). Choose the occupancy map that matches the physical environment. The workspace includes [maps/g1_map.yaml](../maps/g1_map.yaml) and other map/image pairs.
+Start [hardware and sensors](hardware.md), then use the same [system entry point](../src/g1_social_bringup/launch/system.launch.py) for both tasks. Select the task with `navigation_mode`. The examples use profile A and run navigation on the PC. For onboard navigation, use `deployment:=robot_all host:=robot ros_distro:=foxy`. See [deployment](deployment.md) for role placement and RViz.
 
-| Task | Source entry point |
-| --- | --- |
-| Inspect real-robot AMCL localization | [real_robot_amcl_localization.launch.py](../src/g1_nav2/launch/real_robot_amcl_localization.launch.py) |
-| Inspect navigation bringup | [g1_bringup.launch.py](../src/g1_nav2/launch/g1_bringup.launch.py) |
-| Build a map on the robot | [slam_mapping_real.launch.py](../src/g1_nav2/launch/slam_mapping_real.launch.py) |
-| Inspect locomotion calibration | [locomotion_calibration.launch.py](../src/g1_nav2/launch/locomotion_calibration.launch.py) |
+## Build a map with SLAM Toolbox
+
+On the navigation host, confirm scan delivery with `ros2 topic hz /scan` and odometry TF with `ros2 run tf2_ros tf2_echo odom base_footprint`. On the PC, start mapping:
+
+```bash
+ros2 launch g1_social_bringup system.launch.py \
+  profile:=A interaction:=none \
+  deployment:=pc_perception host:=pc ros_distro:=humble \
+  navigation_mode:=slam
+```
+
+The system includes [navigation.launch.py](../src/g1_social_bringup/launch/navigation.launch.py) on the host that owns navigation. It forwards the mode to [g1_bringup.launch.py](../src/g1_nav2/launch/g1_bringup.launch.py), which selects [slam.launch.py](../src/g1_nav2/launch/slam.launch.py). This child starts `slam_toolbox/async_slam_toolbox_node` in mapping mode. It consumes `/scan`, uses the frames `map`, `odom` and `base_footprint` by default, and builds a grid with 0.05 m cells.
+
+In RViz, set the fixed frame to `map` and display `/map`. As the robot explores, check that the occupancy grid grows with the observed surroundings. To save it while SLAM is running, use a second sourced terminal and choose a fresh map name:
+
+```bash
+ros2 run nav2_map_server map_saver_cli -f "$HOME/g1_ws/maps/g1_trial_01"
+```
+
+## Navigate with a saved map
+
+End the mapping launch before switching modes. On the host running Nav2, supply the YAML for the saved occupancy grid:
+
+```bash
+ros2 launch g1_social_bringup system.launch.py \
+  profile:=A interaction:=none \
+  deployment:=pc_perception host:=pc ros_distro:=humble \
+  navigation_mode:=nav2 map:="$HOME/g1_ws/maps/g1_trial_01.yaml"
+```
 
 ## Check a mapped-navigation session
 
