@@ -16,6 +16,211 @@
 
 This ROS 2 workspace connects Nav2 to the Unitree G1 EDU+ locomotion system. The navigation stack uses a LiDAR scan, odometry and a map to localize the robot and follow a goal. Social navigation adds person perception and coordinates stopping, communication and resumption when someone is in the robot’s path. OM integration is planned.
 
+## Test the framework on your G1
+
+Start with step 1, then open the task you want to run. Steps 3–5 accept an existing map of your environment. Each block identifies the host and includes a check for a successful run.
+
+<details>
+<summary><strong>1 · Shared hardware, scan and odometry</strong></summary>
+
+Use a built workspace on each participating host. For a wired PC, complete the [Ethernet check](docs/network.md). In **each new terminal**, source the [host environment](docs/environment.md). On the PC use Humble; on the robot use Foxy. The examples below place hardware on the G1 and navigation on the PC.
+
+**Robot terminal 1 · locomotion.** Use the wired interface for this host (the project G1 uses `eth0`). For the Unitree LOCO backend:
+```bash
+ros2 run rl_sar rl_real_g1_edu23_unitree_loco eth0 --real --control-backend=unitree_loco --max-motion-duration=0.0
+```
+Press **0** for Bring Up, wait for the ready posture, then press **1** for Enter Locomotion. Keep this terminal running. For a custom policy or PC-hosted locomotion, use the [locomotion guide](docs/locomotion.md).
+
+**Robot terminal 2 · shared hardware.** Start one hardware instance. Edit the three selections at the top before running. Use `camera=false` for mapping or ordinary navigation and `camera=true` for a social trial. For Livox, source the installed driver overlay first (on the project robot: `source ~/ros2_ws/install/setup.bash`, then `source ~/g1_ws/install/setup.bash`).
+```bash
+scan=livox          # livox or unitree
+odom=dogc           # see the source table below
+camera=false        # false for A; true for C or D
+livox_driver=false
+if [ "$scan" = livox ]; then livox_driver=true; fi
+dog_calibration=false
+if [ "$odom" = dogc ]; then dog_calibration=true; fi
+
+ros2 launch rl_sar hardware.launch.py \
+  run_robot_core:=true run_lidar_pipeline:=true \
+  lidar_source:="$scan" enable_livox_driver:="$livox_driver" \
+  scan_target_frame:=base_footprint scan_min_height:=-0.53 scan_max_height:=0.72 \
+  odom_source:="$odom" enable_dog_odom_calibration:="$dog_calibration" \
+  run_realsense_pipeline:="$camera" enable_realsense:="$camera" enable_realsense_tf:="$camera"
+```
+If a separate driver already supplies the Livox cloud, set `livox_driver=false` before executing the launch. The Livox height limits are in the project G1’s planar frame at pelvis height. Check these limits for your robot. Changing from A to C/D requires RGB-D: stop and restart terminal 2 with `camera=true`, or use the separate camera procedure in [Hardware](docs/hardware.md). Keep the same hardware running when switching between C and D.
+
+| Odometry choice | Selector input | What the robot must supply |
+| --- | --- | --- |
+| `dog` | `/dog_odom_2d` | Baseline planar DOG odometry. |
+| `dogc` | `/odom_dog_calibrated` | Calibrated DOG. This is the project's tested longitudinal correction. |
+| `unitree` | `/odom_unitree` | Unitree mode-state odometry. Observed with LOCO; verify publication with your backend. |
+| `aocf` | `/odom_aocf` | Start the configured adaptive DOG producer first. |
+| `mola` | `/odom_mola_nav` | Start configured MOLA and its navigation adapter first. |
+| `dogekf` | `/odom_dog_ekf` | Requires a running DOG EKF. Listed by the selector; no trial recipe supplied. |
+
+In the inspected robot core, automatic startup of the AOCF, MOLA adapter and DOG EKF nodes is commented out. Selecting one routes its input; confirm the producer delivers samples. Either scan choice feeds `/scan`. All odometry choices feed the same `/odom` and `odom → base_footprint` TF.
+
+**PC · verify the hardware before continuing.** Run each streaming check separately; press Ctrl+C after observing samples. For C/D also check color and aligned depth.
+```bash
+ros2 topic hz /scan
+ros2 topic hz /odom
+ros2 run tf2_ros tf2_echo odom base_footprint
+```
+
+
+**Profile A on PC.** In the supplied system launcher, remote image ingress is triggered by host placement even when social perception is disabled. This documentation bundle includes a [small launcher patch](docs/profile-a-image-ingress.patch). On the PC checkout that uses that launcher, apply it once before either A recipe. Run from a sourced terminal. An already updated checkout can skip this step.
+
+```bash
+cd ~/g1_ws
+git apply --check docs/profile-a-image-ingress.patch &&
+git apply docs/profile-a-image-ingress.patch &&
+colcon build --packages-select g1_social_bringup &&
+source install/setup.bash
+```
+If the check fails, inspect the launcher before proceeding. The RGB/depth ingress predicates and compressed-image sender should all require a camera-enabled profile. B, C and D retain their existing image paths.
+
+</details>
+
+<details>
+<summary><strong>2 · Create and save a map — A, LiDAR only</strong></summary>
+
+Use shared hardware with **camera=false**. In a prepared PC terminal, start asynchronous SLAM:
+```bash
+ros2 launch g1_social_bringup system.launch.py \
+  profile:=A interaction:=none \
+  deployment:=pc_perception host:=pc ros_distro:=humble \
+  camera_transport:=raw enable_yolo:=false start_visual_odometry:=false \
+  enable_visualization:=true enable_social_rviz:=false \
+  enable_ros4hri_visualization:=false enable_raw_image_visualization:=false \
+  navigation_mode:=slam
+```
+In a second PC terminal, the following check should print no matching nodes on a dedicated A session. If it prints one, identify the owning launch before continuing.
+```bash
+ros2 node list | grep -Ei 'realsense|yolo|image_ingress|rgb_network_transport|person_depth|person_tracking|visual_odometry|social_zone_generator'
+```
+Set the RViz fixed frame to `map`. Move the robot using the operator control already configured for your locomotion backend and observe the occupancy grid growing along the route. In another sourced PC terminal, check the map and save it under a fresh name:
+```bash
+ros2 topic info /map
+mkdir -p "$HOME/g1_ws/maps"
+ros2 run nav2_map_server map_saver_cli -f "$HOME/g1_ws/maps/g1_trial_01"
+ls -l "$HOME/g1_ws/maps/g1_trial_01".*
+```
+Expect a map YAML and its referenced occupancy image. Stop the SLAM system launch with Ctrl+C before starting AMCL; the hardware can keep running.
+
+</details>
+
+<details>
+<summary><strong>3 · Navigate on a saved map — A, LiDAR only</strong></summary>
+
+Use shared hardware with **camera=false**. Start with a saved map of the test area. In a prepared PC terminal:
+```bash
+map_file="$HOME/g1_ws/maps/g1_trial_01.yaml"
+test -r "$map_file" &&
+ros2 launch g1_social_bringup system.launch.py \
+  profile:=A interaction:=none \
+  deployment:=pc_perception host:=pc ros_distro:=humble \
+  camera_transport:=raw enable_yolo:=false start_visual_odometry:=false \
+  enable_visualization:=true enable_social_rviz:=false \
+  enable_ros4hri_visualization:=false enable_raw_image_visualization:=false \
+  navigation_mode:=nav2 map:="$map_file" controller:=dwb navigation_speed:=0.12
+```
+Use the selected odometry and scan from the shared hardware step. In RViz, set **2D Pose Estimate** at the robot’s actual position and heading. Check that the scan follows the walls. In another sourced terminal:
+```bash
+ros2 run tf2_ros tf2_echo map base_footprint
+# After stopping the TF display with Ctrl+C:
+ros2 action info /navigate_to_pose
+```
+Send a nearby reachable **Nav2 Goal**. Check that the action server accepts the goal and RViz reports arrival. Run the profile A node check below to confirm the visual and social pipelines are absent.
+In a second PC terminal, the following check should print no matching nodes on a dedicated A session. If it prints one, identify the owning launch before continuing.
+```bash
+ros2 node list | grep -Ei 'realsense|yolo|image_ingress|rgb_network_transport|person_depth|person_tracking|visual_odometry|social_zone_generator'
+```
+
+</details>
+
+<details>
+<summary><strong>4 · Social navigation — C, announcements</strong></summary>
+
+Start the shared hardware with **camera=true** and a saved map. Stop the preceding system launch on both hosts before changing profiles. Check RGB and aligned depth on the robot (Ctrl+C between checks).
+
+```bash
+ros2 topic hz /camera/camera/color/image_raw
+ros2 topic hz /camera/camera/aligned_depth_to_color/image_raw
+```
+**Robot terminal 3 · speech and RGB transport**
+
+```bash
+ros2 launch g1_social_bringup system.launch.py \
+  profile:=C interaction:=none deployment:=pc_perception \
+  camera_transport:=compressed identity_backend:=yolo_track language:=en \
+  host:=robot ros_distro:=foxy enable_yolo:=false \
+  navigation_mode:=nav2 enable_visualization:=false
+```
+**PC terminal 1 · inference, collaboration and Nav2**
+
+```bash
+ros2 launch g1_social_bringup system.launch.py \
+  profile:=C interaction:=none deployment:=pc_perception \
+  camera_transport:=compressed identity_backend:=yolo_track language:=en \
+  host:=pc ros_distro:=humble enable_yolo:=true \
+  collaboration_manager_type:=simple_cd anticipatory_planning_enabled:=false \
+  navigation_mode:=nav2 map:="$HOME/g1_ws/maps/g1_trial_01.yaml" \
+  controller:=dwb navigation_speed:=0.12 start_visual_odometry:=false \
+  enable_visualization:=true enable_social_rviz:=true
+```
+**PC terminal 2 · observe the encounter.** Check that the receiver and person tracker deliver data, set the initial pose in RViz and send a reachable goal.
+
+```bash
+ros2 topic hz /perception/transport/color
+# With a person in view, inspect the available social, speech and HRI streams:
+ros2 topic list -t | grep -E "social_navigation|explainability|/hri/"
+```
+Have a participant enter the path. Observe the stop and announcement, then have the participant clear the path. Check resumption or replanning and arrival at the original goal.
+
+</details>
+
+<details>
+<summary><strong>5 · Social navigation — D, dialogue</strong></summary>
+
+Start the shared hardware with **camera=true** and a saved map. Stop the preceding system launch on both hosts before changing profiles. Check RGB and aligned depth on the robot (Ctrl+C between checks).
+
+```bash
+ros2 topic hz /camera/camera/color/image_raw
+ros2 topic hz /camera/camera/aligned_depth_to_color/image_raw
+```
+**Robot terminal 3 · speech and RGB transport**
+
+```bash
+ros2 launch g1_social_bringup system.launch.py \
+  profile:=D interaction:=dialogue deployment:=pc_perception \
+  camera_transport:=compressed identity_backend:=yolo_track language:=en \
+  host:=robot ros_distro:=foxy enable_yolo:=false \
+  navigation_mode:=nav2 enable_visualization:=false
+```
+**PC terminal 1 · inference, collaboration and Nav2**
+
+```bash
+ros2 launch g1_social_bringup system.launch.py \
+  profile:=D interaction:=dialogue deployment:=pc_perception \
+  camera_transport:=compressed identity_backend:=yolo_track language:=en \
+  host:=pc ros_distro:=humble enable_yolo:=true \
+  collaboration_manager_type:=simple_cd anticipatory_planning_enabled:=false \
+  navigation_mode:=nav2 map:="$HOME/g1_ws/maps/g1_trial_01.yaml" \
+  controller:=dwb navigation_speed:=0.12 start_visual_odometry:=false \
+  enable_visualization:=true enable_social_rviz:=true
+```
+**PC terminal 2 · observe the encounter.** Check that the receiver and person tracker deliver data, set the initial pose in RViz and send a reachable goal.
+
+```bash
+ros2 topic hz /perception/transport/color
+# With a person in view, inspect the available social, speech and HRI streams:
+ros2 topic list -t | grep -E "social_navigation|explainability|/hri/"
+```
+Confirm microphone/ASR availability on the Humble dialogue host and audible speech on the robot. During a goal, have a participant enter the path, wait for the robot’s question and answer it. Observe permission and any agreed passing side, then the resumed goal. Record whether a directional mask was available when testing a side preference.
+
+</details>
+
 ## System architecture
 
 ![Operational modes and navigation configurations connected through shared coordination, execution validation and the G1 locomotion stack](img/architecture/system-overview.png)
@@ -71,6 +276,11 @@ g1_ws/
 | Calibrate locomotion commands and odometry | [g1_navigation_calibration](https://github.com/JeanMayoko18/g1_navigation_calibration) |
 | Run an encounter with a person and inspect the robot’s response | [Social navigation](docs/social-navigation.md) |
 | Follow the planned OM integration | [OM roadmap](docs/oms.md) |
+
+
+## Choose a launch configuration
+
+Start with the [launch matrix and commands](docs/camera-deployment.md) to choose mapping, LiDAR-only navigation or social navigation, then select the PC, robot or hybrid deployment. For camera-enabled profiles, specify where the RealSense driver runs.
 
 ## Acknowledgements
 

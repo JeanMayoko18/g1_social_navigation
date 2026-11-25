@@ -337,21 +337,24 @@ def _resolve_and_launch(context):
         == "true"
     )
 
-    camera_host = "robot"
+    camera_host = LaunchConfiguration("camera_host").perform(context)
 
-    # Remote RGB is required by either YOLO inference
-    # or person appearance extraction.
+    # Profile B uses camera obstacles. Profiles C and D use social perception.
+    # Profile A uses LiDAR only.
+    image_roles_enabled = plan.camera_obstacles or plan.social_navigation
+
+    # Request remote RGB only when this host runs an image consumer.
     remote_rgb_required = (
-        (
-            vision_is_local
-            or social_perception_is_local
-        )
+        image_roles_enabled
         and plan.host != camera_host
+        and (vision_is_local or social_perception_is_local)
     )
 
+    # Request remote depth only on the host assigned to social perception.
     remote_depth_required = (
-        social_perception_is_local
+        image_roles_enabled
         and plan.host != camera_host
+        and social_perception_is_local
     )
 
     visualization_is_local = plan.owns(
@@ -444,9 +447,15 @@ def _resolve_and_launch(context):
     # ---------------------------------------------------------
     # IMAGE TRANSPORT
     # ---------------------------------------------------------
-    if camera_transport == "compressed":
+    if image_roles_enabled and camera_transport == "compressed":
 
-        if plan.host == "robot":
+        # The peer may enable YOLO independently of this host.
+        remote_rgb_role = any(
+            plan.role_hosts[role] != camera_host
+            for role in ("vision_inference", "social_perception")
+        )
+
+        if plan.host == camera_host and remote_rgb_role:
             actions.append(
                 Node(
                     package="image_transport",
@@ -464,7 +473,7 @@ def _resolve_and_launch(context):
                 )
             )
 
-        elif plan.host == "pc" and remote_rgb_required:
+        elif remote_rgb_required:
             actions.append(
                 Node(
                     package="image_transport",
@@ -1362,6 +1371,13 @@ def generate_launch_description():
                     "pc_all | robot_all | "
                     "robot_perception | pc_perception"
                 ),
+            ),
+
+            DeclareLaunchArgument(
+                "camera_host",
+                default_value="robot",
+                choices=["robot", "pc"],
+                description="Host running the RealSense acquisition driver.",
             ),
 
             DeclareLaunchArgument(
