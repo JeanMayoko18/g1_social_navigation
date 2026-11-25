@@ -25,11 +25,41 @@ Start with step 1, then open the task you want to run. Steps 3–5 accept an exi
 
 Use a built workspace on each participating host. For a wired PC, complete the [Ethernet check](docs/network.md). In **each new terminal**, source the [host environment](docs/environment.md). On the PC use Humble; on the robot use Foxy. The examples below place hardware on the G1 and navigation on the PC.
 
-**Robot terminal 1 · locomotion.** Use the wired interface for this host (the project G1 uses `eth0`). For the Unitree LOCO backend:
+**Terminal 1 · Start locomotion on the robot or PC**
+
+Choose one of the four combinations below. The locomotion host can be
+selected independently of the host running Nav2, perception or dialogue.
+Start one locomotion executable for the session.
+
+Prepare the [environment for the selected host](docs/environment.md).
+The project G1 uses `eth0` on the robot. For a PC launch, first complete
+the [Ethernet setup](docs/network.md). In the same PC terminal, identify
+the wired interface connected to the G1 and enter its name:
+
 ```bash
-ros2 run rl_sar rl_real_g1_edu23_unitree_loco eth0 --real --control-backend=unitree_loco --max-motion-duration=0.0
+ip -br addr
+read -rp "Ethernet interface connected to the G1: " G1_IFACE
+ip -br addr show dev "$G1_IFACE"
 ```
-Press **0** for Bring Up, wait for the ready posture, then press **1** for Enter Locomotion. Keep this terminal running. For a custom policy or PC-hosted locomotion, use the [locomotion guide](docs/locomotion.md).
+
+**Before launching a custom policy from either host**, press **L2 + R2
+simultaneously** on the G1 controller and wait for Debug mode. If there
+is no audible confirmation, check the robot’s Debug-mode indicator before
+running the command.
+
+| Launch host | Locomotion backend | Run this command |
+| --- | --- | --- |
+| Robot · ROS 2 Foxy | Unitree LOCO (default) | `ros2 run rl_sar rl_real_g1_edu23_unitree_loco eth0 --real --control-backend=unitree_loco --max-motion-duration=0.0` |
+| Robot · ROS 2 Foxy | Custom policy | `ros2 run rl_sar rl_real_g1_edu23_unitree eth0 --real` |
+| PC · ROS 2 Humble | Unitree LOCO (default) | `ros2 run rl_sar rl_real_g1_edu23_unitree_loco "$G1_IFACE" --real --control-backend=unitree_loco --max-motion-duration=0.0` |
+| PC · ROS 2 Humble | Custom policy | `ros2 run rl_sar rl_real_g1_edu23_unitree "$G1_IFACE" --real` |
+
+**For all four combinations**, use the terminal where you started locomotion:
+
+1. Press **0** for **Bring Up**.
+2. Wait until bring-up completes and the G1 reaches its ready posture.
+3. Press **1** for **Enter Locomotion**.
+4. Keep this terminal running and continue with shared hardware bring-up.
 
 **Robot terminal 2 · shared hardware.** Start one hardware instance. Edit the three selections at the top before running. Use `camera=false` for mapping or ordinary navigation and `camera=true` for a social trial. For Livox, source the installed driver overlay first (on the project robot: `source ~/ros2_ws/install/setup.bash`, then `source ~/g1_ws/install/setup.bash`).
 ```bash
