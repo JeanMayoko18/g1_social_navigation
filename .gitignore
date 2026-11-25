@@ -197,3 +197,15 @@ language_*.txt
 *.before_*
 /tools/*_backups/
 /tools/*_backup/
+
+# Local poster environment, materials and generation script
+/.venv-poster/
+
+
+# Generated experiment outputs and local review archive
+/benchmark_results/
+/scripts/figures/
+/scripts/resultats_hri/
+/navigation_analysis_code_review.zip
+
+
