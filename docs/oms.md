@@ -1,5 +1,7 @@
 # OM integration roadmap
 
+![Proposed coordination between operational modes and navigation configurations](../img/architecture/system-overview.png)
+
 **Status: planned.** The current reference experiment is a social-navigation encounter with the active profile, perception events, interaction decision and navigation outcome recorded.
 
 1. Establish which coordination decisions each social-navigation configuration already makes and which decision an OM should inform.

@@ -2,6 +2,12 @@
 
 Start [hardware and sensors](hardware.md), then use the same [system entry point](../src/g1_social_bringup/launch/system.launch.py) for both tasks. Select the task with `navigation_mode`. The examples use profile A and run navigation on the PC. For onboard navigation, use `deployment:=robot_all host:=robot ros_distro:=foxy`. See [deployment](deployment.md) for role placement and RViz.
 
+## Navigation architecture
+
+![Nav2 command path to the G1 and localization feedback from time-aligned LiDAR and calibrated odometry](../img/architecture/navigation.png)
+
+For navigation on a saved map, follow the upper path from the mission goal through Nav2, command selection, optional compensation and the locomotion bridge. The lower path shows how odometry and planar scans feed localization and obstacle observations. The AMCL and map-server blocks describe saved-map navigation. For mapping, the launcher selects SLAM Toolbox.
+
 ## Build a map with SLAM Toolbox
 
 On the navigation host, confirm scan delivery with `ros2 topic hz /scan` and odometry TF with `ros2 run tf2_ros tf2_echo odom base_footprint`. On the PC, start mapping:
