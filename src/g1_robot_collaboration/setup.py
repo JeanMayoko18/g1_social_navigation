@@ -48,8 +48,14 @@ setup(
             "trajectory_manager = "
             "g1_robot_collaboration.trajectory_manager:main",
 
+            "pre_goal_announcement = "
+            "g1_robot_collaboration.pre_goal_announcement_node:main",
+
             "trajectory_social_validator = "
             "g1_robot_collaboration.trajectory_social_validator:main",
+
+            'directional_keepout_mask_node = '
+            'g1_robot_collaboration.directional_keepout_mask_node:main',
 
             "robot_motion_state_monitor = "
             "g1_robot_collaboration.robot_motion_state_monitor_node:main",

@@ -67,6 +67,10 @@ string intent_to_confirm
 # never in the robot's reference frame.
 string direction_to_confirm
 
+string directional_reference
+string resolved_robot_direction
+uint8 directional_retry_index
+
 # Person associated with the dialogue interaction.
 string person_id
 

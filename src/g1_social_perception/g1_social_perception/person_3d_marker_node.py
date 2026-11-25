@@ -29,13 +29,12 @@ from collections import OrderedDict
 
 from visualization_msgs.msg import Marker
 from visualization_msgs.msg import MarkerArray
-
+from g1_social_msgs.msg import SocialZoneArray, TrackedPersonArray
 from yolo_msgs.msg import DetectionArray
 
 from g1_qos_manager.profiles import reliable_qos
 from g1_qos_manager.resolver import resolve_subscription_qos
 from g1_qos_manager.diagnostics import log_qos_resolution
-from g1_social_msgs.msg import SocialZoneArray
 
 class Person3DMarkerNode(Node):
     """Publish RViz markers for fused 3D person detections."""
@@ -272,6 +271,13 @@ class Person3DMarkerNode(Node):
             social_zones_qos,
         )
 
+        self.tracked_persons_sub = self.create_subscription(
+            TrackedPersonArray,
+            "/social_perception/tracked_persons",
+            self.tracked_persons_callback,
+            reliable_qos(depth=10),
+        )
+
 
         self.publisher = self.create_publisher(
             MarkerArray,
@@ -379,7 +385,64 @@ class Person3DMarkerNode(Node):
         self.publisher.publish(
             marker_array
         )
+    
+    def tracked_persons_callback(self, msg: TrackedPersonArray):
+        marker_array = MarkerArray()
 
+        for index, person in enumerate(msg.persons):
+
+            # Visualiser uniquement les personnes actuellement observées.
+            if (
+                person.tracking_state != "TRACKED"
+                or not person.observed_in_current_array
+            ):
+                continue
+
+            x = float(person.position.x)
+            y = float(person.position.y)
+
+            if not (
+                math.isfinite(x)
+                and math.isfinite(y)
+            ):
+                continue
+
+            marker = Marker()
+
+            marker.header = msg.header
+            marker.ns = "tracked_person_cylinders"
+            marker.id = index
+
+            marker.type = Marker.CYLINDER
+            marker.action = Marker.ADD
+
+            marker.pose.position.x = x
+            marker.pose.position.y = y
+
+            # Place the cylinder vertically above the navigation plane.
+            marker.pose.position.z = (
+                self.visualization_ground_z
+                + self.cylinder_height / 2.0
+            )
+
+            marker.pose.orientation.w = 1.0
+
+            marker.scale.x = self.cylinder_min_diameter
+            marker.scale.y = self.cylinder_min_diameter
+            marker.scale.z = self.cylinder_height
+
+            marker.color.r = 0.1
+            marker.color.g = 1.0
+            marker.color.b = 0.1
+            marker.color.a = 0.65
+
+            marker.lifetime.sec = 1
+
+            marker_array.markers.append(marker)
+
+        if marker_array.markers:
+            self.publisher.publish(marker_array)
+            
     def social_zones_callback(
         self,
         msg: SocialZoneArray,
@@ -396,6 +459,15 @@ class Person3DMarkerNode(Node):
         self.latest_social_zones_received_at = (
             time.monotonic()
         )
+
+        # Publish social-zone markers directly from their own input.
+        # Do not depend on the legacy YOLO detection topic.
+        marker_array = MarkerArray()
+
+        self._append_social_zone_markers(marker_array)
+
+        if marker_array.markers:
+            self.publisher.publish(marker_array)
 
     def _get_social_marker_id(
         self,
@@ -946,7 +1018,7 @@ class Person3DMarkerNode(Node):
             )
 
         # ================================================================
-        # UPDATE DISPLAYED STATE
+        # UPDATE DISPLAYED STATE Anadir la firma del color
         # ================================================================
 
         self.previous_social_zone_ids = (

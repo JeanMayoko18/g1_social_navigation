@@ -292,6 +292,7 @@ def generate_launch_description():
             "perception_profile": (
                 perception_profile
             ),
+            "interaction": LaunchConfiguration("interaction"),
             "navigation_speed": (
                 navigation_speed
             ),
@@ -767,7 +768,6 @@ def generate_launch_description():
         actions=[map_republisher],
     )
 
-
     #nav_scaler_delayed = TimerAction(period=12.0, actions=[cmd_vel_nav_scalers])
     locomotion_calibration_delayed = TimerAction(period=12.0, actions=[locomotion_calibration])
     twist_mux_delayed = TimerAction(period=13.0, actions=[twist_mux_node])
@@ -854,6 +854,13 @@ def generate_launch_description():
                 "Applied to DWB max_vel_x/max_speed_xy or to RPP "
                 "desired_linear_vel."
             ),
+        ),
+        
+        DeclareLaunchArgument(
+            "interaction",
+            default_value="none",
+            choices=["none", "dialogue"],
+            description="Social interaction policy.",
         ),
 
         DeclareLaunchArgument(

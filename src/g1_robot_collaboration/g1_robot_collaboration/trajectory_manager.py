@@ -322,6 +322,12 @@ class TrajectoryManager(Node):
         # person_id -> (SocialZone, receive_monotonic)
         self.social_zones = {}
 
+        # Historical observations are planning hints, not safety evidence.
+        self._planning_zone_history = {}
+
+        # Preserve exactly one identical waypoint retry per direction.
+        self._directional_waypoints = {}
+
         self.timeout_notified_requests = set()
 
         # Requests whose planning result can no longer authorize
@@ -380,6 +386,17 @@ class TrajectoryManager(Node):
             String,
             "/social_navigation/trajectory_generation_result",
             10,
+        )
+
+        self.terminal_generation_results = {}
+        self.generation_reconcile_futures = {}
+
+        self.generation_status_request_sub = self.create_subscription(
+            String,
+            "/social_navigation/trajectory_generation_status_request",
+            self._generation_status_request_callback,
+            10,
+            callback_group=self.callback_group,
         )
 
 
@@ -462,6 +479,18 @@ class TrajectoryManager(Node):
             )
             return
 
+        with self.state_lock:
+            terminal = self.terminal_generation_results.get(
+                request_id
+            )
+
+        if terminal is not None:
+            if terminal["navigation_goal_id"] == navigation_goal_id:
+                self.generation_result_pub.publish(
+                    String(data=json.dumps(terminal))
+                )
+            return
+        
         generation_reason = (
             str(msg.generation_reason)
             .strip()
@@ -866,43 +895,97 @@ class TrajectoryManager(Node):
     # PERSON-RELATIVE WAYPOINT
     # ====================================================================
 
-    def _build_directional_waypoint(
-        self,
-        msg,
-        metadata
-    ):
-        entry = self._get_fresh_social_zone(
-            metadata.person_id
+    def _build_directional_waypoint(self, msg, metadata):
+        """
+        Build person-relative planning waypoints with one exact retry.
+
+        Historical geometry may be used as a planning hint only.
+        It never constitutes trajectory validation or motion clearance.
+        """
+        now = time.monotonic()
+
+        key = (
+            str(metadata.navigation_goal_id),
+            str(metadata.person_id),
+            str(metadata.directional_constraint),
         )
 
-        if entry is None:
+        with self.state_lock:
+            previous = self._directional_waypoints.get(key)
+
+            if (
+                previous is not None
+                and now - previous["created_at"] >= 180.0
+            ):
+                self._directional_waypoints.pop(key, None)
+                previous = None
+
+            # Retry the same waypoint exactly once.
+            if previous is not None and previous["attempts"] == 1:
+                previous["attempts"] = 2
+
+                self.get_logger().info(
+                    "[DIRECTIONAL PLAN] Repeating exact waypoint | "
+                    f"direction={metadata.directional_constraint}"
+                )
+
+                return copy.deepcopy(previous["waypoint"])
+
+        direction = str(
+            metadata.directional_constraint
+        ).strip().upper()
+
+        if direction not in {"LEFT", "RIGHT"}:
             return None
 
-        zone, header = entry
-
-        target = str(
+        target_frame = str(
             msg.goal.header.frame_id
         ).strip()
 
-        if (
-            not target
-            or metadata.directional_constraint
-            not in {"LEFT", "RIGHT"}
-        ):
+        if not target_frame:
             return None
 
-        sign = (
-            1.0
-            if metadata.directional_constraint == "LEFT"
-            else -1.0
+        # Prefer current observations for a new planning proposal.
+        fresh = self._get_fresh_social_zone(
+            metadata.person_id
         )
 
-        # A side waypoint proposes a route;
-        # the full path still needs validation.
+        historical = False
+
+        if fresh is None:
+            with self.state_lock:
+                saved = self._planning_zone_history.get(
+                    str(metadata.person_id)
+                )
+
+            if saved is None or now - saved[2] > 180.0:
+                return None
+
+            zone = copy.deepcopy(saved[0])
+            header = copy.deepcopy(saved[1])
+            historical = True
+
+        else:
+            zone, header = fresh
+
+        with self.state_lock:
+            attempts = (
+                previous["attempts"]
+                if previous is not None
+                else 0
+            )
+
+        # LEFT and RIGHT are relative to the person's heading.
+        sign = 1.0 if direction == "LEFT" else -1.0
+
         offset = max(
-            self.passage_lateral_offset_m,
-            float(zone.radius_lateral) + 0.35
+            float(self.passage_lateral_offset_m),
+            float(zone.radius_lateral) + 0.35,
         )
+
+        # After the identical retry, explore a wider proposal.
+        if attempts >= 2:
+            offset += 0.40 * (attempts - 1)
 
         x = (
             float(zone.center.x)
@@ -916,69 +999,46 @@ class TrajectoryManager(Node):
 
         z = float(zone.center.z)
 
-        if header.frame_id != target:
+        if str(header.frame_id) != target_frame:
             try:
-                tf = self.tf_buffer.lookup_transform(
-                    target,
-                    header.frame_id,
-                    Time.from_msg(header.stamp),
+                # Historical geometry is only a planning reference.
+                # Use the latest available frame transform when needed.
+                timestamp = (
+                    Time()
+                    if historical
+                    else Time.from_msg(header.stamp)
+                )
+
+                transform = self.tf_buffer.lookup_transform(
+                    target_frame,
+                    str(header.frame_id),
+                    timestamp,
                     timeout=Duration(seconds=0.0),
-                ).transform
-
-                q = tf.rotation
-
-                norm = math.hypot(
-                    q.x,
-                    q.y,
-                    q.z,
-                    q.w
                 )
 
-                if (
-                    not math.isfinite(norm)
-                    or norm <= 1e-12
-                ):
-                    return None
-
-                qx, qy, qz, qw = (
-                    q.x / norm,
-                    q.y / norm,
-                    q.z / norm,
-                    q.w / norm
+                x, y, z = self._transform_point(
+                    x,
+                    y,
+                    z,
+                    transform,
                 )
 
-                tx, ty, tz = (
-                    2 * (qy*z - qz*y),
-                    2 * (qz*x - qx*z),
-                    2 * (qx*y - qy*x)
-                )
-
-                x, y, z = (
-                    x + qw*tx + qy*tz - qz*ty
-                    + tf.translation.x,
-
-                    y + qw*ty + qz*tx - qx*tz
-                    + tf.translation.y,
-
-                    z + qw*tz + qx*ty - qy*tx
-                    + tf.translation.z,
-                )
-
-            except TransformException as exc:
+            except (TransformException, ValueError) as exc:
                 self.get_logger().warning(
-                    f"[TRAJECTORY] TF unavailable: {exc}"
+                    "[DIRECTIONAL PLAN] TF unavailable | "
+                    f"error={exc}"
                 )
                 return None
 
         if not all(
-            math.isfinite(v)
-            for v in (x, y, z)
+            math.isfinite(value)
+            for value in (x, y, z)
         ):
             return None
 
         waypoint = PoseStamped()
 
-        waypoint.header.frame_id = target
+        waypoint.header.frame_id = target_frame
         waypoint.header.stamp = (
             self.get_clock().now().to_msg()
         )
@@ -986,10 +1046,30 @@ class TrajectoryManager(Node):
         waypoint.pose.position.x = x
         waypoint.pose.position.y = y
         waypoint.pose.position.z = z
-
         waypoint.pose.orientation.w = 1.0
 
+        with self.state_lock:
+            self._directional_waypoints[key] = {
+                "waypoint": copy.deepcopy(waypoint),
+                "attempts": attempts + 1,
+                "created_at": (
+                    previous["created_at"]
+                    if previous is not None
+                    else now
+                ),
+            }
+
+        self.get_logger().info(
+            "[DIRECTIONAL PLAN] "
+            f"goal={metadata.navigation_goal_id} | "
+            f"direction={direction} | "
+            f"attempt={attempts + 1} | "
+            f"historical_hint={historical} | "
+            f"waypoint=({x:.2f}, {y:.2f})"
+        )
+
         return waypoint
+
     @staticmethod
     def _transform_point(x, y, z, transform):
         """Apply a normalized rigid transform without modifying input."""
@@ -1028,37 +1108,59 @@ class TrajectoryManager(Node):
         )
     
     def _get_fresh_social_zone(self, person_id):
+        """Return bounded planning geometry; never authorize execution."""
+        person_id = str(person_id or "").strip()
+        limit = self._planning_geometry_max_age()
+
         with self.state_lock:
-            entry = self.social_zones.get(
-                person_id
-            )
+            entry = self.social_zones.get(person_id)
 
         if entry is None:
+            self.get_logger().warning(
+                "[PLANNING GEOMETRY] "
+                f"person={person_id} | "
+                "reason=ZONE_NOT_CACHED"
+            )
             return None
 
         zone, header, received = entry
 
-        age = (
-            self.get_clock().now().nanoseconds / 1e9
-            - (
-                header.stamp.sec
-                + header.stamp.nanosec / 1e9
-            )
+        source_ns = (
+            int(header.stamp.sec) * 1_000_000_000
+            + int(header.stamp.nanosec)
         )
 
-        if not (
-            0 <= time.monotonic() - received
-            <= self.social_zone_max_age_sec
-        ):
-            return None
+        source_age = (
+            self.get_clock().now().nanoseconds
+            - source_ns
+        ) / 1e9
+
+        receipt_age = time.monotonic() - received
 
         if not (
-            -0.1 <= age
-            <= self.social_zone_max_age_sec
+            -0.1 <= source_age <= limit
+            and 0.0 <= receipt_age <= limit
         ):
+            self.get_logger().warning(
+                "[PLANNING GEOMETRY] Snapshot expired | "
+                f"person={person_id} | "
+                f"source_age={source_age:.3f}s | "
+                f"receipt_age={receipt_age:.3f}s | "
+                f"limit={limit:.3f}s"
+            )
             return None
 
-        return zone, header
+        self.get_logger().info(
+            "[PLANNING GEOMETRY] Waypoint input available | "
+            f"person={person_id} | "
+            f"source_age={source_age:.3f}s | "
+            "fresh_path_validation_required=True"
+        )
+
+        return (
+            copy.deepcopy(zone),
+            copy.deepcopy(header),
+        )
     
     # ====================================================================
     # NAV2 GOAL RESPONSE
@@ -1455,6 +1557,15 @@ class TrajectoryManager(Node):
 
             status = int(wrapped_result.status)
 
+            if status not in {
+                GoalStatus.STATUS_SUCCEEDED,
+                GoalStatus.STATUS_CANCELED,
+                GoalStatus.STATUS_ABORTED,
+            }:
+                raise RuntimeError(
+                    f"Nonterminal planning result status: {status}"
+                )
+
         except Exception as exc:
             with self.state_lock:
                 if request_id not in self.pending_requests:
@@ -1639,34 +1750,50 @@ class TrajectoryManager(Node):
     # ====================================================================
 
     def _social_zones_callback(self, msg):
+        """Cache an ordered, complete snapshot for waypoint construction."""
         now = time.monotonic()
+        limit = self._planning_geometry_max_age()
 
-        stamp = msg.header.stamp
+        try:
+            session = str(msg.tracking_session_id).strip()
+            stamp = msg.header.stamp
 
-        source_ns = (
-            stamp.sec * 1000000000
-            + stamp.nanosec
-        )
+            source_ns = (
+                int(stamp.sec) * 1_000_000_000
+                + int(stamp.nanosec)
+            )
 
-        age = (
-            self.get_clock().now().nanoseconds
-            - source_ns
-        ) / 1e9
+            age = (
+                self.get_clock().now().nanoseconds
+                - source_ns
+            ) / 1e9
 
-        valid = (
-            bool(msg.header.frame_id.strip())
-            and source_ns > 0
-            and 0 <= stamp.nanosec < 1000000000
-            and -0.1 <= age <= self.social_zone_max_age_sec
-        )
+            if (
+                not session
+                or not str(msg.header.frame_id).strip()
+                or stamp.sec < 0
+                or not 0 <= stamp.nanosec < 1_000_000_000
+                or source_ns <= 0
+                or age < -0.1
+            ):
+                return
 
-        updated = {}
+            complete = bool(
+                msg.source_observation_complete
+                and msg.source_person_count == len(msg.zones)
+                and age <= limit
+            )
 
-        if valid:
+            updated = {}
+
             for zone in msg.zones:
-                person_id = str(
-                    zone.person_id
-                ).strip()
+                person_id = str(zone.person_id).strip()
+                zone_stamp = zone.observation_stamp
+
+                zone_ns = (
+                    int(zone_stamp.sec) * 1_000_000_000
+                    + int(zone_stamp.nanosec)
+                )
 
                 values = (
                     zone.center.x,
@@ -1674,31 +1801,122 @@ class TrajectoryManager(Node):
                     zone.center.z,
                     zone.heading,
                     zone.radius_longitudinal,
-                    zone.radius_lateral
+                    zone.radius_lateral,
+                    zone.person_speed,
                 )
 
                 if (
                     not person_id
                     or person_id in updated
+                    or zone.tracking_session_id != session
+                    or zone_stamp.sec < 0
+                    or not (
+                        0 <= zone_stamp.nanosec
+                        < 1_000_000_000
+                    )
+                    or zone_ns != source_ns
                     or zone.tracking_state != "TRACKED"
                     or not all(
-                        math.isfinite(float(v))
-                        for v in values
+                        math.isfinite(float(value))
+                        for value in values
                     )
-                    or zone.radius_longitudinal <= 0
-                    or zone.radius_lateral <= 0
+                    or zone.radius_longitudinal <= 0.0
+                    or zone.radius_lateral <= 0.0
+                    or zone.person_speed < 0.0
                 ):
-                    updated = {}
+                    complete = False
                     break
 
+                # Preserve the original observation timestamp.
                 updated[person_id] = (
                     copy.deepcopy(zone),
                     copy.deepcopy(msg.header),
-                    now
+                    now,
                 )
 
+        except (
+            ValueError,
+            TypeError,
+            AttributeError,
+            OverflowError,
+        ):
+            with self.state_lock:
+                self.social_zones = {}
+            return
+
         with self.state_lock:
-            self.social_zones = updated
+            previous_session = getattr(
+                self,
+                "_planning_zone_session",
+                "",
+            )
+
+            retired = getattr(
+                self,
+                "_planning_retired_sessions",
+                set(),
+            )
+
+            if session in retired:
+                return
+
+            if (
+                session == previous_session
+                and self.last_social_stamp_ns is not None
+                and source_ns <= self.last_social_stamp_ns
+            ):
+                return
+
+            if (
+                previous_session
+                and previous_session != session
+            ):
+                retired.add(previous_session)
+
+            self._planning_retired_sessions = retired
+            self._planning_zone_session = session
+            self.last_social_stamp_ns = source_ns
+
+            # New incomplete evidence invalidates the previous snapshot.
+            self.social_zones = updated if complete else {}
+
+            # Preserve the last valid geometry for planning only.
+            # New incomplete evidence invalidates the current snapshot.
+            self.social_zones = updated if complete else {}
+
+            # Preserve the last valid geometry for planning only.
+            if complete:
+                for person_id, entry in updated.items():
+                    self._planning_zone_history[person_id] = (
+                        copy.deepcopy(entry[0]),
+                        copy.deepcopy(entry[1]),
+                        now,
+                    )
+
+            # Expire planning hints independently of live observations.
+            self._planning_zone_history = {
+                person_id: entry
+                for person_id, entry in self._planning_zone_history.items()
+                if 0.0 <= now - entry[2] < 180.0
+            }
+
+            # Expire directional waypoint states.
+            self._directional_waypoints = {
+                key: state
+                for key, state in self._directional_waypoints.items()
+                if 0.0 <= now - state["created_at"] < 180.0
+            }
+
+        if not complete:
+            self.get_logger().warning(
+                "[PLANNING GEOMETRY] Snapshot unavailable | "
+                f"source_age={age:.3f}s | "
+                f"limit={limit:.3f}s | "
+                f"coverage_complete="
+                f"{msg.source_observation_complete}",
+                throttle_duration_sec=2.0,
+            )
+
     # ====================================================================
     # REQUEST LIFECYCLE
     # ====================================================================
@@ -1891,79 +2109,216 @@ class TrajectoryManager(Node):
                 "CANCEL_RESPONSE_UNCONFIRMED",
             )
 
-    def _remove_request(
-        self,
-        request_id: str,
-    ) -> None:
+    def _planning_geometry_max_age(self):
+        """Configure a planning-only age limit, independent of validation."""
+        name = "directional_planning_geometry_max_age_sec"
+
+        if not self.has_parameter(name):
+            self.declare_parameter(name, 2.0)
+
+        value = float(self.get_parameter(name).value)
+
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(
+                f"{name} must be finite and positive."
+            )
+
+        return value
+    
+    def _generation_status_request_callback(self, msg):
         """
-        Forget one terminal planning generation.
+        Reconcile an uncertain planning transaction.
 
-        If this was the final live request for its navigation_goal_id, immediately
-        release the newest deferred generation for that same public goal.
-
-        The deferred generation is started only AFTER the previous Nav2 planning
-        action has reached this terminal cleanup point.
+        A missing record never proves termination.
+        Querying a live uncertain request inhibits its candidate.
         """
+        try:
+            data = json.loads(msg.data)
 
-        deferred_request = None
-        navigation_goal_id = ""
+            if (
+                not isinstance(data, dict)
+                or data.get("version") != 1
+            ):
+                return
+
+            request_id = str(data["request_id"]).strip()
+            goal_id = str(data["navigation_goal_id"]).strip()
+
+            if not request_id or not goal_id:
+                return
+
+        except (ValueError, TypeError, KeyError):
+            return
 
         with self.state_lock:
-            metadata = self.pending_requests.pop(request_id, None)
-            self.active_goal_handles.pop(request_id, None)
-            self.cancel_pending_requests.discard(request_id)
-            self.timeout_notified_requests.discard(request_id)
-            self.inhibited_request_ids.discard(request_id)
-            self.timeout_notified_requests.discard(request_id)
+            terminal = self.terminal_generation_results.get(
+                request_id
+            )
+            metadata = self.pending_requests.get(request_id)
+
+            if terminal is not None:
+                if terminal["navigation_goal_id"] != goal_id:
+                    return
+
+                payload = dict(terminal)
+                goal_handle = None
+
+            elif metadata is None:
+                payload = {
+                    "version": 1,
+                    "producer": "trajectory_manager",
+                    "navigation_goal_id": goal_id,
+                    "request_id": request_id,
+                    "status": "UNKNOWN",
+                    "reason": "REQUEST_NOT_RECONCILED",
+                }
+                goal_handle = None
+
+            else:
+                if metadata.navigation_goal_id != goal_id:
+                    return
+
+                self.inhibited_request_ids.add(request_id)
+
+                payload = None
+                goal_handle = self.active_goal_handles.get(
+                    request_id
+                )
+
+                outstanding = self.generation_reconcile_futures.get(
+                    request_id
+                )
+
+                if (
+                    outstanding is not None
+                    and not outstanding.done()
+                ):
+                    goal_handle = None
+
+        if payload is not None:
+            self.generation_result_pub.publish(
+                String(data=json.dumps(payload))
+            )
+            return
+
+        self._cancel_and_remove_request(request_id)
+
+        if goal_handle is None:
+            return
+
+        try:
+            future = goal_handle.get_result_async()
+
+            if future is None:
+                raise RuntimeError("Result future missing.")
+
+            with self.state_lock:
+                if request_id not in self.pending_requests:
+                    return
+
+                self.generation_reconcile_futures[request_id] = future
+
+            future.add_done_callback(
+                lambda completed, rid=request_id:
+                    self._planning_result_callback(rid, completed)
+            )
+
+        except Exception as exc:
+            self.get_logger().warning(
+                "[TRAJECTORY RECONCILIATION] Result unavailable | "
+                f"request={request_id} | error={exc}"
+            )
+
+    def _remove_request(self, request_id: str) -> None:
+        """
+        Publish terminal generation evidence before releasing ownership.
+
+        A TERMINATED result only proves that this planning transaction
+        has finished. It does not authorize trajectory execution.
+        """
+        deferred_request = None
+        terminal_payload = None
+
+        with self.state_lock:
+            metadata = self.pending_requests.get(request_id)
 
             if metadata is None:
                 return
 
-            navigation_goal_id = (
-                metadata.navigation_goal_id
+            goal_id = metadata.navigation_goal_id
+
+            terminal_payload = {
+                "version": 1,
+                "producer": "trajectory_manager",
+                "navigation_goal_id": goal_id,
+                "request_id": request_id,
+                "status": "TERMINATED",
+                "reason": "GENERATION_TERMINAL_RECONCILED",
+            }
+
+            self.terminal_generation_results[
+                request_id
+            ] = dict(terminal_payload)
+
+            while len(self.terminal_generation_results) > 512:
+                oldest = next(
+                    iter(self.terminal_generation_results)
+                )
+
+                self.terminal_generation_results.pop(
+                    oldest,
+                    None,
+                )
+
+            self.pending_requests.pop(request_id, None)
+            self.active_goal_handles.pop(request_id, None)
+            self.generation_reconcile_futures.pop(
+                request_id,
+                None,
             )
 
-            same_goal_still_alive = any(
-                other_metadata.navigation_goal_id
-                == navigation_goal_id
-                for other_metadata
-                in self.pending_requests.values()
+            self.cancel_pending_requests.discard(request_id)
+            self.timeout_notified_requests.discard(request_id)
+            self.inhibited_request_ids.discard(request_id)
+
+            same_goal_alive = any(
+                other.navigation_goal_id == goal_id
+                for other in self.pending_requests.values()
             )
 
-            if not same_goal_still_alive:
-
+            if not same_goal_alive:
                 deferred_request = (
                     self.deferred_requests_by_goal.pop(
-                        navigation_goal_id,
+                        goal_id,
                         None,
                     )
                 )
 
-        self.get_logger().info(
-            "[TRAJECTORY MANAGER] "
-            f"REQUEST_TERMINAL={request_id} | "
-            f"GOAL={navigation_goal_id}"
+        # Publish terminal evidence for the collaboration pipeline.
+        # CandidateTrajectory may arrive before or after this result.
+        self.generation_result_pub.publish(
+            String(
+                data=json.dumps(
+                    terminal_payload,
+                    separators=(",", ":"),
+                )
+            )
         )
-
-        if deferred_request is None:
-            return
-
-        deferred_request_id = str(
-            deferred_request.request_id
-        ).strip()
 
         self.get_logger().info(
-            "[TRAJECTORY MANAGER] "
-            f"DEFERRED_REQUEST_RELEASED="
-            f"{deferred_request_id} | "
-            f"GOAL={navigation_goal_id}"
+            "[TRAJECTORY MANAGER] Generation terminal published | "
+            f"request={request_id} | "
+            f"goal={goal_id} | "
+            "status=TERMINATED"
         )
 
-        # Start outside state_lock.
-        self._trajectory_generation_request_callback(
-            deferred_request
-        )
-
+        # Start a deferred replacement only after the previous
+        # generation has reached its terminal result.
+        if deferred_request is not None:
+            self._trajectory_generation_request_callback(
+                deferred_request
+            )
+            
     # ====================================================================
     # IDENTIFIERS
     # ====================================================================

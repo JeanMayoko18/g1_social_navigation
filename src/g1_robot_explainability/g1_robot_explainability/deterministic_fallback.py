@@ -144,6 +144,25 @@ class DeterministicFallbackProvider(LLMProvider):
         action = str(context.action or "").strip().upper()
         reason = str(context.reason_code or "").strip().upper()
 
+        if reason == "NO_FEASIBLE_ROUTE":
+            texts = {
+                "fr": (
+                    "Je n'ai trouvé aucun passage praticable ni à votre "
+                    "gauche ni à votre droite pour le moment. "
+                    "Je reste arrêté et continue à chercher."
+                ),
+                "en": (
+                    "I have not found a practicable route on either "
+                    "side for now. I will stay stopped and keep looking."
+                ),
+                "es": (
+                    "No he encontrado una ruta practicable por ninguno "
+                    "de los dos lados por ahora. "
+                    "Seguiré detenido mientras busco otra opción."
+                ),
+            }
+            return texts[language]
+
         if reason == REASON_NO_HUMAN_RESPONSE:
             return self._build_no_human_response_explanation(
                 language
@@ -437,10 +456,19 @@ class DeterministicFallbackProvider(LLMProvider):
         else:
             return False
 
+        if reason == "NO_FEASIBLE_ROUTE":
+            return bool(
+                action == "WAIT"
+                and has_goal
+                and not active
+                and not replan
+            )
+
         if reason == "PASSAGE_ASSISTANCE":
             return bool(
                 action == "WAIT"
-                and conflict
+                and has_goal
+                and not active
                 and not replan
                 and str(context.person_id or "").strip()
             )

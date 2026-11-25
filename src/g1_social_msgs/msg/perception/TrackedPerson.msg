@@ -1,6 +1,10 @@
 # Persistent person identifier inherited from the perception tracker.
 string id
 
+# Generation assigned by the identity authority.
+# Distinguishes successive incarnations of the same person ID.
+uint64 identity_generation
+
 # Semantic class information.
 int32 class_id
 string class_name

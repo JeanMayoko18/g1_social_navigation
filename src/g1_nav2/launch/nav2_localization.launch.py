@@ -113,6 +113,17 @@ def generate_launch_description():
             DeclareLaunchArgument("odom_frame", default_value="odom"),
             DeclareLaunchArgument("controller", default_value="dwb"),
             DeclareLaunchArgument("perception_profile", default_value="A"),
+
+            DeclareLaunchArgument(
+                "interaction",
+                default_value="none",
+                choices=["none", "dialogue"],
+                description=(
+                    "Social interaction policy: none or dialogue. "
+                    "Independent from the perception profile."
+                ),
+            ),
+
             DeclareLaunchArgument("navigation_speed", default_value="0.20"),
             DeclareLaunchArgument("enable_navigation_goal_gate", default_value="false", description=(
                 "Remap the Nav2 NavigateToPose server to "

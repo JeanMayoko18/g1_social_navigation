@@ -23,7 +23,8 @@ uint64 source_sequence
 uint8 SOURCE=0
 uint8 DEPTH=1
 uint8 SPATIAL=2
-uint8 IDENTITY=3
+uint8 APPEARANCE=3
+uint8 IDENTITY=4
 
 # Last processing stage completed or attempted for this observation.
 # Stage advancement does not imply every feature became available.

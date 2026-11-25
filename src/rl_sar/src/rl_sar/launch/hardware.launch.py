@@ -3,15 +3,17 @@ from launch.actions import (
     DeclareLaunchArgument,
     IncludeLaunchDescription,
 )
+from launch.substitutions import (
+    LaunchConfiguration,
+    PathJoinSubstitution,
+    PythonExpression,
+)
 from launch.conditions import IfCondition
 from launch.launch_description_sources import (
     PythonLaunchDescriptionSource,
 )
 import os
-from launch.substitutions import (
-    LaunchConfiguration,
-    PathJoinSubstitution,
-)
+
 from launch_ros.substitutions import FindPackageShare
 from launch_ros.parameter_descriptions import ParameterValue
 
@@ -259,16 +261,29 @@ def generate_launch_description():
             ])
         ),
 
+        # Load the child launch when either the pipeline or its TF is needed.
         condition=IfCondition(
-            run_realsense_pipeline
+            PythonExpression([
+                "'",
+                run_realsense_pipeline,
+                "'.lower() in ('true', '1') or '",
+                enable_realsense_tf,
+                "'.lower() in ('true', '1')",
+            ])
         ),
 
         launch_arguments={
-            "enable_realsense":
+            # Start the driver only when both pipeline and driver are enabled.
+            "enable_realsense": PythonExpression([
+                "'",
+                run_realsense_pipeline,
+                "'.lower() in ('true', '1') and '",
                 enable_realsense,
+                "'.lower() in ('true', '1')",
+            ]),
 
-            "enable_realsense_tf":
-                enable_realsense_tf,
+            # Mounting TF is independent of camera acquisition.
+            "enable_realsense_tf": enable_realsense_tf,
         }.items(),
     )
 

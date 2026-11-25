@@ -12,6 +12,14 @@ string request_id
 # Person associated with the social situation.
 string person_id
 
+# Spatial tracking session associated with the person.
+# An approval must not be reused after a tracker session change.
+string tracking_session_id
+
+# Identity generation associated with the approved person.
+# Prevents reuse of a person ID after identity reassignment.
+uint64 identity_generation
+
 # Navigation action requested from the execution layer.
 #
 # Allowed values:

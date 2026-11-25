@@ -15,7 +15,6 @@
 #
 # ============================================================================
 
-
 # ============================================================================
 # SOCIAL NAVIGATION DECISION
 # ============================================================================
@@ -26,27 +25,37 @@ social_navigation_decision:
     input_topic: "/social_perception/social_zones"
     output_topic: "/social_navigation/decision"
 
+    tracked_persons_topic: "/social_perception/tracked_persons"
+
     navigation_state_topic: "/social_navigation/navigation_state"
     episode_state_topic: "/social_navigation/episode_state"
 
     expected_frame: "base_footprint"
-
+    
     # Fixed robot-person intrusion threshold.
     intrusion_distance_m: 1.50
-
     # Release hysteresis:
     # 1.50 + 0.15 = 1.65 m
     release_margin_m: 0.15
-
-    person_absence_clear_sec: 2.0
-
     minimum_radius_m: 0.05
 
     conflict_confirmation_sec: 0.20
     clear_confirmation_sec: 1.00
+    
+    source_pairing_timeout_sec: 0.20
+    source_pairing_max_pending: 32
 
     social_observation_timeout_sec: 1.0
 
+    # Temporal-continuity ablation:
+    # true  -> tolerate brief observation loss before reporting LOST.
+    # false -> report LOST as soon as missing evidence is detected.
+    #
+    # Unresolved episode identity is retained in both conditions.
+    temporal_continuity_enabled: true
+
+    # Applied only when temporal_continuity_enabled is true.
+    observation_loss_grace_sec: 0.50
 
 # ============================================================================
 # COLLABORATION MANAGER
@@ -79,7 +88,7 @@ collaboration_manager:
     # ------------------------------------------------------------------------
     # Trajectory pipeline
     # ------------------------------------------------------------------------
-
+    negotiated_adaptation_enabled: true
     trajectory_generation_request_topic: "/social_navigation/trajectory_generation_request"
 
     candidate_trajectory_topic: "/social_navigation/candidate_trajectory"
@@ -105,10 +114,43 @@ collaboration_manager:
     # ------------------------------------------------------------------------
 
     dialogue_response_timeout_sec: 5.0
-    social_decision_max_age_sec: 1.0
+    social_decision_max_age_sec: 1.5
     trajectory_validation_max_age_sec: 1.0
     conflict_persistence_sec: 2.0
     initial_speech_start_timeout_sec: 15.0
+
+# ============================================================================
+# OPTIONAL DIRECTIONAL KEEPOUT MASK
+# ============================================================================
+
+directional_keepout_mask_node:
+  ros__parameters:
+    zone_max_age_sec: 1.5
+
+# ============================================================================
+# HRI MANAGER
+# ============================================================================
+hri_manager:
+  ros__parameters:
+    # Maximum delay before human speech starts.
+    asr_onset_timeout_sec: 5.0
+
+    # Maximum delay for capture readiness or listening acknowledgment.
+    asr_ready_timeout_sec: 3.0
+
+    # Maximum recording supervision duration.
+    asr_utterance_timeout_sec: 10.0
+
+    # Maximum transcription processing duration.
+    asr_transcription_timeout_sec: 10.0
+
+    # Maximum delay for the semantic interpretation result.
+    asr_intent_timeout_sec: 3.0
+
+    # Must match the PC ASR voice_id.
+    asr_voice_id: "pc_user"
+    
+    turn_cue_enabled: false
 
 # ============================================================================
 # TRAJECTORY MANAGER
@@ -133,7 +175,6 @@ trajectory_manager:
     social_zone_max_age_sec: 0.5
 
     passage_lateral_offset_m: 1.0
-
 
 # ============================================================================
 # TRAJECTORY SOCIAL VALIDATOR
@@ -199,7 +240,8 @@ navigation_goal_gate:
     navigation_state_topic: "/social_navigation/navigation_state"
 
     navigation_goal_context_topic: "/social_navigation/navigation_goal_context"
-
+    
+    negotiated_adaptation_enabled: true
     # ------------------------------------------------------------------------
     # Speech
     # ------------------------------------------------------------------------

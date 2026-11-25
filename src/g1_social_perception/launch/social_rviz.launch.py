@@ -164,12 +164,13 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "rgb_topic",
                 default_value=(
-                    "/perception/ingress/color/image_raw"
+                    "/perception/transport/color"
                 ),
                 description=(
-                    "Resolved RGB visualization topic."
+                    "Local RGB image received from the network transport."
                 ),
             ),
+
 
             DeclareLaunchArgument(
                 "aligned_depth_topic",

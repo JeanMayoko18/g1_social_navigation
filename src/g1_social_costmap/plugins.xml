@@ -14,4 +14,13 @@
 
   </class>
 
+  <class
+    name="g1_social_costmap::DirectionalKeepoutFilter"
+    type="g1_social_costmap::DirectionalKeepoutFilter"
+    base_class_type="nav2_costmap_2d::Layer">
+    <description>
+      Directional keepout costmap filter with processing evidence.
+    </description>
+  </class>
+
 </library>

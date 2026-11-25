@@ -320,6 +320,72 @@ def _load_yaml(path: str, label: str) -> Dict[str, Any]:
 
     return data
 
+def configure_directional_keepout(
+    effective_params,
+    *,
+    ros_distro,
+    perception,
+    interaction,
+):
+    """Configure Humble keepout filters only for social dialogue."""
+    if interaction not in {"none", "dialogue"}:
+        raise RuntimeError(
+            f"Unsupported interaction={interaction!r}."
+        )
+
+    enabled = (
+        ros_distro == "humble"
+        and perception in {"C", "D"}
+        and interaction == "dialogue"
+    )
+
+    filter_name = "directional_keepout"
+
+    filter_params = {
+        "plugin": "nav2_costmap_2d::KeepoutFilter",
+        "enabled": True,
+        "filter_info_topic": (
+            "/social_navigation/directional_filter_info"
+        ),
+        "transform_tolerance": 0.2,
+    }
+
+    for costmap_name in ("global_costmap", "local_costmap"):
+        params = (
+            effective_params
+            .get(costmap_name, {})
+            .get(costmap_name, {})
+            .get("ros__parameters")
+        )
+
+        if not isinstance(params, dict):
+            raise RuntimeError(
+                f"Missing {costmap_name} parameters."
+            )
+
+        current_filters = list(params.get("filters", []))
+
+        # Remove any stale directional filter inserted
+        # by another configuration overlay.
+        current_filters = [
+            item
+            for item in current_filters
+            if item != filter_name
+        ]
+
+        if enabled:
+            current_filters.append(filter_name)
+            params["directional_keepout"] = dict(filter_params)
+        else:
+            params.pop("directional_keepout", None)
+
+        if current_filters:
+            params["filters"] = current_filters
+        else:
+            params.pop("filters", None)
+
+    return enabled
+
 def launch_nav2_with_runtime_profile(context, g1_nav2_share: str):
     """Build one effective Nav2 YAML and start exactly one Nav2 stack.
 
@@ -389,9 +455,42 @@ def launch_nav2_with_runtime_profile(context, g1_nav2_share: str):
         f"perception_{perception.lower()}.yaml",
     )
 
-    effective_params = copy.deepcopy(_load_yaml(base_path, "base Nav2"))
-    deep_merge(effective_params, _load_yaml(distro_path, "ROS distribution overlay"))
-    deep_merge(effective_params, _load_yaml(perception_path, "perception overlay"))
+    effective_params = copy.deepcopy(
+        _load_yaml(base_path, "base Nav2")
+    )
+
+    deep_merge(
+        effective_params,
+        _load_yaml(distro_path, "ROS distribution overlay")
+    )
+
+    deep_merge(
+        effective_params,
+        _load_yaml(perception_path, "perception overlay")
+    )
+
+    # ============================================================
+    # Directional keepout - Humble + social dialogue only
+    # ============================================================
+
+    interaction = (
+        LaunchConfiguration("interaction")
+        .perform(context)
+        .strip()
+        .lower()
+    )
+
+    directional_keepout_enabled = configure_directional_keepout(
+        effective_params,
+        ros_distro=ros_distro,
+        perception=perception,
+        interaction=interaction,
+    )
+
+    # ============================================================
+    # Apply experimental navigation speed
+    # ============================================================
+
     changed_parameters = apply_navigation_speed(
         effective_params,
         controller,
@@ -405,7 +504,9 @@ def launch_nav2_with_runtime_profile(context, g1_nav2_share: str):
         runtime_dir,
         (
             f"nav2_{controller}_{ros_distro}_"
-            f"perception_{perception.lower()}_vx_{speed_tag:03d}.yaml"
+            f"perception_{perception.lower()}_"
+            f"interaction_{interaction}_"
+            f"vx_{speed_tag:03d}.yaml"
         ),
     )
 
@@ -484,6 +585,50 @@ def launch_nav2_with_runtime_profile(context, g1_nav2_share: str):
     else:
         nav2_action = nav2_launch
 
+    directional_filter_actions = []
+
+    if directional_keepout_enabled:
+        filter_info_server = Node(
+            package="nav2_map_server",
+            executable="costmap_filter_info_server",
+            name="directional_costmap_filter_info_server",
+            output="screen",
+            parameters=[{
+                "use_sim_time": (
+                    str(use_sim_time).strip().lower() == "true"
+                ),
+                "type": 0,
+                "filter_info_topic": (
+                    "/social_navigation/directional_filter_info"
+                ),
+                "mask_topic": (
+                    "/social_navigation/directional_keepout_mask"
+                ),
+                "base": 0.0,
+                "multiplier": 1.0,
+            }],
+        )
+
+        filter_lifecycle_manager = Node(
+            package="nav2_lifecycle_manager",
+            executable="lifecycle_manager",
+            name="lifecycle_manager_directional_filter",
+            output="screen",
+            parameters=[{
+                "use_sim_time": (
+                    str(use_sim_time).strip().lower() == "true"
+                ),
+                "autostart": True,
+                "node_names": [
+                    "directional_costmap_filter_info_server",
+                ],
+            }],
+        )
+
+        directional_filter_actions = [
+            filter_info_server,
+            filter_lifecycle_manager,
+        ]
 
     return [
         LogInfo(
@@ -492,6 +637,7 @@ def launch_nav2_with_runtime_profile(context, g1_nav2_share: str):
                 f"ros_distro={ros_distro} | "
                 f"controller={controller} | "
                 f"perception={perception} | "
+                f"directional_keepout={directional_keepout_enabled} | "
                 f"navigation_speed={navigation_speed:.2f} m/s | "
                 f"goal_gate={goal_gate_enabled} | "
                 f"overrides={','.join(changed_parameters)} | "
@@ -499,5 +645,6 @@ def launch_nav2_with_runtime_profile(context, g1_nav2_share: str):
             )
         ),
 
+        *directional_filter_actions,
         nav2_action,
     ]

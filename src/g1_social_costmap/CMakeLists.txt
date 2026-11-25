@@ -32,6 +32,8 @@ find_package(rclcpp REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
 
 find_package(nav2_costmap_2d REQUIRED)
+find_package(nav2_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 find_package(nav2_util REQUIRED)
 
 find_package(pluginlib REQUIRED)
@@ -58,6 +60,7 @@ add_library(
 
   src/social_cost.cpp
   src/social_layer.cpp
+  src/directional_keepout_filter.cpp
 )
 
 target_include_directories(
@@ -85,6 +88,8 @@ ament_target_dependencies(
 
   geometry_msgs
   nav_msgs
+  nav2_msgs
+  std_msgs
   visualization_msgs
   diagnostic_msgs
 
@@ -94,6 +99,8 @@ ament_target_dependencies(
 pluginlib_export_plugin_description_file(
   nav2_costmap_2d
   plugins.xml
+  nav2_msgs
+  std_msgs
 )
 
 

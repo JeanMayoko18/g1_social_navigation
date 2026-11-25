@@ -212,13 +212,42 @@ def _resolve_and_launch(context):
     ros_distro = LaunchConfiguration("ros_distro").perform(context)
     map_yaml = LaunchConfiguration("map").perform(context)
     language = LaunchConfiguration("language").perform(context).strip().lower()
+    anticipatory_planning_enabled = LaunchConfiguration(
+        "anticipatory_planning_enabled"
+    ).perform(context).strip().lower()
+
+    demo_robot_only_single_yes = LaunchConfiguration(
+        "demo_robot_only_single_yes"
+    ).perform(context).strip().lower()
+
+    manager_type = LaunchConfiguration(
+        "collaboration_manager_type"
+    ).perform(context)
+    identity_backend = LaunchConfiguration(
+        "identity_backend"
+    ).perform(context)
 
     if language not in ("en", "es", "fr"):
         raise RuntimeError(
             f"Unsupported language='{language}'. "
             "Expected 'en', 'es' or 'fr'."
         )
-
+    
+    if identity_backend not in ("yolo_track", "multimodal"):
+        raise RuntimeError(
+            f"Unsupported identity_backend={identity_backend!r}"
+        )
+    
+    if demo_robot_only_single_yes == "true" and not (
+        interaction == "dialogue"
+        and manager_type == "simple_cd"
+    ):
+        raise RuntimeError(
+            "demo_robot_only_single_yes requires "
+            "profile=D, interaction=dialogue and "
+            "collaboration_manager_type=simple_cd"
+        )
+    
     navigation_mode = LaunchConfiguration(
         "navigation_mode"
     ).perform(context)
@@ -310,8 +339,13 @@ def _resolve_and_launch(context):
 
     camera_host = "robot"
 
+    # Remote RGB is required by either YOLO inference
+    # or person appearance extraction.
     remote_rgb_required = (
-        vision_is_local
+        (
+            vision_is_local
+            or social_perception_is_local
+        )
         and plan.host != camera_host
     )
 
@@ -386,7 +420,12 @@ def _resolve_and_launch(context):
         LogInfo(msg=f"ROS distribution  : {plan.ros_distro}"),
         LogInfo(msg=f"Profile           : {plan.profile}"),
         LogInfo(msg=f"Interaction       : {plan.interaction}"),
+        LogInfo(msg=f"Identity backend  : {identity_backend}"),
         LogInfo(msg=f"Deployment        : {plan.deployment}"),
+        LogInfo(msg=f"Collaboration FSM : {manager_type}"),
+        LogInfo(
+            msg=f"HRI demo mode     : {demo_robot_only_single_yes}"
+        ),
         LogInfo(
             msg=f"Camera obstacles  : {plan.camera_obstacles}"
         ),
@@ -571,23 +610,60 @@ def _resolve_and_launch(context):
             "vision_inference.launch.py",
         )
 
-        vision_inference_action = IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(
-                vision_inference_launch
-            ),
-            launch_arguments={
-                "enable_yolo": "true",
-                "input_image_topic": (
-                    "/perception/transport/color"
-                    if remote_rgb_required and camera_transport == "compressed"
-                    else (
-                        "/perception/ingress/color/image_raw"
+        if identity_backend == "yolo_track":
+
+            vision_inference_action = Node(
+                package="g1_social_perception",
+                executable="person_yolo_track_source",
+                name="person_yolo_track_source",
+                output="screen",
+                parameters=[{
+                    "image_topic": (
+                        "/perception/transport/color"
                         if remote_rgb_required
-                        else "/camera/camera/color/image_raw"
-                    )
+                        and camera_transport == "compressed"
+                        else (
+                            "/perception/ingress/color/image_raw"
+                            if remote_rgb_required
+                            else "/camera/camera/color/image_raw"
+                        )
+                    ),
+
+                    "publish_debug_image": (
+                        enable_visualization
+                        and enable_social_rviz
+                        and plan.owns("visualization")
+                    ),
+
+                    "debug_image_topic": "/yolo/dbg_image",
+                    "output_topic": "/yolo/detections",
+                    "confidence": 0.20,
+                    "image_size": 640,
+                    "maximum_processing_hz": 10.0,
+                }],
+            )
+
+        else:
+
+            vision_inference_action = IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    vision_inference_launch
                 ),
-            }.items(),
-        )
+                launch_arguments={
+                    "enable_yolo": "true",
+                    "input_image_topic": (
+                        "/perception/transport/color"
+                        if remote_rgb_required
+                        and camera_transport == "compressed"
+                        else (
+                            "/perception/ingress/color/image_raw"
+                            if remote_rgb_required
+                            else "/camera/camera/color/image_raw"
+                        )
+                    ),
+                }.items(),
+            )
+
 
         vision_log_action = LogInfo(
             msg=(
@@ -610,7 +686,8 @@ def _resolve_and_launch(context):
                                     vision_log_action,
                                 ],
                                 "RGB",
-                                start_on_failure=True,
+                                start_on_failure=False,
+                                #start_on_failure=True,
                             )
                         ),
                     )
@@ -650,6 +727,19 @@ def _resolve_and_launch(context):
                 social_perception_launch
             ),
             launch_arguments={
+                "rgb_topic": (
+                    "/perception/transport/color"
+                    if (
+                        remote_rgb_required
+                        and camera_transport == "compressed"
+                    )
+                    else (
+                        "/perception/ingress/color/image_raw"
+                        if remote_rgb_required
+                        else "/camera/camera/color/image_raw"
+                    )
+                ),
+
                 "depth_topic": (
                     "/perception/ingress/"
                     "aligned_depth/image_raw"
@@ -659,7 +749,7 @@ def _resolve_and_launch(context):
                         "aligned_depth_to_color/image_raw"
                     )
                 ),
-                "language": language,
+
                 "camera_info_topic": (
                     "/perception/ingress/"
                     "aligned_depth/camera_info"
@@ -669,9 +759,12 @@ def _resolve_and_launch(context):
                         "aligned_depth_to_color/camera_info"
                     )
                 ),
+
+                "language": language,
+                "identity_backend": identity_backend,
             }.items(),
         )
-
+        
         social_perception_log_action = LogInfo(
             msg=(
                 "Starting local social perception role "
@@ -728,7 +821,10 @@ def _resolve_and_launch(context):
                 launch_arguments={
                     "interaction": plan.interaction,
                     "host": plan.host,
+                    "anticipatory_planning_enabled": anticipatory_planning_enabled,
+                    "collaboration_manager_type": manager_type,
                     "language": language,
+                    "demo_robot_only_single_yes": demo_robot_only_single_yes,
                 }.items(),
             )
         )
@@ -792,7 +888,8 @@ def _resolve_and_launch(context):
             "ros4hri_adapter.launch.py",
         )
 
-        # HRI manager
+        # HRI manager.
+        # The child launch must load this file into the HRI node.
         actions.append(
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(
@@ -800,6 +897,11 @@ def _resolve_and_launch(context):
                 ),
                 launch_arguments={
                     "hri_enabled": "true",
+                    "params_file": os.path.join(
+                        bringup_share,
+                        "config",
+                        "social_system.yaml",
+                    ),
                 }.items(),
             )
         )
@@ -912,6 +1014,7 @@ def _resolve_and_launch(context):
                 ),
                 launch_arguments={
                     "profile": plan.profile,
+                    "interaction": plan.interaction,
                     "ros_distro": plan.ros_distro,
                     "enable_navigation_goal_gate": (
                         enable_navigation_goal_gate
@@ -1234,6 +1337,13 @@ def generate_launch_description():
             ),
 
             DeclareLaunchArgument(
+                "anticipatory_planning_enabled",
+                default_value="false",
+                choices=["true", "false"],
+                description="Enable anticipatory planning in dialogue mode D.",
+            ),
+
+            DeclareLaunchArgument(
                 "map",
                 default_value=os.path.join(
                     os.path.expanduser("~"),
@@ -1285,6 +1395,25 @@ def generate_launch_description():
                 default_value="auto",
                 description=(
                     "ROS distribution: auto | foxy | humble"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "demo_robot_only_single_yes",
+                default_value="false",
+                choices=["true", "false"],
+                description=(
+                    "Short robot-initiated HRI demo: "
+                    "one response with optional direction, "
+                    "without the final confirmation turn."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "identity_backend",
+                default_value="yolo_track",
+                choices=["yolo_track", "multimodal"],
+                description=(
+                    "Select the social perception identity backend. "
+                    "yolo_track disables legacy multimodal identity scoring."
                 ),
             ),
 
@@ -1357,6 +1486,16 @@ def generate_launch_description():
                 description=(
                     "Enable YOLO vision inference when the current host "
                     "owns the vision_inference role."
+                ),
+            ),
+            
+            DeclareLaunchArgument(
+                "collaboration_manager_type",
+                default_value="original",
+                choices=["original", "simple_cd"],
+                description=(
+                    "Collaboration FSM implementation: "
+                    "original or simplified C/D."
                 ),
             ),
 

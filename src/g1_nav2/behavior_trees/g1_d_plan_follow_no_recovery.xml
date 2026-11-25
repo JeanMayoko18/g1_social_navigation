@@ -1,0 +1,15 @@
+<root main_tree_to_execute="ModeDPlanAndFollow">
+  <BehaviorTree ID="ModeDPlanAndFollow">
+    <PipelineSequence name="DirectionalPlanAndFollow">
+      <RateController hz="1.0">
+        <ComputePathToPose
+          goal="{goal}"
+          path="{path}"
+          planner_id="GridBased"/>
+      </RateController>
+      <FollowPath
+        path="{path}"
+        controller_id="FollowPath"/>
+    </PipelineSequence>
+  </BehaviorTree>
+</root>

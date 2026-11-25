@@ -32,6 +32,7 @@ from launch.actions import (
     DeclareLaunchArgument,
     IncludeLaunchDescription,
 )
+from launch_ros.parameter_descriptions import ParameterValue
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -40,8 +41,12 @@ from launch_ros.actions import Node
 def generate_launch_description():
 
     interaction = LaunchConfiguration("interaction")
+    manager_type = LaunchConfiguration("collaboration_manager_type")
     host = LaunchConfiguration("host")
     language = LaunchConfiguration("language")
+    demo_robot_only_single_yes = LaunchConfiguration(
+        "demo_robot_only_single_yes"
+    )
 
     # -------------------------------------------------------------------------
     # CENTRAL CONFIGURATION
@@ -88,7 +93,12 @@ def generate_launch_description():
         launch_arguments={
             "interaction": interaction,
             "host": host,
+            "anticipatory_planning_enabled": LaunchConfiguration(
+                "anticipatory_planning_enabled"
+            ),
+            "collaboration_manager_type": manager_type,
             "language": language,
+            "demo_robot_only_single_yes": demo_robot_only_single_yes,
         }.items(),
     )
 
@@ -104,6 +114,19 @@ def generate_launch_description():
         ),
 
         DeclareLaunchArgument(
+            "demo_robot_only_single_yes",
+            default_value="false",
+            choices=["true", "false"],
+            description="Enable shortened robot-initiated demo dialogue.",
+        ),
+
+        DeclareLaunchArgument(
+            "collaboration_manager_type",
+            default_value="original",
+            choices=["original", "simple_cd"],
+            description="Select the collaboration manager implementation",
+        ),
+        DeclareLaunchArgument(
             "host",
             choices=["pc", "robot"],
             description="Host running this social-navigation layer.",
@@ -114,6 +137,11 @@ def generate_launch_description():
             default_value="en",
             choices=["en", "fr", "es", "auto"],
             description="Human interaction language.",
+        ),
+        DeclareLaunchArgument(
+            "anticipatory_planning_enabled",
+            default_value="false",
+            choices=["true", "false"],
         ),
 
         social_navigation_decision,

@@ -113,7 +113,7 @@ class GenerativeLLMProvider(LLMProvider):
     def build_prompt(
         context: ExplanationContext,
     ) -> str:
-        """Build speech instructions with an explicit assistance exception."""
+        """Build speech instructions for navigation and recovery explanations."""
 
         language = {
             "en": "English",
@@ -124,49 +124,97 @@ class GenerativeLLMProvider(LLMProvider):
             "Spanish",
         )
 
-        reason = str(context.reason_code or "").strip().upper()
-        assistance = reason == "PASSAGE_ASSISTANCE"
+        reason = str(
+            context.reason_code or ""
+        ).strip().upper()
 
-        if assistance and not (
-            str(context.action or "").strip().upper() == "WAIT"
-            and str(context.navigation_goal_id or "").strip()
-            and str(context.person_id or "").strip()
-            and not context.navigation_active
-            and context.social_conflict_active
-            and not context.requires_replan
-        ):
-            raise ValueError(
-                "Invalid PASSAGE_ASSISTANCE context."
+        action = str(
+            context.action or ""
+        ).strip().upper()
+
+        assistance = reason == "PASSAGE_ASSISTANCE"
+        unavailable = reason == "NO_FEASIBLE_ROUTE"
+
+        # Validate route-unavailable explanation context.
+        if unavailable:
+            if not (
+                action == "WAIT"
+                and str(context.navigation_goal_id or "").strip()
+                and not context.navigation_active
+                and not context.requires_replan
+            ):
+                raise ValueError(
+                    "Invalid NO_FEASIBLE_ROUTE context."
+                )
+
+        # Validate passage-assistance explanation context.
+        if assistance:
+            if not (
+                action == "WAIT"
+                and str(context.navigation_goal_id or "").strip()
+                and str(context.person_id or "").strip()
+                and not context.navigation_active
+                and not context.requires_replan
+            ):
+                raise ValueError(
+                    "Invalid PASSAGE_ASSISTANCE context."
+                )
+
+        # Select exactly one explanation policy.
+        if unavailable:
+            instructions = (
+                "Explain that no practicable navigation path "
+                "has been found on either side of the person "
+                "for the moment. "
+                "Explain that I am remaining stopped while "
+                "continuing to search for another possible route. "
+                "Address the person directly and respectfully. "
+                "Do not ask for passage permission again. "
+                "Do not ask the person to move. "
+                "Do not blame the person. "
+                "Do not claim that every possible route "
+                "is permanently blocked. "
+                "Do not promise that navigation will resume "
+                "before a safe executable path is available."
             )
 
-        if assistance:
+        elif assistance:
             instructions = (
-                "The checked candidate trajectories did not provide "
-                "an admissible passage. I am stopped. "
-                "Politely ask whether you could move slightly, "
-                "if convenient, to provide more room. "
-                "Make this optional, never an order. "
-                "Say that I will remain stopped. "
-                "Do not ask for passage permission again. "
-                "Do not claim that all possible routes are blocked "
-                "or that you caused the failure. "
-                "Do not promise to move after you comply; "
-                "new observation and trajectory validation "
-                "are still required."
+                "The attempted navigation paths on the "
+                "person's left side were not practicable. "
+                "I am currently stopped. "
+                "Politely ask the person whether they could "
+                "move slightly toward their OWN RIGHT, "
+                "if convenient, to free more space "
+                "on their OWN LEFT. "
+                "Make it an optional request, never an order. "
+                "Clearly distinguish the person's right "
+                "from the robot's right. "
+                "Say that I will remain stopped while "
+                "searching again for a practicable path. "
+                "Do not request passage permission again "
+                "because LEFT was already confirmed. "
+                "Do not blame the person. "
+                "Do not claim that all possible routes "
+                "are blocked. "
+                "Do not promise to move immediately "
+                "after the person changes position."
             )
 
         else:
             instructions = (
-                "Explain only the supplied decision and "
-                "immediate intention. "
-                "For WAIT, describe remaining stopped and "
-                "preserving personal space. "
-                "For REPLAN, describe looking for another path. "
+                "Explain only the supplied decision "
+                "and immediate intention. "
+                "For WAIT, describe remaining stopped "
+                "and preserving personal space. "
+                "For REPLAN, describe looking "
+                "for another path. "
                 "For SLOW_DOWN, describe slowing down. "
-                "For OBSERVE, acknowledge your presence without "
-                "claiming navigation was interrupted. "
-                "Do not ask you to move or invent a request "
-                "for assistance."
+                "For OBSERVE, acknowledge the person's "
+                "presence without claiming navigation "
+                "was interrupted. "
+                "Do not invent a request for assistance "
+                "or ask the person to move."
             )
 
         return (
@@ -180,23 +228,28 @@ class GenerativeLLMProvider(LLMProvider):
             f"Robot intention: {context.robot_intention}\n"
             f"Explanation objective: {context.explanation_goal}\n\n"
             f"Situation-specific instructions: {instructions}\n\n"
-            "Speak in the first person as the robot and address "
-            "the person directly and respectfully, using the "
-            "selected language. "
-            "Never refer to yourself as 'the robot' or 'the system', "
-            "or to the person as an uninvolved third party. "
+            "Speak in the first person as the robot "
+            "and address the person directly "
+            "and respectfully, using the selected language. "
+            "LEFT and RIGHT always refer to the person's "
+            "own left and right, never the robot's. "
+            "Never refer to yourself as 'the robot' "
+            "or 'the system', or to the person "
+            "as an uninvolved third party. "
             "Do not choose or modify navigation policy. "
-            "Human agreement does not authorize movement. "
+            "Human agreement does not by itself "
+            "authorize physical movement. "
             "Missing observation is not clearance. "
             "Do not invent sensor facts, collision risk, "
             "or human intentions. "
-            "Do not blame the person or describe them as an obstacle. "
-            "Do not include numerical measurements, coordinates "
-            "or identifiers. "
-            "Return only speech text, at most two short sentences "
-            "and 30 words."
+            "Do not blame the person or describe "
+            "them as an obstacle. "
+            "Do not include numerical measurements, "
+            "coordinates, or identifiers. "
+            "Return only speech text, at most "
+            "two short sentences and 30 words."
         )
-    
+
     @staticmethod
     def build_prompt_old(
         context: ExplanationContext,

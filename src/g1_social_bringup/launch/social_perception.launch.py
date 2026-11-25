@@ -64,6 +64,10 @@ from launch.substitutions import LaunchConfiguration
 
 def generate_launch_description():
 
+    # ============================================================
+    # PACKAGE PATH AND DEFAULT CONFIGURATION
+    # ============================================================
+
     social_perception_share = get_package_share_directory(
         "g1_social_perception"
     )
@@ -74,8 +78,16 @@ def generate_launch_description():
         "person_depth_fusion.yaml",
     )
 
+    # ============================================================
+    # LAUNCH ARGUMENT REFERENCES
+    # ============================================================
+
     perception_config = LaunchConfiguration(
         "perception_config"
+    )
+
+    rgb_topic = LaunchConfiguration(
+        "rgb_topic"
     )
 
     depth_topic = LaunchConfiguration(
@@ -90,6 +102,14 @@ def generate_launch_description():
         "language"
     )
 
+    identity_backend = LaunchConfiguration(
+        "identity_backend"
+    )
+
+    # ============================================================
+    # INCLUDED PERCEPTION PIPELINE
+    # ============================================================
+
     pipeline = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(
@@ -100,11 +120,17 @@ def generate_launch_description():
         ),
         launch_arguments={
             "config_file": perception_config,
+            "rgb_topic": rgb_topic,
             "depth_topic": depth_topic,
             "camera_info_topic": camera_info_topic,
             "language": language,
+            "identity_backend": identity_backend,
         }.items(),
     )
+
+    # ============================================================
+    # ARGUMENT DECLARATIONS AND PIPELINE STARTUP
+    # ============================================================
 
     return LaunchDescription(
         [
@@ -115,6 +141,25 @@ def generate_launch_description():
                     "Configuration for the downstream "
                     "social perception pipeline."
                 ),
+            ),
+
+            DeclareLaunchArgument(
+                "rgb_topic",
+                default_value=(
+                    "/camera/camera/"
+                    "color/image_raw"
+                ),
+                description=(
+                    "RGB image input selected by the system "
+                    "orchestrator for person appearance extraction."
+                ),
+            ),
+
+            DeclareLaunchArgument(
+                "identity_backend",
+                default_value="yolo_track",
+                choices=["yolo_track", "multimodal"],
+                description="Identity backend for social perception.",
             ),
 
             DeclareLaunchArgument(
@@ -140,14 +185,14 @@ def generate_launch_description():
                     "by the system orchestrator."
                 ),
             ),
-            
+
             DeclareLaunchArgument(
                 "language",
                 default_value="en",
                 choices=["en", "es"],
                 description=(
-                    "System-wide language propagated to "
-                    "ExplanationContext."
+                    "Language argument forwarded to the "
+                    "included perception launch."
                 ),
             ),
 

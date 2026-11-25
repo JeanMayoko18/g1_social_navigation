@@ -71,6 +71,12 @@ def generate_launch_description():
         "social_system.yaml",
     )
 
+    mode_d_bt_xml = os.path.join(
+        nav2_share,
+        "behavior_trees",
+        "g1_d_plan_follow_no_recovery.xml",
+    )
+
     navigation_goal_gate = Node(
         package="g1_nav2",
         executable="navigation_goal_gate",
@@ -78,6 +84,9 @@ def generate_launch_description():
         output="screen",
         parameters=[
             config_file,
+            {
+                "mode_d_behavior_tree_xml": mode_d_bt_xml,
+            },
         ],
         condition=IfCondition(
             LaunchConfiguration("enable_navigation_goal_gate")
@@ -96,6 +105,7 @@ def generate_launch_description():
                 "enabled": LaunchConfiguration(
                     "enable_navigation_announcements"
                 ),
+                "interaction": LaunchConfiguration("interaction"),
                 "language": LaunchConfiguration("language"),
                 "enable_goal_speech": LaunchConfiguration(
                     "enable_direct_goal_speech"
@@ -215,6 +225,16 @@ def generate_launch_description():
             default_value="false",
             choices=["true", "false"],
             description="Enable command-level locomotion calibration.",
+        ),
+
+        DeclareLaunchArgument(
+            "interaction",
+            default_value="none",
+            choices=["none", "dialogue"],
+            description=(
+                "Social interaction policy, independent "
+                "from the A/B/C/D perception profile."
+            ),
         ),
 
         DeclareLaunchArgument(

@@ -1,268 +1,583 @@
+
+#!/usr/bin/env python3
 """
-Track person detections across consecutive YOLO frames.
+ROS 2 orchestration for multimodal person tracking.
 
-Responsibility:
-    Associate current person detections with previously active tracks and assign
-    persistent detection IDs.
+INPUT
+    /social_perception/detections_enriched
+    PersonDetectionArray, APPEARANCE stage.
 
-Flow:
-    INPUT
-        /yolo/detections
-            ↓
-    PERSON FILTERING
-            ↓
-    TRACK ASSOCIATION
-        IoU + center distance
-            ↓
-    TRACK UPDATE / CREATION / EXPIRATION
-            ↓
-    OUTPUT
-        /yolo/detections_tracked
+OUTPUT
+    /social_perception/detections_identified
+    PersonDetectionArray, IDENTITY stage.
 
-The node does not estimate depth and does not perform TF transforms.
-It only manages temporal identity consistency.
+PIPELINE
+    Validate observation and source order.
+    Retain an ordered, bounded pending queue.
+    Prepare timestamp-correct RGB camera geometry.
+    Validate RGB/depth metric provenance.
+    Decode all candidates without dropping any.
+    Invoke one transactional identity engine.
+    Publish identity decisions.
+
+BOUNDARIES
+    The node does not calculate association scores.
+    It does not invent observations, timestamps, or geometry.
+    GeometryAdapter is an auxiliary class, not another ROS node.
 """
 
 import copy
 import math
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+import sqlite3
 import time
-import rclpy
-from rclpy.node import Node
+import uuid
 
-from yolo_msgs.msg import Detection
-from yolo_msgs.msg import DetectionArray
+from pathlib import Path
+from collections import deque
+from dataclasses import dataclass
+
+import rclpy
+
+from rclpy.clock import Clock, ClockType
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+
+from std_msgs.msg import String
+
+from g1_social_msgs.msg import (
+    DepthEvidence,
+    ExtentFeature,
+    FeatureMetadata,
+    PersonDetection,
+    PersonDetectionArray,
+)
+
+from g1_social_perception.geometry_adapter import (
+    GeometryAdapter,
+    GeometryAdapterConfig,
+)
+
+from g1_social_perception.identity.persistent_memory import (
+    PersistentIdentityMemory,
+    PersistentMemoryConfig,
+)
+
+from g1_social_perception.identity.multimodal_engine import (
+    ACTIVE_MODES,
+    EngineConfig,
+    MultimodalIdentityEngine,
+)
+
+from g1_social_perception.mathematical_model.assignment import (
+    AssignmentThresholds,
+)
+
+from g1_social_perception.mathematical_model.types import (
+    AssociationWeights,
+    BoundingBox2D,
+    EnrichedDetection,
+    Extent2D,
+    Histogram,
+    Measurement,
+    SourceDetection,
+    Vector3,
+)
 
 from g1_qos_manager.diagnostics import log_qos_resolution
 from g1_qos_manager.profiles import reliable_qos
 from g1_qos_manager.resolver import resolve_subscription_qos
 
 
-# =============================================================================
-# RESULT OBJECTS
-# =============================================================================
+# ============================================================================
+# DATA / UTILITIES
+# ============================================================================
+
+
+def stamp_ns(stamp):
+    seconds = int(stamp.sec)
+    nanoseconds = int(stamp.nanosec)
+
+    if seconds < 0 or not 0 <= nanoseconds < 1_000_000_000:
+        raise ValueError("INVALID_TIMESTAMP")
+
+    result = seconds * 1_000_000_000 + nanoseconds
+
+    if result <= 0:
+        raise ValueError("ZERO_TIMESTAMP")
+
+    return result
+
+
+def positive(name, value):
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError(f"INVALID_POSITIVE_PARAMETER:{name}")
+
+
+def unit(name, value):
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or not 0 <= value <= 1
+    ):
+        raise ValueError(f"INVALID_UNIT_PARAMETER:{name}")
 
 
 @dataclass
-class TrackState:
+class PendingObservation:
+    message: object
+    received_at: float
+    deadline_at: float
+    source_ns: int
+    source_session_id: str
+    source_sequence: int
+
+
+# ============================================================================
+# PROCESSING / MESSAGE DECODING
+# ============================================================================
+
+
+def decode_feature(feature, value, *, reason="UNAVAILABLE"):
+    metadata = feature.metadata
+
+    if (
+        metadata.status != FeatureMetadata.AVAILABLE
+        or metadata.quality <= 0.0
+    ):
+        return Measurement.unavailable(
+            metadata.reason or reason
+        )
+
+    return Measurement(
+        value=value,
+        quality=float(metadata.quality),
+        stamp_ns=stamp_ns(metadata.header.stamp),
+        frame_id=metadata.header.frame_id,
+        reason=metadata.reason,
+    )
+
+
+def decode_position(feature):
+    if (
+        feature.metadata.status != FeatureMetadata.AVAILABLE
+        or feature.metadata.quality <= 0.0
+    ):
+        return Measurement.unavailable(
+            feature.metadata.reason or "POSITION_UNAVAILABLE"
+        )
+
+    return decode_feature(
+        feature,
+        Vector3(
+            float(feature.value.x),
+            float(feature.value.y),
+            float(feature.value.z),
+        ),
+    )
+
+
+def decode_extent(feature, expected_unit):
+    if (
+        feature.metadata.status != FeatureMetadata.AVAILABLE
+        or feature.metadata.quality <= 0.0
+    ):
+        return Measurement.unavailable(
+            feature.metadata.reason or "EXTENT_UNAVAILABLE"
+        )
+
+    if feature.unit != expected_unit:
+        raise ValueError("EXTENT_UNIT_MISMATCH")
+
+    return decode_feature(
+        feature,
+        Extent2D(
+            float(feature.width),
+            float(feature.height),
+        ),
+    )
+
+
+def decode_histogram(feature):
+    if (
+        feature.metadata.status != FeatureMetadata.AVAILABLE
+        or feature.metadata.quality <= 0.0
+    ):
+        return Measurement.unavailable(
+            feature.metadata.reason or "APPEARANCE_UNAVAILABLE"
+        )
+
+    return decode_feature(
+        feature,
+        Histogram(
+            bins=tuple(float(value) for value in feature.bins),
+            schema_id=str(feature.schema_id),
+        ),
+    )
+
+def decode_candidate(msg, candidate, *, metric_allowed):
     """
-    Store the persistent state of one tracked person.
+    Decode one real candidate.
 
-    Attributes:
-        track_id:
-            Internal numeric identifier.
+    Invalid RGB-D provenance excludes BOTH depth-derived
+    spatial measurements: odom position and metric extent.
 
-        center_x / center_y:
-            Last known 2D bounding-box center in pixels.
-
-        width / height:
-            Last known 2D bounding-box dimensions in pixels.
-
-        missed_frames:
-            Number of consecutive frames in which the track was not matched.
-
-        age_frames:
-            Total number of frames during which the track has existed.
-
-        hits:
-            Number of successful detection associations.
+    Original YOLO and appearance evidence remain available.
     """
+    detection = candidate.source_detection
+    bbox_msg = detection.bbox
 
-    track_id: int
+    bbox = BoundingBox2D(
+        center_u=float(bbox_msg.center.position.x),
+        center_v=float(bbox_msg.center.position.y),
+        width=float(bbox_msg.size.x),
+        height=float(bbox_msg.size.y),
+    )
 
-    center_x: float
-    center_y: float
+    source = SourceDetection(
+        stamp_ns=stamp_ns(msg.image_header.stamp),
+        image_frame=msg.image_header.frame_id,
+        candidate_index=int(candidate.source_index),
+        bbox=bbox,
+        confidence=float(detection.score),
+        class_id=int(detection.class_id),
+        source_session_id=msg.source_session_id,
+    )
 
-    width: float
-    height: float
+    if metric_allowed:
+        position = decode_position(candidate.position)
+        metric = decode_extent(
+            candidate.metric_extent,
+            ExtentFeature.METRES,
+        )
+    else:
+        position = Measurement.unavailable(
+            "INVALID_RGB_DEPTH_PROVENANCE"
+        )
+        metric = Measurement.unavailable(
+            "INVALID_RGB_DEPTH_PROVENANCE"
+        )
 
-    missed_frames: int = 0
-    age_frames: int = 1
-    hits: int = 1
+    upper = decode_histogram(candidate.appearance_upper)
+    lower = decode_histogram(candidate.appearance_lower)
 
+    apparent = decode_extent(
+        candidate.apparent_extent,
+        ExtentFeature.PIXELS,
+    )
 
-# =============================================================================
-# TRACKING NODE
-# =============================================================================
+    return EnrichedDetection(
+        source=source,
+        position_odom=position,
+        appearance_upper=upper,
+        appearance_lower=lower,
+        apparent_extent=apparent,
+        metric_extent=metric,
+    )
+
+# ============================================================================
+# ROS NODE
+# ============================================================================
 
 
 class PersonTrackingNode(Node):
-    """
-    Maintain persistent identities for person detections.
-
-    Input:
-        DetectionArray containing YOLO detections.
-
-    Output:
-        DetectionArray containing only person detections, each with a stable
-        detection.id such as "person_1".
-    """
 
     def __init__(self):
         super().__init__("person_tracking")
 
-        # =====================================================================
-        # INPUT / CONFIGURATION
-        # =====================================================================
+        self._configure()
+        self._initialize_state()
+        self._create_interfaces()
 
-        self.declare_parameter(
-            "input_topic",
-            "/yolo/detections",
+        self.get_logger().info(
+            "[PERSON TRACKING] "
+            f"input={self.input_topic} "
+            f"output={self.output_topic} "
+            f"session={self.tracking_session_id}"
         )
 
-        self.declare_parameter(
-            "output_topic",
-            "/yolo/detections_tracked",
-        )
+    # ========================================================================
+    # DATA / CONFIGURATION
+    # ========================================================================
 
-        self.declare_parameter(
-            "person_class_id",
-            0,
-        )
+    def _configure(self):
+        defaults = {
+            "input_topic":
+                "/social_perception/detections_enriched",
+            "output_topic":
+                "/social_perception/detections_identified",
+            "timing_topic":
+                "/social_perception/person_tracking/timing",
+            "camera_info_topic":
+                "/camera/aligned_depth_to_color/camera_info",
 
-        self.declare_parameter(
-            "minimum_iou",
-            0.20,
-        )
+            "odom_frame": "odom",
+            "person_class_id": 0,
 
-        self.declare_parameter(
-            "maximum_center_distance_px",
-            100.0,
-        )
+            "geometry_wait_sec": 0.15,
+            "retry_period_sec": 0.02,
+            "max_pending_observations": 32,
 
-        self.declare_parameter(
-            "iou_weight",
-            0.70,
-        )
+            "maximum_depth_rgb_offset_sec": 0.10,
+            "maximum_camera_info_age_sec": 2.0,
+            "tf_cache_sec": 10.0,
 
-        self.declare_parameter(
-            "center_weight",
-            0.30,
-        )
+            "weight_g": 0.25,
+            "weight_m": 0.35,
+            "weight_a": 0.30,
+            "weight_h": 0.10,
 
-        self.declare_parameter(
-            "minimum_match_score",
-            0.35,
-        )
+            "eta_upper": 0.50,
+            "eta_lower": 0.50,
+            "alpha": 0.50,
+            "beta": 0.50,
 
-        self.declare_parameter(
-            "max_missed_frames",
-            45,
-        )
+            "motion_tolerance_m": 1.0,
+            "maximum_velocity_age_sec": 1.0,
 
-        self.input_topic = (
-            self.get_parameter("input_topic")
-            .get_parameter_value()
-            .string_value
-        )
+            "metric_sigma_w": 0.45,
+            "metric_sigma_h": 0.45,
+            "apparent_sigma_w": 0.45,
+            "apparent_sigma_h": 0.45,
 
-        self.output_topic = (
-            self.get_parameter("output_topic")
-            .get_parameter_value()
-            .string_value
-        )
+            "maximum_view_angle_rad": 0.35,
+            "minimum_projection_depth_m": 0.20,
+            "maximum_projection_depth_m": 8.0,
 
-        self.person_class_id = (
-            self.get_parameter("person_class_id")
-            .get_parameter_value()
-            .integer_value
-        )
+            "active_timeout_sec": 2.0,
+            "gallery_retention_sec": 30.0,
 
-        self.minimum_iou = (
-            self.get_parameter("minimum_iou")
-            .get_parameter_value()
-            .double_value
-        )
+            "confirm_hits": 3,
+            "max_active_tracks": 64,
+            "max_gallery_entries": 128,
 
-        self.maximum_center_distance_px = (
-            self.get_parameter("maximum_center_distance_px")
-            .get_parameter_value()
-            .double_value
-        )
+            "minimum_initial_confidence": 0.50,
+            "minimum_initial_region_quality": 0.20,
 
-        self.iou_weight = (
-            self.get_parameter("iou_weight")
-            .get_parameter_value()
-            .double_value
-        )
+            "minimum_return_score": 0.75,
+            "minimum_return_support": 0.50,
+            "minimum_return_margin": 0.10,
 
-        self.center_weight = (
-            self.get_parameter("center_weight")
-            .get_parameter_value()
-            .double_value
-        )
+            "stationary_fallback_quality": 0.35,
 
-        self.minimum_match_score = (
-            self.get_parameter("minimum_match_score")
-            .get_parameter_value()
-            .double_value
-        )
+            "active_minimum_score": 0.55,
+            "active_minimum_support": 0.15,
+            "active_minimum_margin": 0.10,
 
-        self.max_missed_frames = (
-            self.get_parameter("max_missed_frames")
-            .get_parameter_value()
-            .integer_value
-        )
+            "log_period_sec": 5.0,
 
-        # =====================================================================
-        # INTERNAL STATE
-        # =====================================================================
+            "persistent_memory_enabled": False,
+            "persistent_memory_path":
+                "~/.local/share/g1_social_perception/"
+                "identity_history.sqlite3",
+            "persistent_memory_retention_days": 7,
+            "persistent_memory_maximum_records": 10000,
+        }
 
-        self.tracks: Dict[int, TrackState] = {}
+        for name, default in defaults.items():
+            self.declare_parameter(name, default)
+            setattr(self, name, self.get_parameter(name).value)
 
-        # ============================================================
-        # OBSERVATION PROVENANCE - 2D
-        # ============================================================
+        if len({
+            self.input_topic,
+            self.output_topic,
+            self.timing_topic,
+        }) != 3:
+            raise ValueError("TOPIC_COLLISION")
 
-        self.last_input_stamp_sec = None
-        self.last_input_received_monotonic = None
+        for name in (
+            "geometry_wait_sec",
+            "retry_period_sec",
+            "tf_cache_sec",
+            "log_period_sec",
+        ):
+            positive(name, getattr(self, name))
 
-        self.accepted_observation_arrays = 0
-        self.empty_observation_arrays = 0
-        self.rejected_observation_timestamps = 0
-
-        # Diagnostics.
-        self.accepted_observation_arrays = 0
-        self.empty_observation_arrays = 0
-        self.rejected_observation_timestamps = 0
-        self.stale_observation_cycles = 0
-
-        # Maximum delay allowed between reception and publication.
-        self.declare_parameter(
-            "observation_freshness_timeout_sec",
-            1.0,
-        )
-
-        self.observation_freshness_timeout_sec = float(
-            self.get_parameter(
-                "observation_freshness_timeout_sec"
-            ).value
-        )
+        if self.retry_period_sec > self.geometry_wait_sec:
+            raise ValueError("INVALID_GEOMETRY_RETRY_PERIOD")
 
         if (
-            not math.isfinite(self.observation_freshness_timeout_sec)
-            or self.observation_freshness_timeout_sec <= 0.0
+            type(self.max_pending_observations) is not int
+            or self.max_pending_observations < 1
         ):
-            raise ValueError(
-                "observation_freshness_timeout_sec must be finite and positive."
+            raise ValueError("INVALID_PENDING_CAPACITY")
+
+        for name in (
+            "weight_g", "weight_m", "weight_a", "weight_h",
+            "eta_upper", "eta_lower", "alpha", "beta",
+            "minimum_initial_confidence",
+            "minimum_initial_region_quality",
+            "minimum_return_score",
+            "minimum_return_support",
+            "minimum_return_margin",
+            "active_minimum_score",
+            "active_minimum_support",
+            "active_minimum_margin",
+            "stationary_fallback_quality",
+        ):
+            unit(name, getattr(self, name))
+
+        if (
+            self.weight_g + self.weight_m
+            + self.weight_a + self.weight_h <= 0.0
+        ):
+            raise ValueError("ALL_ASSOCIATION_WEIGHTS_ZERO")
+
+        if self.eta_upper + self.eta_lower <= 0.0:
+            raise ValueError("APPEARANCE_WEIGHTS_ZERO")
+
+        if self.alpha + self.beta <= 0.0:
+            raise ValueError("SIZE_WEIGHTS_ZERO")
+
+    def _engine_config(self):
+        weights = AssociationWeights(
+            g=float(self.weight_g),
+            m=float(self.weight_m),
+            a=float(self.weight_a),
+            h=float(self.weight_h),
+            eta_upper=float(self.eta_upper),
+            eta_lower=float(self.eta_lower),
+            alpha=float(self.alpha),
+            beta=float(self.beta),
+        )
+
+        # One explicitly configured initial policy for each mode.
+        # Per-mode thresholds should be calibrated offline.
+        thresholds = {
+            mode: AssignmentThresholds(
+                minimum_score=float(self.active_minimum_score),
+                minimum_support=float(self.active_minimum_support),
+                minimum_margin=float(self.active_minimum_margin),
             )
+            for mode in ACTIVE_MODES
+        }
 
-        self.next_track_id = 1
+        return EngineConfig(
+            weights=weights,
+            active_thresholds=thresholds,
+            motion_tolerance_m=float(self.motion_tolerance_m),
+            maximum_velocity_age_sec=float(
+                self.maximum_velocity_age_sec
+            ),
+            metric_sigma=(
+                float(self.metric_sigma_w),
+                float(self.metric_sigma_h),
+            ),
+            apparent_sigma=(
+                float(self.apparent_sigma_w),
+                float(self.apparent_sigma_h),
+            ),
+            maximum_view_angle_rad=float(
+                self.maximum_view_angle_rad
+            ),
+            minimum_projection_depth_m=float(
+                self.minimum_projection_depth_m
+            ),
+            maximum_projection_depth_m=float(
+                self.maximum_projection_depth_m
+            ),
+            active_timeout_sec=float(self.active_timeout_sec),
+            gallery_retention_sec=float(
+                self.gallery_retention_sec
+            ),
+            confirm_hits=int(self.confirm_hits),
+            max_active_tracks=int(self.max_active_tracks),
+            max_gallery_entries=int(self.max_gallery_entries),
+            minimum_initial_confidence=float(
+                self.minimum_initial_confidence
+            ),
+            minimum_initial_region_quality=float(
+                self.minimum_initial_region_quality
+            ),
+            minimum_return_score=float(
+                self.minimum_return_score
+            ),
+            minimum_return_support=float(
+                self.minimum_return_support
+            ),
+            minimum_return_margin=float(
+                self.minimum_return_margin
+            ),
+            stationary_fallback_quality=float(
+                self.stationary_fallback_quality
+            ),
+        )
 
-        # Diagnostics counters.
-        self.frames_received = 0
-        self.detections_received = 0
+    # ========================================================================
+    # DATA / STATE
+    # ========================================================================
 
-        self.person_detections = 0
+    def _initialize_state(self):
+        self.tracking_session_id = uuid.uuid4().hex
 
-        self.matches = 0
-        self.new_tracks = 0
-        self.expired_tracks = 0
+        self.engine = MultimodalIdentityEngine(
+            session_id=self.tracking_session_id,
+            config=self._engine_config(),
+        )
 
-        # =====================================================================
-        # QOS
-        # =====================================================================
+        if type(self.persistent_memory_enabled) is not bool:
+            raise ValueError("INVALID_PERSISTENCE_ENABLED")
+
+        self.persistent_memory = PersistentIdentityMemory(
+            PersistentMemoryConfig(
+                database_path=str(
+                    Path(self.persistent_memory_path).expanduser()
+                ),
+                enabled=self.persistent_memory_enabled,
+                retention_days=int(
+                    self.persistent_memory_retention_days
+                ),
+                maximum_records=int(
+                    self.persistent_memory_maximum_records
+                ),
+            )
+        )
+
+        self._persistent_observation_counts = {}
+        self.persistent_saved = 0
+        self.persistent_errors = 0
+
+        self.pending = deque()
+        self.active_source_session = None
+        self.retired_source_sessions = set()
+
+        self.last_source_sequence = 0
+        self.last_source_stamp_ns = 0
+
+        self.arrays_received = 0
+        self.arrays_rejected = 0
+        self.arrays_published = 0
+        self.arrays_discarded = 0
+        self.geometry_unavailable = 0
+
+        self.steady_clock = Clock(
+            clock_type=ClockType.STEADY_TIME
+        )
+
+    # ========================================================================
+    # ROS INTERFACES
+    # ========================================================================
+
+    def _create_interfaces(self):
+        self.geometry_adapter = GeometryAdapter(
+            node=self,
+            config=GeometryAdapterConfig(
+                camera_info_topic=self.camera_info_topic,
+                odom_frame=self.odom_frame,
+                tf_cache_sec=float(self.tf_cache_sec),
+                maximum_camera_info_age_sec=float(
+                    self.maximum_camera_info_age_sec
+                ),
+                maximum_depth_rgb_offset_sec=float(
+                    self.maximum_depth_rgb_offset_sec
+                ),
+            ),
+        )
 
         input_qos = resolve_subscription_qos(
             self,
@@ -272,725 +587,448 @@ class PersonTrackingNode(Node):
         )
 
         log_qos_resolution(
-            self,
-            self.input_topic,
-            input_qos,
+            self, self.input_topic, input_qos
         )
 
-        output_qos = reliable_qos(
-            depth=10,
+        self.output_pub = self.create_publisher(
+            PersonDetectionArray,
+            self.output_topic,
+            reliable_qos(depth=10),
         )
 
-        # =====================================================================
-        # ROS INTERFACES
-        # =====================================================================
+        self.timing_pub = self.create_publisher(
+            String,
+            self.timing_topic,
+            reliable_qos(depth=100),
+        )
 
         self.subscription = self.create_subscription(
-            DetectionArray,
+            PersonDetectionArray,
             self.input_topic,
             self.detections_callback,
             input_qos,
         )
 
-        self.publisher = self.create_publisher(
-            DetectionArray,
-            self.output_topic,
-            output_qos,
+        self.retry_timer = self.create_timer(
+            self.retry_period_sec,
+            self._drain_pending,
+            clock=self.steady_clock,
         )
-
-        # =====================================================================
-        # REPORTING
-        # =====================================================================
 
         self.diagnostics_timer = self.create_timer(
-            5.0,
+            self.log_period_sec,
             self.log_diagnostics,
+            clock=self.steady_clock,
         )
 
-        self.get_logger().info("")
-        self.get_logger().info("=" * 82)
-        self.get_logger().info(
-            "  PERSON TRACKING - INITIALIZATION"
-        )
-        self.get_logger().info("=" * 82)
+    # ========================================================================
+    # INPUT / VALIDATION
+    # ========================================================================
 
-        self.get_logger().info(
-            f"  Input topic              : {self.input_topic}"
-        )
-        self.get_logger().info(
-            f"  Output topic             : {self.output_topic}"
-        )
-        self.get_logger().info(
-            f"  Person class ID          : {self.person_class_id}"
-        )
-        self.get_logger().info(
-            f"  Minimum IoU              : {self.minimum_iou:.2f}"
-        )
-        self.get_logger().info(
-            f"  Maximum center distance  : "
-            f"{self.maximum_center_distance_px:.1f} px"
-        )
-        self.get_logger().info(
-            f"  Minimum match score      : "
-            f"{self.minimum_match_score:.2f}"
-        )
-        self.get_logger().info(
-            f"  Maximum missed frames    : {self.max_missed_frames}"
-        )
-
-        self.get_logger().info("-" * 82)
-
-    # =========================================================================
-    # COLLECTION
-    # =========================================================================
-
-    def detections_callback(
-        self,
-        msg: DetectionArray,
-    ) -> None:
-        """
-        Associate YOLO 2D person detections with persistent tracks.
-
-        Input:
-            /yolo/detections
-
-        Output:
-            /yolo/detections_tracked
-
-        Rules:
-            - Process only genuine new source frames.
-            - Preserve the original source timestamp and frame.
-            - Use 2D bounding boxes, never bbox3d.
-            - Associate detections using IoU and center distance.
-            - Assign stable person IDs.
-            - Expire missing tracks without inventing detections.
-            - Reject malformed input without publishing a false
-            empty observation.
-        """
-
-        self.frames_received += 1
-        self.detections_received += len(msg.detections)
-
-        # ------------------------------------------------------------
-        # VALIDATE UPSTREAM OBSERVATION
-        # ------------------------------------------------------------
-
-        stamp = msg.header.stamp
-
-        sec = int(stamp.sec)
-        nanosec = int(stamp.nanosec)
+    def _validate_input(self, msg):
+        if (
+            msg.processing_stage != PersonDetectionArray.APPEARANCE
+            or msg.identity_evaluated
+            or msg.tracking_session_id
+        ):
+            raise ValueError("EXPECTED_UNIDENTIFIED_APPEARANCE_STAGE")
 
         if (
-            sec < 0
-            or nanosec < 0
-            or nanosec >= 1_000_000_000
+            not msg.source_session_id
+            or not msg.image_header.frame_id
+            or msg.header.frame_id != self.odom_frame
         ):
-            self.rejected_observation_timestamps += 1
-            return
+            raise ValueError("INVALID_SOURCE_OR_SPATIAL_FRAME")
 
-        stamp_sec = sec + nanosec * 1e-9
+        source_ns = stamp_ns(msg.header.stamp)
 
-        if (
-            stamp_sec <= 0.0
-            or (
-                self.last_input_stamp_sec is not None
-                and stamp_sec <= self.last_input_stamp_sec
-            )
-        ):
-            self.rejected_observation_timestamps += 1
-            return
+        if source_ns != stamp_ns(msg.image_header.stamp):
+            raise ValueError("RGB_SOURCE_TIMESTAMP_MISMATCH")
 
-        if not str(msg.header.frame_id).strip():
-            self.get_logger().warning(
-                "[PERSON TRACKING] Rejected detection array "
-                "with empty source frame.",
-                throttle_duration_sec=2.0,
-            )
-            return
+        if msg.source_sequence < 1:
+            raise ValueError("INVALID_SOURCE_SEQUENCE")
 
-        # ------------------------------------------------------------
-        # FILTER AND VALIDATE 2D PERSON DETECTIONS
-        # ------------------------------------------------------------
+        if msg.source_detection_count != len(msg.candidates):
+            raise ValueError("SOURCE_CANDIDATE_COUNT_MISMATCH")
 
-        person_detections = []
+        if msg.source_session_id in self.retired_source_sessions:
+            raise ValueError("RETIRED_SOURCE_SESSION")
 
-        for detection in msg.detections:
-
-            if int(detection.class_id) != self.person_class_id:
-                continue
-
-            center_x, center_y, width, height = (
-                self.extract_bbox(detection)
-            )
-
-            if not all(
-                math.isfinite(value)
-                for value in (
-                    center_x,
-                    center_y,
-                    width,
-                    height,
-                )
-            ) or width <= 0.0 or height <= 0.0:
-
-                self.get_logger().warning(
-                    "[PERSON TRACKING] Rejected frame: "
-                    "invalid person 2D bounding box.",
-                    throttle_duration_sec=2.0,
-                )
-                return
-
-            person_detections.append(detection)
-
-        # The complete incoming frame is now accepted.
-
-        self.last_input_stamp_sec = stamp_sec
-        self.last_input_received_monotonic = time.monotonic()
-
-        self.accepted_observation_arrays += 1
-        self.person_detections += len(person_detections)
-
-        if not person_detections:
-            self.empty_observation_arrays += 1
-
-        # ------------------------------------------------------------
-        # ASSOCIATE WITH EXISTING TRACKS
-        # ------------------------------------------------------------
-
-        assignments = self.associate_detections(
-            person_detections
-        )
-
-        matched_track_ids = set()
-        matched_detection_indices = set()
-
-        output_detections = [
-            copy.deepcopy(detection)
-            for detection in person_detections
-        ]
-
-        for track_id, detection_index in assignments:
-
-            track = self.tracks.get(track_id)
-
-            if track is None:
-                continue
-
-            detection = person_detections[detection_index]
-
-            self.update_track(
-                track,
-                detection,
-            )
-
-            output_detections[detection_index].id = (
-                f"person_{track_id}"
-            )
-
-            matched_track_ids.add(track_id)
-            matched_detection_indices.add(detection_index)
-
-            self.matches += 1
-
-        # ------------------------------------------------------------
-        # AGE UNMATCHED TRACKS
-        # ------------------------------------------------------------
-
-        for track_id, track in self.tracks.items():
-
-            if track_id in matched_track_ids:
-                continue
-
-            track.missed_frames += 1
-            track.age_frames += 1
-
-        # ------------------------------------------------------------
-        # CREATE NEW TRACKS FOR UNMATCHED DETECTIONS
-        # ------------------------------------------------------------
-
-        for detection_index, detection in enumerate(
-            person_detections
-        ):
-
-            if detection_index in matched_detection_indices:
-                continue
-
-            track = self.create_track(detection)
-
-            output_detections[detection_index].id = (
-                f"person_{track.track_id}"
-            )
-
-        # ------------------------------------------------------------
-        # REMOVE EXPIRED TRACKS
-        # ------------------------------------------------------------
-
-        self.remove_expired_tracks()
-
-        # ------------------------------------------------------------
-        # PUBLISH ACTUAL DETECTIONS
-        # ------------------------------------------------------------
-
-        output = copy.deepcopy(msg)
-
-        # Only observed persons, never predicted or historical boxes.
-        output.detections = output_detections
-
-        # The original header remains unchanged.
-        self.publisher.publish(output)
-
-    # =========================================================================
-    # PROCESSING / ASSOCIATION
-    # =========================================================================
-
-    def associate_detections(
-        self,
-        detections: List[Detection],
-    ) -> List[Tuple[int, int]]:
-        """
-        Associate current detections with active tracks.
-
-        Processing:
-            Evaluates every track/detection pair using:
-                - Intersection over Union.
-                - 2D bounding-box center distance.
-
-            The highest scoring non-conflicting pairs are selected greedily.
-
-        Output:
-            List of:
-                (track_id, detection_index)
-
-        Side effects:
-            None.
-        """
-
-        candidates = []
-
-        for track_id, track in self.tracks.items():
-            for detection_index, detection in enumerate(
-                detections
+        if msg.source_session_id == self.active_source_session:
+            if (
+                msg.source_sequence <= self.last_source_sequence
+                or source_ns <= self.last_source_stamp_ns
             ):
-                iou = self.calculate_iou(
-                    track,
-                    detection,
+                raise ValueError("DUPLICATE_OR_REVERSED_OBSERVATION")
+
+        seen = set()
+
+        for candidate in msg.candidates:
+            index = int(candidate.source_index)
+
+            if index in seen:
+                raise ValueError("DUPLICATE_SOURCE_INDEX")
+
+            seen.add(index)
+
+            if (
+                candidate.person_id
+                or candidate.identity_confirmed
+                or candidate.identity_generation
+                or candidate.identity_state != "INSUFFICIENT"
+            ):
+                raise ValueError("UNEXPECTED_UPSTREAM_IDENTITY")
+
+            if int(candidate.source_detection.class_id) != int(
+                self.person_class_id
+            ):
+                raise ValueError("NON_PERSON_SOURCE_DETECTION")
+
+            confidence = float(candidate.source_detection.score)
+            unit("source_confidence", confidence)
+
+        return source_ns
+
+    # ========================================================================
+    # INPUT / ORDERED QUEUE
+    # ========================================================================
+
+    def detections_callback(self, msg):
+        self.arrays_received += 1
+
+        try:
+            source_ns = self._validate_input(msg)
+
+        except (
+            ValueError,
+            TypeError,
+            AttributeError,
+            OverflowError,
+        ) as exc:
+            self.arrays_rejected += 1
+            self.get_logger().warning(
+                "[TRACKING] Rejected observation: " + str(exc)
+            )
+            return
+
+        if msg.source_session_id != self.active_source_session:
+            if self.active_source_session is not None:
+                self.retired_source_sessions.add(
+                    self.active_source_session
                 )
 
-                center_distance = (
-                    self.calculate_center_distance(
-                        track,
-                        detection,
-                    )
+                # A new source producer starts a new identity domain.
+                # Pending observations from its predecessor cannot be
+                # carried into that domain.
+                while self.pending:
+                    self.pending.popleft()
+                    self.arrays_discarded += 1
+
+                self.tracking_session_id = uuid.uuid4().hex
+                self.engine = MultimodalIdentityEngine(
+                    session_id=self.tracking_session_id,
+                    config=self._engine_config(),
                 )
 
-                # Reject obviously unrelated detections.
-                if (
-                    iou < self.minimum_iou
-                    and center_distance
-                    > self.maximum_center_distance_px
-                ):
-                    continue
+            self.active_source_session = msg.source_session_id
 
-                center_similarity = max(
-                    0.0,
-                    1.0
-                    - (
-                        center_distance
-                        / self.maximum_center_distance_px
-                    ),
-                )
+        self.last_source_sequence = int(msg.source_sequence)
+        self.last_source_stamp_ns = source_ns
 
-                score = (
-                    self.iou_weight * iou
-                    + self.center_weight
-                    * center_similarity
-                )
+        # Preserve source order even while TF is missing.
+        self._drain_pending()
 
-                if score < self.minimum_match_score:
-                    continue
-
-                candidates.append(
-                    (
-                        score,
-                        track_id,
-                        detection_index,
-                    )
-                )
-
-        # Highest score first.
-        candidates.sort(
-            key=lambda item: item[0],
-            reverse=True,
-        )
-
-        assignments = []
-
-        used_tracks: Set[int] = set()
-        used_detections: Set[int] = set()
-
-        for (
-            _score,
-            track_id,
-            detection_index,
-        ) in candidates:
-
-            if track_id in used_tracks:
-                continue
-
-            if detection_index in used_detections:
-                continue
-
-            assignments.append(
-                (
-                    track_id,
-                    detection_index,
-                )
+        if len(self.pending) >= self.max_pending_observations:
+            self.arrays_discarded += 1
+            self.get_logger().warning(
+                "[TRACKING] Pending buffer full"
             )
-
-            used_tracks.add(
-                track_id
-            )
-
-            used_detections.add(
-                detection_index
-            )
-
-        return assignments
-
-    # =========================================================================
-    # PROCESSING / TRACK STATE
-    # =========================================================================
-
-    def create_track(
-        self,
-        detection: Detection,
-    ) -> TrackState:
-        """
-        Create a new persistent person track.
-
-        Output:
-            Newly created TrackState.
-
-        Side effects:
-            Inserts the track into self.tracks.
-        """
-
-        track_id = self.next_track_id
-
-        self.next_track_id += 1
-
-        center_x, center_y, width, height = (
-            self.extract_bbox(
-                detection
-            )
-        )
-
-        track = TrackState(
-            track_id=track_id,
-            center_x=center_x,
-            center_y=center_y,
-            width=width,
-            height=height,
-        )
-
-        self.tracks[
-            track_id
-        ] = track
-
-        self.new_tracks += 1
-
-        return track
-
-    def update_track(
-        self,
-        track: TrackState,
-        detection: Detection,
-    ) -> None:
-        """
-        Update an existing track using a newly associated detection.
-
-        Side effects:
-            Mutates TrackState.
-        """
-
-        (
-            center_x,
-            center_y,
-            width,
-            height,
-        ) = self.extract_bbox(
-            detection
-        )
-
-        track.center_x = center_x
-        track.center_y = center_y
-
-        track.width = width
-        track.height = height
-
-        track.missed_frames = 0
-        track.age_frames += 1
-        track.hits += 1
-
-    def remove_expired_tracks(
-        self,
-    ) -> None:
-        """
-        Remove tracks absent for too many consecutive frames.
-
-        Side effects:
-            Deletes expired TrackState objects.
-        """
-
-        expired_ids = [
-            track_id
-            for track_id, track in self.tracks.items()
-            if track.missed_frames
-            > self.max_missed_frames
-        ]
-
-        for track_id in expired_ids:
-            del self.tracks[
-                track_id
-            ]
-
-            self.expired_tracks += 1
-
-    # =========================================================================
-    # PROCESSING / GEOMETRY
-    # =========================================================================
-
-    @staticmethod
-    def extract_bbox(
-        detection: Detection,
-    ) -> Tuple[
-        float,
-        float,
-        float,
-        float,
-    ]:
-        """
-        Extract the YOLO 2D bounding box.
-
-        Output:
-            center_x, center_y, width, height
-        """
-
-        return (
-            float(
-                detection.bbox.center.position.x
-            ),
-            float(
-                detection.bbox.center.position.y
-            ),
-            float(
-                detection.bbox.size.x
-            ),
-            float(
-                detection.bbox.size.y
-            ),
-        )
-
-    def calculate_center_distance(
-        self,
-        track: TrackState,
-        detection: Detection,
-    ) -> float:
-        """
-        Compute Euclidean distance between bbox centers in pixels.
-
-        Output:
-            Pixel distance.
-        """
-
-        center_x, center_y, _, _ = (
-            self.extract_bbox(
-                detection
-            )
-        )
-
-        return math.hypot(
-            center_x - track.center_x,
-            center_y - track.center_y,
-        )
-
-    def calculate_iou(
-        self,
-        track: TrackState,
-        detection: Detection,
-    ) -> float:
-        """
-        Compute Intersection over Union between track and detection boxes.
-
-        Output:
-            IoU in [0, 1].
-        """
-
-        detection_x, detection_y, detection_w, detection_h = (
-            self.extract_bbox(
-                detection
-            )
-        )
-
-        track_x1 = (
-            track.center_x
-            - track.width / 2.0
-        )
-
-        track_y1 = (
-            track.center_y
-            - track.height / 2.0
-        )
-
-        track_x2 = (
-            track.center_x
-            + track.width / 2.0
-        )
-
-        track_y2 = (
-            track.center_y
-            + track.height / 2.0
-        )
-
-        detection_x1 = (
-            detection_x
-            - detection_w / 2.0
-        )
-
-        detection_y1 = (
-            detection_y
-            - detection_h / 2.0
-        )
-
-        detection_x2 = (
-            detection_x
-            + detection_w / 2.0
-        )
-
-        detection_y2 = (
-            detection_y
-            + detection_h / 2.0
-        )
-
-        intersection_x1 = max(
-            track_x1,
-            detection_x1,
-        )
-
-        intersection_y1 = max(
-            track_y1,
-            detection_y1,
-        )
-
-        intersection_x2 = min(
-            track_x2,
-            detection_x2,
-        )
-
-        intersection_y2 = min(
-            track_y2,
-            detection_y2,
-        )
-
-        intersection_width = max(
-            0.0,
-            intersection_x2
-            - intersection_x1,
-        )
-
-        intersection_height = max(
-            0.0,
-            intersection_y2
-            - intersection_y1,
-        )
-
-        intersection_area = (
-            intersection_width
-            * intersection_height
-        )
-
-        track_area = (
-            track.width
-            * track.height
-        )
-
-        detection_area = (
-            detection_w
-            * detection_h
-        )
-
-        union_area = (
-            track_area
-            + detection_area
-            - intersection_area
-        )
-
-        if union_area <= 0.0:
-            return 0.0
-
-        return (
-            intersection_area
-            / union_area
-        )
-
-    # =========================================================================
-    # OUTPUT / REPORTING
-    # =========================================================================
-    
-    def log_diagnostics(self) -> None:
-        """Report 2D tracking and source observation diagnostics."""
+            return
 
         now = time.monotonic()
 
-        if self.last_input_received_monotonic is None:
-            observation_age = float("inf")
-        else:
-            observation_age = max(
-                0.0,
-                now - self.last_input_received_monotonic,
+        self.pending.append(
+            PendingObservation(
+                message=copy.deepcopy(msg),
+                received_at=now,
+                deadline_at=now + self.geometry_wait_sec,
+                source_ns=source_ns,
+                source_session_id=msg.source_session_id,
+                source_sequence=int(msg.source_sequence),
             )
-
-        self.get_logger().info(
-            "[PERSON TRACKING 2D] "
-            f"FRAMES_RX={self.frames_received} | "
-            f"DETECTIONS_RX={self.detections_received} | "
-            f"PERSONS_RX={self.person_detections} | "
-            f"ACTIVE_TRACKS={len(self.tracks)} | "
-            f"MATCHES={self.matches} | "
-            f"NEW_TRACKS={self.new_tracks} | "
-            f"EXPIRED_TRACKS={self.expired_tracks} | "
-            f"OBS_ACCEPTED={self.accepted_observation_arrays} | "
-            f"OBS_EMPTY={self.empty_observation_arrays} | "
-            f"REJECTED_STAMPS="
-            f"{self.rejected_observation_timestamps} | "
-            f"OBS_AGE={observation_age:.2f}s"
         )
 
+        self._drain_pending()
 
-# =============================================================================
+    # ========================================================================
+    # PROCESSING / CANDIDATE CONVERSION
+    # ========================================================================
+
+    def _decode_candidates(self, msg):
+        source_ns = stamp_ns(msg.image_header.stamp)
+        frame = msg.image_header.frame_id
+
+        decoded = []
+
+        for candidate in msg.candidates:
+            provenance = (
+                self.geometry_adapter.validate_metric_provenance(
+                    candidate,
+                    rgb_stamp_ns=source_ns,
+                    camera_frame=frame,
+                )
+            )
+
+            decoded.append(
+                decode_candidate(
+                    msg,
+                    candidate,
+                    metric_allowed=provenance.usable,
+                )
+            )
+
+        return tuple(decoded)
+
+    # ========================================================================
+    # PROCESSING / ORDERED GEOMETRY AND IDENTITY
+    # ========================================================================
+
+    def _drain_pending(self):
+        while self.pending:
+            entry = self.pending[0]
+            msg = entry.message
+
+            try:
+                geometry = self.geometry_adapter.prepare(msg)
+
+            except (
+                ValueError,
+                TypeError,
+                AttributeError,
+            ) as exc:
+                # Invalid observation contracts are not repaired by
+                # substituting an unrelated camera transformation.
+                self.pending.popleft()
+                self.arrays_rejected += 1
+                self.get_logger().error(
+                    "[TRACKING] Geometry contract: " + str(exc)
+                )
+                continue
+
+            if (
+                not geometry.usable
+                and time.monotonic() < entry.deadline_at
+            ):
+                # Keep this observation at the head of the queue.
+                # CameraInfo and TF subscriptions can receive updates.
+                return
+
+            self.pending.popleft()
+
+            if not geometry.usable:
+                self.geometry_unavailable += 1
+
+            try:
+                self._process_observation(entry, geometry)
+
+            except Exception as exc:
+                self.arrays_rejected += 1
+                self.get_logger().error(
+                    "[TRACKING] Processing failed: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)
+                )
+
+    def _process_observation(self, entry, geometry):
+        msg = entry.message
+
+        candidates = self._decode_candidates(msg)
+
+        receipt = time.monotonic()
+
+        decisions = self.engine.process(
+            candidates,
+            stamp_ns=entry.source_ns,
+            receipt=receipt,
+            current_view=geometry.view,
+        )
+
+        if len(decisions) != len(msg.candidates):
+            raise RuntimeError("DECISION_COUNT_MISMATCH")
+
+        output = copy.deepcopy(msg)
+
+        output.processing_stage = PersonDetectionArray.IDENTITY
+        output.identity_evaluated = True
+        output.tracking_session_id = self.tracking_session_id
+
+        # source_observation_complete remains unchanged:
+        # it is not the same as identity confirmation.
+
+        for candidate, decision in zip(
+            output.candidates,
+            decisions,
+        ):
+            candidate.person_id = decision.person_id
+            candidate.identity_state = decision.state
+            candidate.identity_confirmed = decision.confirmed
+            candidate.identity_generation = decision.generation
+
+        self.output_pub.publish(output)
+        self.arrays_published += 1
+
+        # Persistence is independent from identity decisions.
+        self._persist_confirmed_observations(
+            output=output,
+            source_ns=entry.source_ns,
+        )
+
+        trace = {
+            "node": self.get_name(),
+            "tracking_session_id": self.tracking_session_id,
+            "source_session_id": entry.source_session_id,
+            "source_sequence": entry.source_sequence,
+            "source_stamp_ns": entry.source_ns,
+            "geometry_status": geometry.reason,
+            "candidate_count": len(candidates),
+            "identity_states": [
+                decision.state for decision in decisions
+            ],
+            "processing_receipt_monotonic": receipt,
+        }
+
+        import json
+        self.timing_pub.publish(
+            String(data=json.dumps(trace, allow_nan=False))
+        )
+
+    # ========================================================================
+    # PERSISTENT MEMORY
+    # ========================================================================
+
+    def _persist_confirmed_observations(
+        self,
+        *,
+        output,
+        source_ns,
+    ):
+        """
+        Persist non-biometric history for confirmed identities.
+
+        Never store tentative or ambiguous identities.
+        Never reassign an identity from historical database rows.
+        A database failure must not invalidate a published result.
+        """
+        if not self.persistent_memory.enabled:
+            return
+
+        session = str(output.tracking_session_id).strip()
+
+        if not session or source_ns <= 0:
+            return
+
+        for candidate in output.candidates:
+            person_id = str(candidate.person_id).strip()
+            generation = int(candidate.identity_generation)
+
+            if (
+                not person_id
+                or generation < 1
+                or not candidate.identity_confirmed
+                or candidate.identity_state in {
+                    "AMBIGUOUS",
+                    "INSUFFICIENT",
+                }
+            ):
+                continue
+
+            key = (session, person_id, generation)
+
+            count = (
+                self._persistent_observation_counts.get(key, 0)
+                + 1
+            )
+
+            try:
+                saved = self.persistent_memory.save_confirmed(
+                    tracking_session_id=session,
+                    person_id=person_id,
+                    generation=generation,
+                    observation_count=count,
+                    last_observation_ns=source_ns,
+                )
+
+                if saved:
+                    self._persistent_observation_counts[key] = count
+                    self.persistent_saved += 1
+
+            except (
+                OSError,
+                sqlite3.Error,
+                RuntimeError,
+                ValueError,
+                TypeError,
+            ) as exc:
+                self.persistent_errors += 1
+                self.get_logger().error(
+                    "[PERSISTENT MEMORY] Save failed: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc),
+                    throttle_duration_sec=5.0,
+                )
+
+    # ========================================================================
+    # DIAGNOSTICS
+    # ========================================================================
+
+    def log_diagnostics(self):
+        self.get_logger().info(
+            "[PERSON TRACKING] "
+            f"RX={self.arrays_received} | "
+            f"REJECTED={self.arrays_rejected} | "
+            f"PUBLISHED={self.arrays_published} | "
+            f"DISCARDED={self.arrays_discarded} | "
+            f"PENDING={len(self.pending)} | "
+            f"GEOMETRY_UNAVAILABLE={self.geometry_unavailable} | "
+            f"ACTIVE_TRACKS={len(self.engine.active)} | "
+            f"DORMANT_TRACKS={len(self.engine.dormant)} | "
+            f"PERSISTENCE_ENABLED={self.persistent_memory.enabled} | "
+            f"PERSISTENT_SAVED={self.persistent_saved} | "
+            f"PERSISTENT_ERRORS={self.persistent_errors}"
+        )
+
+    def discard_pending_on_shutdown(self):
+        while self.pending:
+            self.pending.popleft()
+            self.arrays_discarded += 1
+
+
+# ============================================================================
 # ORCHESTRATION
-# =============================================================================
+# ============================================================================
 
 
 def main(args=None):
-    """Run the person tracking node."""
-
-    rclpy.init(
-        args=args
-    )
-
-    node = PersonTrackingNode()
+    rclpy.init(args=args)
+    node = None
 
     try:
-        rclpy.spin(
-            node
-        )
+        node = PersonTrackingNode()
+        rclpy.spin(node)
 
     except KeyboardInterrupt:
         pass
 
     finally:
-        node.destroy_node()
+        if node is not None:
+            node.discard_pending_on_shutdown()
+
+            try:
+                node.persistent_memory.close()
+            finally:
+                node.destroy_node()
 
         if rclpy.ok():
             rclpy.shutdown()

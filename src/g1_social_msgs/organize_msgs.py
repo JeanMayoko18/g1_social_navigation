@@ -171,4 +171,21 @@ python3 organize_msgs.py
 # Vérifier l'organisation
 find msg -type f -name "*.msg" | sort
 
+
+cd ~/g1_ws
+
+rm -rf build/g1_social_msgs
+
+colcon build \
+  --packages-select g1_social_msgs \
+  --cmake-clean-cache \
+  --allow-overriding g1_social_msgs
+
+source install/setup.bash
+
+ros2 interface show g1_social_msgs/msg/TrackedPerson
+ros2 interface show g1_social_msgs/msg/SocialNavigationDecision
+ros2 interface show g1_social_msgs/msg/HumanIntent
+ros2 interface show g1_social_msgs/srv/SimulateHumanIntent
+
 """

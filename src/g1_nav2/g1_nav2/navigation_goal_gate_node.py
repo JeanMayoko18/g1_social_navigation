@@ -90,7 +90,11 @@ from g1_social_msgs.msg import (
     NavigationState,
     SpeechStatus,
     TrajectorySocialValidation,
+    DirectionalConstraintRequest,
+    DirectionalConstraintStatus,
+    
 )
+
 
 from g1_qos_manager.profiles import reliable_qos
 
@@ -643,18 +647,21 @@ class NavigationGoalGateNode(Node):
         )
 
 
-        self.navigation_state_timer = self.create_timer(
-            0.20,
-            self._publish_navigation_state,
-            callback_group=self.callback_group,
+        # ================================================================
+        # DIRECTIONAL NAVIGATION INITIALIZATION
+        # ================================================================
+
+        self._initialize_directional_gate()
+
+        # Mode D Behavior Tree, provided by navigation.launch.py
+        self.declare_parameter(
+            "mode_d_behavior_tree_xml",
+            "",
         )
 
-
-        self.authorization_watchdog_timer = self.create_timer(
-            0.20,
-            self._watch_authorization_deadlines,
-            callback_group=self.callback_group,
-        )
+        # ================================================================
+        # SOCIAL VALIDATION
+        # ================================================================
 
         self.social_validation_cache = {}
         self.authorization_sources = {}
@@ -665,8 +672,24 @@ class NavigationGoalGateNode(Node):
             "/social_navigation/trajectory_social_validation",
             self._social_validation_callback,
             10,
+            callback_group=self.callback_group,
         )
 
+        # ================================================================
+        # TIMERS
+        # ================================================================
+
+        self.navigation_state_timer = self.create_timer(
+            0.20,
+            self._publish_navigation_state,
+            callback_group=self.callback_group,
+        )
+
+        self.authorization_watchdog_timer = self.create_timer(
+            0.20,
+            self._watch_authorization_deadlines,
+            callback_group=self.callback_group,
+        )
 
         # ================================================================
         # PUBLIC ACTION SERVER
@@ -691,75 +714,80 @@ class NavigationGoalGateNode(Node):
             callback_group=self.callback_group,
         )
 
-        # ================================================================
-        # STARTUP LOGGING
-        # ================================================================
-
-        self.get_logger().info("")
-        self.get_logger().info("=" * 84)
-        self.get_logger().info(
-            "  NAVIGATION GOAL GATE - INITIALIZATION"
-        )
-        self.get_logger().info("=" * 84)
-
-        self.get_logger().info(
-            f"  Enabled                 : {self.enabled}"
-        )
-        self.get_logger().info(
-            f"  Public action           : "
-            f"{self.public_action_name}"
-        )
-        self.get_logger().info(
-            f"  Internal action         : "
-            f"{self.internal_action_name}"
-        )
-        self.get_logger().info(
-            f"  Speech topic            : "
-            f"{self.speech_topic}"
-        )
-        self.get_logger().info(
-            f"  Speech status topic     : "
-            f"{self.speech_status_topic}"
-        )
-        self.get_logger().info(
-            f"  Final decision          : "
-            f"{self.collaborative_decision_topic}"
-        )
-        self.get_logger().info(
-            f"  Navigation state        : "
-            f"{self.navigation_state_topic}"
-        )
-        self.get_logger().info(
-            f"  Navigation goal context : "
-            f"{self.navigation_goal_context_topic}"
-        )
-        self.get_logger().info(
-            f"  Candidate trajectory    : "
-            f"{self.candidate_trajectory_topic}"
-        )
-        self.get_logger().info(
-            f"  FollowPath action       : "
-            f"{self.follow_path_action_name}"
-        )
-        self.get_logger().info(
-            f"  Speech timeout          : "
-            f"{self.speech_timeout_sec:.1f} s"
-        )
-        self.get_logger().info(
-            f"  Navigation cancel       : "
-            f"{self.navigation_cancel_timeout_sec:.1f} s"
-        )
-        self.get_logger().info(
-            f"  Fail open               : "
-            f"{self.fail_open}"
-        )
-
-        self.get_logger().info("-" * 84)
 
     # ====================================================================
     # NAVIGATION GOAL / CANDIDATE TRAJECTORY CONTEXT
     # ====================================================================
     
+    def _mode_c_candidate_valid_locked(self, goal_id, path_id):
+        """Verify exact, fresh, unconstrained planning evidence for one public goal."""
+        handle = self.public_navigation_goals.get(goal_id)
+
+        if (
+            handle is None
+            or not handle.is_active
+            or handle.is_cancel_requested
+            or not path_id
+        ):
+            return False
+
+        with self.trajectory_lock:
+            candidate = self.candidate_trajectories.get(path_id)
+
+        validation = self.social_validation_cache.get(path_id)
+
+        if candidate is None or validation is None:
+            return False
+
+        if (
+            str(candidate.navigation_goal_id or "").strip() != goal_id
+            or str(
+                candidate.generation_reason or ""
+            ).strip().upper() != "REPLAN"
+            or not candidate.path.poses
+            or str(
+                validation.validation or ""
+            ).strip().upper() != "VALID"
+            or not (
+                -0.1 <= self._source_age(validation.header.stamp)
+                < self.validation_max_age_sec
+            )
+            or not (
+                -0.1 <= self._source_age(candidate.header.stamp)
+                < self.validation_max_age_sec
+            )
+        ):
+            return False
+
+        destination = handle.request.pose
+        final_pose = candidate.path.poses[-1]
+
+        frame = str(destination.header.frame_id or "").strip()
+
+        if (
+            not frame
+            or candidate.path.header.frame_id != frame
+            or final_pose.header.frame_id != frame
+        ):
+            return False
+
+        dx = (
+            final_pose.pose.position.x
+            - destination.pose.position.x
+        )
+
+        dy = (
+            final_pose.pose.position.y
+            - destination.pose.position.y
+        )
+
+        return bool(
+            math.isfinite(dx)
+            and math.isfinite(dy)
+            and math.hypot(dx, dy)
+                <= self.goal_success_position_tolerance_m
+        )
+
     def _source_age(self, stamp):
         return (
             self.get_clock().now().nanoseconds / 1e9
@@ -952,223 +980,596 @@ class NavigationGoalGateNode(Node):
 
         return "READY"
 
-    def _decision_expiration_old(self, msg):
+    @staticmethod
+    def _directional_revoke_complete(status):
+        if status is None or status.state != "REVOKED":
+            return False
+
+        if status.reason == "NO_DIRECTIONAL_MASK_WAS_PUBLISHED":
+            return True
+
+        return bool(
+            status.global_costmap_confirmed
+            and status.local_costmap_confirmed
+        )
+    
+    # Initialize directional-mask subscriptions and state.
+    def _initialize_directional_gate(self):
+        """Initialize exact directional-mask evidence and subscriptions."""
+
+        self.declare_parameter(
+            "negotiated_adaptation_enabled",
+            False,
+        )
+        self.negotiated_adaptation_enabled = bool(
+            self.get_parameter(
+                "negotiated_adaptation_enabled"
+            ).value
+        )
+        self.directional_lock = threading.Lock()
+        self.directional_requests = {}
+        self.directional_statuses = {}
+        self.directional_received_at = {}
+        self.directional_active_goals = {}
+        self.directional_pending_installs = {}
+
+        status_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+
+        self.directional_request_subscription = (
+            self.create_subscription(
+                DirectionalConstraintRequest,
+                "/social_navigation/directional_constraint_request",
+                self._directional_request_callback,
+                reliable_qos(depth=20),
+                callback_group=self.callback_group,
+            )
+        )
+
+        self.directional_status_subscription = (
+            self.create_subscription(
+                DirectionalConstraintStatus,
+                "/social_navigation/directional_constraint_status",
+                self._directional_status_callback,
+                status_qos,
+                callback_group=self.callback_group,
+            )
+        )
+
+    @staticmethod
+    def _directional_identity(msg):
+        """Identify one exact directional permission transaction."""
+        return (
+            str(msg.request_id).strip(),
+            str(msg.navigation_goal_id).strip(),
+            str(msg.interaction_id).strip(),
+            str(msg.person_id).strip(),
+            str(msg.tracking_session_id).strip(),
+            int(msg.identity_generation),
+            str(msg.directional_constraint).strip().upper(),
+        )
+
+    def _directional_request_callback(self, msg):
+        """
+        Handle INSTALL, renewal and REVOKE without losing
+        verified costmap evidence.
+
+        A new INSTALL may be deferred until exact revocation.
+        """
+        goal_id = str(
+            msg.navigation_goal_id or ""
+        ).strip()
+
+        action = str(
+            msg.action or ""
+        ).strip().upper()
+
         if (
-            msg.action != "RESUME"
-            or not msg.navigation_authorized
+            not goal_id
+            or not str(msg.request_id).strip()
+            or action not in {"INSTALL", "REVOKE"}
         ):
-            return None
+            return
 
-        path_id = str(msg.path_id or "").strip()
+        with self.directional_lock:
+            previous = self.directional_requests.get(goal_id)
+            old_status = self.directional_statuses.get(goal_id)
 
-        age = self._source_age(
-            msg.header.stamp
+            if action == "REVOKE":
+                if (
+                    previous is None
+                    or self._directional_identity(previous)
+                    != self._directional_identity(msg)
+                ):
+                    return
+
+                self.directional_requests[goal_id] = (
+                    copy.deepcopy(msg)
+                )
+
+                self.directional_received_at[goal_id] = (
+                    time.monotonic()
+                )
+
+                # It is possible to receive the final status
+                # before this REVOKE callback, because ROS
+                # topics have independent delivery ordering.
+                if self._directional_revoke_complete(
+                    old_status
+                ):
+                    pending = (
+                        self.directional_pending_installs.pop(
+                            goal_id, None
+                        )
+                    )
+
+                    if (
+                        pending is not None
+                        and self._directional_identity(pending)
+                            != self._directional_identity(msg)
+                    ):
+                        self.directional_requests[goal_id] = (
+                            pending
+                        )
+                        self.directional_statuses.pop(
+                            goal_id, None
+                        )
+                        self.directional_received_at[goal_id] = (
+                            time.monotonic()
+                        )
+
+                return
+
+            if previous is not None:
+                same = (
+                    self._directional_identity(previous)
+                    == self._directional_identity(msg)
+                )
+
+                previous_action = str(
+                    previous.action
+                ).strip().upper()
+
+                if previous_action == "INSTALL":
+                    if same:
+                        # RENEWAL: keep the verified status.
+                        self.directional_requests[goal_id] = (
+                            copy.deepcopy(msg)
+                        )
+                        self.directional_received_at[goal_id] = (
+                            time.monotonic()
+                        )
+                        return
+
+                    # Replacement requires an exact REVOKE.
+                    self.directional_pending_installs[goal_id] = (
+                        copy.deepcopy(msg)
+                    )
+                    return
+
+                if previous_action == "REVOKE":
+                    if same:
+                        # Never revive a request under revocation
+                        # using a late renewal message.
+                        return
+
+                    if not self._directional_revoke_complete(
+                        old_status
+                    ):
+                        self.directional_pending_installs[goal_id] = (
+                            copy.deepcopy(msg)
+                        )
+                        return
+
+            # First installation, or confirmed replacement.
+            self.directional_pending_installs.pop(goal_id, None)
+
+            self.directional_requests[goal_id] = (
+                copy.deepcopy(msg)
+            )
+
+            self.directional_statuses.pop(goal_id, None)
+
+            self.directional_received_at[goal_id] = (
+                time.monotonic()
+            )
+
+    def _directional_status_callback(self, msg):
+        """Accept only current producer status for the exact request."""
+        goal_id = str(msg.navigation_goal_id).strip()
+
+        if not goal_id:
+            return
+
+        with self.directional_lock:
+            request = self.directional_requests.get(goal_id)
+
+            if request is None:
+                return
+
+            if (
+                self._directional_identity(request)
+                != self._directional_identity(msg)
+            ):
+                return
+
+            previous = self.directional_statuses.get(goal_id)
+
+            new_stamp = (
+                int(msg.header.stamp.sec) * 1_000_000_000
+                + int(msg.header.stamp.nanosec)
+            )
+
+            if previous is not None:
+                old_stamp = (
+                    int(previous.header.stamp.sec) * 1_000_000_000
+                    + int(previous.header.stamp.nanosec)
+                )
+
+                if new_stamp < old_stamp:
+                    return
+
+            self.directional_statuses[goal_id] = copy.deepcopy(msg)
+
+            if (
+                str(request.action).upper() == "REVOKE"
+                and self._directional_revoke_complete(msg)
+            ):
+                pending = self.directional_pending_installs.pop(
+                    goal_id, None
+                )
+
+                if pending is not None:
+                    self.directional_requests[goal_id] = pending
+                    self.directional_statuses.pop(goal_id, None)
+                    self.directional_received_at[goal_id] = (
+                        time.monotonic()
+                    )
+
+    def _retain_failed_directional_attempt(
+        self,
+        goal_id,
+        request_id,
+        status,
+    ):
+        """
+        Handle confirmed internal Nav2 ABORTED.
+
+        D:
+            No automatic D retry.
+            Retain G and negotiate Mode C.
+            Do not consume the Mode-C retry budget.
+
+        C / non-directional:
+            Preserve one same-goal retry.
+            End the public action if that retry fails.
+
+        Navigation Interaction owns terminal speech.
+        """
+        if status != GoalStatus.STATUS_ABORTED:
+            return False
+
+        failure_reason = ""
+        is_directional = False
+
+        with self.navigation_state_lock:
+            handle = self.public_navigation_goals.get(
+                goal_id
+            )
+
+            if (
+                handle is None
+                or not handle.is_active
+                or handle.is_cancel_requested
+                or self.navigation_control_states.get(
+                    goal_id
+                ) != self.CONTROL_RUNNING
+                or self.navigation_control_requests.get(
+                    goal_id
+                ) != request_id
+            ):
+                return False
+
+            with self.internal_goal_lock:
+                has_internal_handle = (
+                    goal_id in self.internal_goal_handles
+                )
+
+            internal_idle = (
+                not has_internal_handle
+                and goal_id not in self.internal_send_pending
+                and goal_id not in self.internal_cancel_pending
+            )
+
+            if not internal_idle:
+                return False
+
+            with self.directional_lock:
+                is_directional = (
+                    str(
+                        self.directional_active_goals.get(
+                            goal_id,
+                            "",
+                        )
+                    ).strip().upper() in {"LEFT", "RIGHT"}
+                )
+
+            if is_directional:
+                failure_reason = (
+                    "NAV2_D_NO_RECOVERY_ABORT"
+                )
+
+            else:
+                used_retries = getattr(
+                    self,
+                    "_nav2_goal_retries_used",
+                    None,
+                )
+
+                if used_retries is None:
+                    self._nav2_goal_retries_used = set()
+                    used_retries = (
+                        self._nav2_goal_retries_used
+                    )
+
+                if goal_id in used_retries:
+                    self.get_logger().error(
+                        "[NAV2 GOAL RECOVERY] "
+                        "Non-directional retry exhausted | "
+                        f"goal={goal_id} | "
+                        "next=PUBLIC_GOAL_ABORTED"
+                    )
+                    return False
+
+                used_retries.add(goal_id)
+
+                failure_reason = (
+                    "NAV2_ABORT_RETRY_AVAILABLE"
+                )
+
+            self._clear_resume_authorization_locked(
+                goal_id
+            )
+
+            self.authorization_actions.pop(
+                goal_id, None
+            )
+
+            self.authorization_sources.pop(
+                goal_id, None
+            )
+
+            self.goals_with_social_hold.add(goal_id)
+
+            self.navigation_control_states[
+                goal_id
+            ] = self.CONTROL_WAITING
+
+            self.public_navigation_phases[
+                goal_id
+            ] = self.PHASE_WAITING
+
+        if is_directional:
+            self.get_logger().warning(
+                "[NAV2 D] No-recovery attempt aborted | "
+                f"goal={goal_id} | "
+                "public_goal_retained=True | "
+                "next=NEGOTIATE_MODE_C | "
+                "mode_c_retry_budget_unchanged=True"
+            )
+
+        else:
+            self.get_logger().warning(
+                "[NAV2 C] First non-directional abort | "
+                f"goal={goal_id} | "
+                "public_goal_retained=True | "
+                "one_fresh_START_retry_available=True"
+            )
+
+        self._publish_gate_command_result(
+            goal_id=goal_id,
+            action="START",
+            request_id=request_id,
+            status="EXECUTION_FAILED",
+            reason=failure_reason,
         )
 
-        if (
-            not path_id
-            or not -0.1 <= age
-            < self.execution_authorization_max_age_sec
-        ):
-            return None
+        self._publish_navigation_state()
+        return True
+    
+    def _directional_ready_for_start(
+        self,
+        goal_id,
+        direction,
+        person_id="",
+    ):
+        """Require exact authorization and real costmap confirmations.
 
-        validation = self.social_validation_cache.get(
-            path_id
+        PUBLISHED alone is insufficient. This method never checks
+        route geometry or path feasibility.
+        """
+        with self.directional_lock:
+            request = self.directional_requests.get(goal_id)
+            status = self.directional_statuses.get(goal_id)
+            received_at = self.directional_received_at.get(goal_id)
+
+            if (
+                request is None
+                or status is None
+                or received_at is None
+            ):
+                return False
+
+            if (
+                self._directional_identity(request)
+                != self._directional_identity(status)
+            ):
+                return False
+
+            if (
+                str(request.action).strip().upper() != "INSTALL"
+                or str(
+                    request.directional_constraint
+                ).strip().upper() != direction
+                or (
+                    person_id
+                    and str(request.person_id).strip() != person_id
+                )
+                or str(status.state).strip().upper() not in (
+                    {"PUBLISHED", "ACTIVE"}
+                    if self.negotiated_adaptation_enabled
+                    else {"PUBLISHED"}
+                )
+                or not str(status.mask_id).strip()
+            ):
+                return False
+
+            lease = (
+                int(request.validity_duration.sec)
+                + int(request.validity_duration.nanosec) / 1e9
+            )
+
+            if (
+                not math.isfinite(lease)
+                or lease <= 0.0
+                or time.monotonic() - received_at >= lease
+            ):
+                return False
+
+            status_age = self._source_age(
+                status.header.stamp
+            )
+
+            if not (-0.1 <= status_age < 1.0):
+                return False
+
+            # These must be populated from real Nav2 evidence.
+            # The mask producer currently keeps both False.
+            return bool(
+                status.global_costmap_confirmed
+                and status.local_costmap_confirmed
+            )
+
+    def _directional_execution_ready(self, goal_id):
+        """Revalidate a directional authorization during execution."""
+        with self.directional_lock:
+            direction = self.directional_active_goals.get(
+                goal_id
+            )
+
+        if direction is None:
+            return True
+
+        return self._directional_ready_for_start(
+            goal_id,
+            direction,
         )
-
-        if (
-            validation is None
-            or str(validation.validation).upper() != "VALID"
-        ):
-            return None
-
-        validation_age = self._source_age(
-            validation.header.stamp
-        )
-
-        if (
-            not -0.1 <= validation_age
-            < self.validation_max_age_sec
-        ):
-            return None
-
-        remaining = min(
-            self.execution_authorization_max_age_sec
-            - max(age, 0.0),
-
-            self.validation_max_age_sec
-            - max(validation_age, 0.0)
-        )
-
-        self.authorization_sources[
-            msg.navigation_goal_id
-        ] = (
-            msg.header.stamp,
-            path_id
-        )
-
-        return time.monotonic() + remaining
 
     def _decision_expiration(self, msg):
-        action = str(msg.action or "").upper()
+        """Validate START and reject C until old D is removed."""
+        action = str(msg.action or "").strip().upper()
         goal_id = str(msg.navigation_goal_id or "").strip()
         path_id = str(msg.path_id or "").strip()
 
         if (
-            action not in {"START", "RESUME"}
-            or not msg.navigation_authorized
+            action != "START"
+            or not bool(msg.navigation_authorized)
             or not goal_id
+            or path_id
         ):
             return None
 
         age = self._source_age(msg.header.stamp)
 
         if not (
-            -0.1 <= age <
-            self.execution_authorization_max_age_sec
+            -0.1 <= age
+            < self.execution_authorization_max_age_sec
         ):
             return None
 
-        if action == "START":
-            if path_id:
+        reason = str(msg.reason or "").strip().upper()
+        direction = str(
+            msg.directional_constraint or ""
+        ).strip().upper()
+        intent = str(
+            msg.human_intent or ""
+        ).strip().upper()
+        outcome = str(
+            msg.outcome or ""
+        ).strip().upper()
+
+        if direction not in {"NONE", "LEFT", "RIGHT"}:
+            return None
+
+        mode_c = reason == "AUTONOMOUS_MODE_C_NAV2_HANDOFF"
+        mode_d = reason == "CONFIRMED_PASSAGE_NAV2_HANDOFF"
+
+        if mode_c:
+            if (
+                outcome != "NAVIGATION_TRANSACTION"
+                or bool(msg.requires_replan)
+                or direction != "NONE"
+                or intent != "UNKNOWN"
+            ):
                 return None
 
-            # START is valid only for first execution,
-            # never after a social hold.
+            with self.directional_lock:
+                previous = self.directional_requests.get(goal_id)
+                status = self.directional_statuses.get(goal_id)
+
+                if previous is not None:
+                    if not (
+                        str(previous.action).upper() == "REVOKE"
+                        and status is not None
+                        and self._directional_identity(previous)
+                            == self._directional_identity(status)
+                        and self._directional_revoke_complete(status)
+                    ):
+                        return None
+
+        elif mode_d:
             if (
-                goal_id in self.goals_with_social_hold
+                outcome != "NAVIGATION_TRANSACTION"
+                or bool(msg.requires_replan)
+                or intent not in {"UNKNOWN", "ALLOW_PASSAGE"}
+            ):
+                return None
+
+            if direction in {"LEFT", "RIGHT"}:
+                if intent != "ALLOW_PASSAGE":
+                    return None
+
+                if not self._directional_ready_for_start(
+                    goal_id,
+                    direction,
+                    str(msg.person_id or "").strip(),
+                ):
+                    return None
+
+        else:
+            if (
+                direction != "NONE"
+                or goal_id in self.goals_with_social_hold
                 or goal_id in self.goals_ever_sent
             ):
                 return None
 
-            self.authorization_sources[goal_id] = (
-                msg.header.stamp,
-                "",
-            )
-
-            return (
-                time.monotonic()
-                + self.execution_authorization_max_age_sec
-                - max(age, 0.0)
-            )
-
-        # RESUME requires exact validated trajectory.
-        if not path_id:
-            return None
-
-        validation = self.social_validation_cache.get(
-            path_id
-        )
-
-        if (
-            validation is None
-            or str(validation.validation).upper() != "VALID"
-        ):
-            return None
-
-        validation_age = self._source_age(
-            validation.header.stamp
-        )
-
-        if not (
-            -0.1 <= validation_age <
-            self.validation_max_age_sec
-        ):
-            return None
-
-        remaining = min(
+        remaining = (
             self.execution_authorization_max_age_sec
-            - max(age, 0.0),
-            self.validation_max_age_sec
-            - max(validation_age, 0.0),
+            - max(age, 0.0)
         )
 
         if remaining <= 0.0:
             return None
 
-        self.authorization_sources[goal_id] = (
-            msg.header.stamp,
-            path_id,
-        )
-
         return time.monotonic() + remaining
-
-    def _clear_resume_authorization_locked(self, goal_id):
-        """
-        Revoke all unconsumed resume authorizations.
-
-        Caller must hold navigation_state_lock.
-        """
-
-        self.resume_waiting_for_candidate.pop(goal_id, None)
-
-        # Legacy authorization deadlines are no longer used.
-        self.execution_authorization_deadlines.pop(
-            goal_id, None
-        )
-
-        if hasattr(self, "resume_authorization_deadlines"):
-            self.resume_authorization_deadlines.pop(
-                goal_id, None
-            )
-
-        with self.trajectory_lock:
-            self.pending_resume_path_ids.pop(goal_id, None)
-            self.authorized_resume_path_ids.pop(goal_id, None)
-            
-    def _resume_authorization_fresh_locked_old(self, goal_id):
-        handle = self.public_navigation_goals.get(
-            goal_id
-        )
-
-        if (
-            handle is None
-            or not handle.is_active
-            or handle.is_cancel_requested
-            or self.navigation_control_states.get(goal_id)
-            == self.CONTROL_STOPPING
-        ):
-            return False
-
-        deadline = (
-            self.execution_authorization_deadlines.get(
-                goal_id
-            )
-        )
-
-        source = self.authorization_sources.get(
-            goal_id
-        )
-
-        if (
-            deadline is None
-            or source is None
-            or not math.isfinite(deadline)
-            or time.monotonic() >= deadline
-        ):
-            return False
-
-        stamp, path_id = source
-
-        if not (
-            -0.1 <= self._source_age(stamp)
-            < self.execution_authorization_max_age_sec
-        ):
-            return False
-
-        validation = self.social_validation_cache.get(
-            path_id
-        )
-
-        return (
-            validation is not None
-            and str(validation.validation).upper() == "VALID"
-            and -0.1
-            <= self._source_age(validation.header.stamp)
-            < self.validation_max_age_sec
-        )
-
+    
     def _resume_authorization_fresh_locked(self, goal_id):
+        """Validate an unconsumed, pathless START authorization."""
         handle = self.public_navigation_goals.get(goal_id)
 
         if (
@@ -1196,6 +1597,733 @@ class NavigationGoalGateNode(Node):
 
         stamp, path_id = source
 
+        if (
+            path_id
+            or self.authorization_actions.get(goal_id) != "START"
+            or not self.navigation_control_requests.get(goal_id)
+        ):
+            return False
+
+        if not (
+            -0.1 <= self._source_age(stamp)
+            < self.execution_authorization_max_age_sec
+        ):
+            return False
+
+        if goal_id in self.goals_with_social_hold:
+            return bool(
+                self.confirmed_hold_requests.get(goal_id)
+            )
+
+        return goal_id not in self.goals_ever_sent
+
+    def _collaborative_decision_callback(self, msg):
+        """Apply exact START/WAIT/REPLAN/STOP transactions."""
+        goal_id = str(msg.navigation_goal_id or "").strip()
+        request_id = str(msg.request_id or "").strip()
+        action = str(msg.action or "").strip().upper()
+        path_id = str(msg.path_id or "").strip()
+        reason_code = str(msg.reason or "").strip().upper()
+
+        if not goal_id or not request_id:
+            return
+
+        if action not in {"START", "WAIT", "REPLAN", "STOP"}:
+            self._publish_gate_command_result(
+                goal_id=goal_id,
+                action=action,
+                request_id=request_id,
+                status="REJECTED",
+                reason=(
+                    "FOLLOW_PATH_DISABLED_FOR_AUTONOMOUS_NAV2"
+                    if action == "RESUME"
+                    else "UNSUPPORTED_ACTION"
+                ),
+                path_id=path_id,
+            )
+            return
+
+        stamp = msg.header.stamp
+        stamp_ns = (
+            int(stamp.sec) * 1_000_000_000
+            + int(stamp.nanosec)
+        )
+
+        valid_stamp = (
+            int(stamp.sec) >= 0
+            and 0 <= int(stamp.nanosec) < 1_000_000_000
+            and stamp_ns > 0
+        )
+
+        result = "REJECTED"
+        result_reason = ""
+        publish_state = False
+
+        with self.navigation_state_lock:
+            handle = self.public_navigation_goals.get(goal_id)
+
+            if handle is None or not handle.is_active:
+                result_reason = "PUBLIC_GOAL_NOT_ACTIVE"
+
+            elif handle.is_cancel_requested and action != "STOP":
+                result_reason = "PUBLIC_GOAL_CANCEL_REQUESTED"
+
+            elif (
+                self.navigation_control_requests.get(goal_id)
+                == request_id
+            ):
+                result = "DUPLICATE"
+                result_reason = "REQUEST_ALREADY_PROCESSED"
+
+            elif not valid_stamp:
+                result_reason = "INVALID_CONTROL_TIMESTAMP"
+
+            elif (
+                action != "STOP"
+                and stamp_ns <= self.last_control_stamp_ns.get(
+                    goal_id, 0
+                )
+            ):
+                result_reason = "OUT_OF_ORDER_CONTROL_COMMAND"
+
+            elif path_id:
+                result_reason = "UNEXPECTED_PATH_ID"
+
+            else:
+                current_state = self.navigation_control_states.get(
+                    goal_id,
+                    self.CONTROL_WAITING,
+                )
+
+                if (
+                    current_state == self.CONTROL_STOPPING
+                    and action != "STOP"
+                ):
+                    result_reason = "PUBLIC_GOAL_STOPPING"
+
+                elif action in {"WAIT", "REPLAN", "STOP"}:
+                    self._clear_resume_authorization_locked(goal_id)
+                    self.authorization_actions.pop(goal_id, None)
+                    self.authorization_sources.pop(goal_id, None)
+
+                    self.goals_with_social_hold.add(goal_id)
+                    self.navigation_control_requests[goal_id] = (
+                        request_id
+                    )
+
+                    if action == "WAIT":
+                        self.navigation_control_states[goal_id] = (
+                            self.CONTROL_WAITING
+                        )
+
+                        with self.internal_goal_lock:
+                            has_handle = (
+                                goal_id in self.internal_goal_handles
+                            )
+
+                        internal_busy = (
+                            has_handle
+                            or goal_id in self.internal_send_pending
+                            or goal_id in self.internal_cancel_pending
+                        )
+
+                        self.public_navigation_phases[goal_id] = (
+                            self.PHASE_SOCIAL_HOLD
+                            if internal_busy
+                            else self.PHASE_WAITING
+                        )
+
+                        self.pending_hold_requests[goal_id] = (
+                            "WAIT",
+                            request_id,
+                        )
+
+                    elif action == "REPLAN":
+                        # REPLAN does not authorize FollowPath.
+                        self.navigation_control_states[goal_id] = (
+                            self.CONTROL_SOCIAL_HOLD
+                        )
+
+                        self.public_navigation_phases[goal_id] = (
+                            self.PHASE_SOCIAL_HOLD
+                        )
+
+                        self.pending_hold_requests[goal_id] = (
+                            "REPLAN",
+                            request_id,
+                        )
+
+                    else:
+                        self.navigation_control_states[goal_id] = (
+                            self.CONTROL_STOPPING
+                        )
+
+                        self.public_navigation_phases[goal_id] = (
+                            self.PHASE_STOPPING
+                        )
+
+                        self.pending_hold_requests.pop(
+                            goal_id, None
+                        )
+
+                    result = "ACCEPTED"
+                    result_reason = "CONTROL_APPLIED"
+                    publish_state = True
+
+                elif action == "START":
+                    expiration = self._decision_expiration(msg)
+
+                    with self.internal_goal_lock:
+                        has_handle = (
+                            goal_id in self.internal_goal_handles
+                        )
+
+                    with self.trajectory_lock:
+                        has_legacy_path = (
+                            goal_id in self.authorized_resume_path_ids
+                            or goal_id in self.pending_resume_path_ids
+                        )
+
+                    internal_idle = (
+                        not has_handle
+                        and not has_legacy_path
+                        and goal_id not in self.internal_send_pending
+                        and goal_id not in self.internal_cancel_pending
+                    )
+
+                    phase = self.public_navigation_phases.get(
+                        goal_id
+                    )
+
+                    direct = reason_code in {
+                        "CONFIRMED_PASSAGE_NAV2_HANDOFF",
+                        "AUTONOMOUS_MODE_C_NAV2_HANDOFF",
+                    }
+
+                    pending = self.pending_hold_requests.get(
+                        goal_id
+                    )
+
+                    hold_id = self.confirmed_hold_requests.get(
+                        goal_id
+                    )
+
+                    confirmed_wait = bool(
+                        pending is not None
+                        and pending[0] == "WAIT"
+                        and pending[1] == hold_id
+                        and hold_id
+                    )
+
+                    initial_start = (
+                        not direct
+                        and current_state == self.CONTROL_WAITING
+                        and goal_id not in self.goals_with_social_hold
+                        and goal_id not in self.goals_ever_sent
+                        and phase in {
+                            self.PHASE_WAITING_FOR_SPEECH,
+                            self.PHASE_WAITING,
+                        }
+                    )
+
+                    direct_start = (
+                        direct
+                        and current_state == self.CONTROL_WAITING
+                        and confirmed_wait
+                        and phase == self.PHASE_WAITING
+                    )
+
+                    allowed = (
+                        expiration is not None
+                        and internal_idle
+                        and (initial_start or direct_start)
+                    )
+
+                    if not allowed:
+                        result_reason = "START_PRECONDITIONS_NOT_MET"
+
+                    else:
+                        self.execution_authorization_deadlines[
+                            goal_id
+                        ] = expiration
+
+                        self.authorization_sources[goal_id] = (
+                            msg.header.stamp,
+                            "",
+                        )
+
+                        self.authorization_actions[goal_id] = "START"
+
+                        direction = str(
+                            msg.directional_constraint or "NONE"
+                        ).strip().upper()
+
+                        with self.directional_lock:
+                            if direction in {"LEFT", "RIGHT"}:
+                                self.directional_active_goals[
+                                    goal_id
+                                ] = direction
+                            else:
+                                self.directional_active_goals.pop(
+                                    goal_id, None
+                                )
+
+                        self.navigation_control_states[goal_id] = (
+                            self.CONTROL_RUNNING
+                        )
+
+                        self.navigation_control_requests[goal_id] = (
+                            request_id
+                        )
+
+                        self.pending_hold_requests.pop(
+                            goal_id, None
+                        )
+
+                        result = "ACCEPTED"
+                        result_reason = "START_AUTHORIZED"
+                        publish_state = True
+
+                if result != "REJECTED":
+                    self.last_control_stamp_ns[goal_id] = max(
+                        stamp_ns,
+                        self.last_control_stamp_ns.get(goal_id, 0),
+                    )
+
+        self._publish_gate_command_result(
+            goal_id=goal_id,
+            action=action,
+            request_id=request_id,
+            status=result,
+            reason=result_reason,
+            path_id=path_id,
+        )
+
+        if publish_state:
+            self._publish_navigation_state()
+
+    def _send_internal_goal_if_running(
+        self,
+        public_goal_handle,
+        public_goal_id,
+        client,
+        goal,
+        internal_uuid,
+        resume_path_id="",
+        feedback_callback=None,
+    ):
+        """
+        Submit an exact START under Gate ownership.
+
+        Mode D:
+            Select the configured no-motor-recovery BT.
+            Never silently fall back to the default Nav2 BT.
+
+        Mode C:
+            Preserve the original NavigateToPose BT.
+
+        Missing D BT configuration:
+            Keep public G in WAIT and report failure.
+        """
+        if (
+            resume_path_id
+            or client is not self.internal_action_client
+        ):
+            return None
+
+        configuration_error = ""
+        command_id = ""
+        mode_d = False
+        bt_xml = ""
+
+        with self.navigation_state_lock:
+            if (
+                not public_goal_handle.is_active
+                or public_goal_handle.is_cancel_requested
+                or self.navigation_control_states.get(
+                    public_goal_id
+                ) != self.CONTROL_RUNNING
+            ):
+                return None
+
+            if not self._resume_authorization_fresh_locked(
+                public_goal_id
+            ):
+                self._expire_resume_authorization_locked(
+                    public_goal_id
+                )
+                return None
+
+            if self.authorization_actions.get(
+                public_goal_id
+            ) != "START":
+                return None
+
+            if not self._directional_execution_ready(
+                public_goal_id
+            ):
+                self._expire_resume_authorization_locked(
+                    public_goal_id
+                )
+                return None
+
+            command_id = self.navigation_control_requests.get(
+                public_goal_id,
+                "",
+            )
+
+            if not command_id:
+                return None
+
+            if (
+                public_goal_id in self.internal_send_pending
+                or public_goal_id in self.internal_cancel_pending
+            ):
+                return None
+
+            with self.internal_goal_lock:
+                if public_goal_id in self.internal_goal_handles:
+                    return None
+
+            with self.trajectory_lock:
+                if (
+                    self.authorized_resume_path_ids.get(
+                        public_goal_id, ""
+                    )
+                    or self.pending_resume_path_ids.get(
+                        public_goal_id, ""
+                    )
+                ):
+                    return None
+
+            with self.directional_lock:
+                mode_d = (
+                    str(
+                        self.directional_active_goals.get(
+                            public_goal_id,
+                            "",
+                        )
+                    ).strip().upper() in {"LEFT", "RIGHT"}
+                )
+
+            if mode_d:
+                bt_xml = str(
+                    self.get_parameter(
+                        "mode_d_behavior_tree_xml"
+                    ).value or ""
+                ).strip()
+
+                if (
+                    not bt_xml
+                    or not bt_xml.startswith("/")
+                ):
+                    configuration_error = (
+                        "D_BT_XML_NOT_CONFIGURED"
+                    )
+
+                elif not hasattr(goal, "behavior_tree"):
+                    configuration_error = (
+                        "D_BT_FIELD_UNAVAILABLE"
+                    )
+
+            if configuration_error:
+                # No internal Nav2 action was submitted.
+                self._clear_resume_authorization_locked(
+                    public_goal_id
+                )
+
+                self.authorization_actions.pop(
+                    public_goal_id, None
+                )
+
+                self.authorization_sources.pop(
+                    public_goal_id, None
+                )
+
+                self.goals_with_social_hold.add(
+                    public_goal_id
+                )
+
+                self.navigation_control_states[
+                    public_goal_id
+                ] = self.CONTROL_WAITING
+
+                self.public_navigation_phases[
+                    public_goal_id
+                ] = self.PHASE_WAITING
+
+            else:
+                if mode_d:
+                    # goal is a copy of the public request.
+                    goal.behavior_tree = bt_xml
+
+                self.goals_ever_sent.add(public_goal_id)
+                self.internal_send_pending.add(public_goal_id)
+
+                self.internal_send_command_ids[
+                    public_goal_id
+                ] = command_id
+
+                self.public_navigation_phases[
+                    public_goal_id
+                ] = self.PHASE_FORWARDING
+
+                kwargs = {"goal_uuid": internal_uuid}
+
+                if feedback_callback is not None:
+                    kwargs["feedback_callback"] = (
+                        feedback_callback
+                    )
+
+                if mode_d:
+                    self.get_logger().info(
+                        "[GOAL GATE] Sending no-recovery D | "
+                        f"goal={public_goal_id} | "
+                        f"bt={bt_xml} | "
+                        "recoveries=NONE"
+                    )
+
+                return client.send_goal_async(
+                    goal,
+                    **kwargs,
+                )
+
+        self.get_logger().error(
+            "[GOAL GATE] Mode D tree unavailable | "
+            f"goal={public_goal_id} | "
+            f"reason={configuration_error} | "
+            "internal_goal_sent=False | "
+            "public_G_retained=True"
+        )
+
+        self._publish_gate_command_result(
+            goal_id=public_goal_id,
+            action="START",
+            request_id=command_id,
+            status="EXECUTION_FAILED",
+            reason=configuration_error,
+        )
+
+        self._publish_navigation_state()
+        return None
+    
+    def _watch_authorization_deadlines(self):
+        """Expire unconsumed START and supervise active mask evidence."""
+        now = time.monotonic()
+        expired_goals = []
+        direction_lost = []
+
+        with self.navigation_state_lock:
+            for goal_id, deadline in list(
+                self.execution_authorization_deadlines.items()
+            ):
+                if goal_id in self.internal_send_pending:
+                    continue
+
+                if (
+                    not math.isfinite(deadline)
+                    or now >= deadline
+                ):
+                    expired_goals.append(goal_id)
+
+            for goal_id in expired_goals:
+                self._expire_resume_authorization_locked(
+                    goal_id
+                )
+
+            for goal_id, control in list(
+                self.navigation_control_states.items()
+            ):
+                if control != self.CONTROL_RUNNING:
+                    continue
+
+                with self.directional_lock:
+                    directional = (
+                        goal_id in self.directional_active_goals
+                    )
+
+                if not directional:
+                    continue
+
+                if not self._directional_execution_ready(
+                    goal_id
+                ):
+                    self.navigation_control_states[goal_id] = (
+                        self.CONTROL_SOCIAL_HOLD
+                    )
+
+                    self.public_navigation_phases[goal_id] = (
+                        self.PHASE_SOCIAL_HOLD
+                    )
+
+                    self.goals_with_social_hold.add(goal_id)
+                    direction_lost.append(goal_id)
+
+        if expired_goals or direction_lost:
+            self._publish_navigation_state()
+
+        for goal_id in direction_lost:
+            self.get_logger().error(
+                "[DIRECTIONAL GATE] Constraint evidence lost | "
+                f"goal={goal_id} | "
+                "internal Nav2 cancellation required"
+            )
+
+    def _decision_expiration_old(self, msg):
+        """Reject directional execution until Nav2 enforces the authorized side."""
+        action = str(msg.action or "").strip().upper()
+        goal_id = str(msg.navigation_goal_id or "").strip()
+        path_id = str(msg.path_id or "").strip()
+
+        if (
+            action not in {"START", "RESUME"}
+            or not bool(msg.navigation_authorized)
+            or not goal_id
+        ):
+            return None
+
+        age = self._source_age(msg.header.stamp)
+
+        if not (
+            -0.1 <= age < self.execution_authorization_max_age_sec
+        ):
+            return None
+
+        if action == "START":
+            if path_id:
+                return None
+
+            reason = str(msg.reason or "").strip().upper()
+            direction = str(
+                msg.directional_constraint or ""
+            ).strip().upper()
+            intent = str(
+                msg.human_intent or ""
+            ).strip().upper()
+            outcome = str(
+                msg.outcome or ""
+            ).strip().upper()
+
+            if reason == "CONFIRMED_PASSAGE_NAV2_HANDOFF":
+                if (
+                    outcome != "NAVIGATION_TRANSACTION"
+                    or bool(msg.requires_replan)
+                    or direction not in {"NONE", "LEFT", "RIGHT"}
+                ):
+                    return None
+
+                if direction in {"LEFT", "RIGHT"}:
+                    # An HRI direction is not a Nav2 spatial constraint.
+                    # Foxy must have a verified enforcement mechanism
+                    # before directional execution can be enabled.
+                    self.get_logger().error(
+                        "[DIRECTIONAL GATE] START rejected | "
+                        f"goal={goal_id} | "
+                        f"direction={direction} | "
+                        "reason=NAV2_DIRECTION_ENFORCEMENT_NOT_INSTALLED"
+                    )
+                    return None
+
+                if intent not in {"UNKNOWN", "ALLOW_PASSAGE"}:
+                    return None
+
+            else:
+                # Ordinary START is valid only before the first
+                # internal execution and before any social hold.
+                if (
+                    direction != "NONE"
+                    or goal_id in self.goals_with_social_hold
+                    or goal_id in self.goals_ever_sent
+                ):
+                    return None
+
+            remaining = (
+                self.execution_authorization_max_age_sec
+                - max(age, 0.0)
+            )
+
+            return (
+                time.monotonic() + remaining
+                if remaining > 0.0
+                else None
+            )
+
+        # Disable the legacy FollowPath execution path.
+        # It bypasses autonomous NavigateToPose replanning.
+        self.get_logger().warning(
+            "[GOAL GATE] Legacy RESUME rejected | "
+            f"goal={goal_id} | "
+            "reason=FOLLOW_PATH_DISABLED_FOR_AUTONOMOUS_NAV2"
+        )
+
+        return None
+
+    def _clear_resume_authorization_locked(self, goal_id):
+        """Revoke all unconsumed path and Mode C restart authorizations."""
+        self.resume_waiting_for_candidate.pop(goal_id, None)
+
+        restart = getattr(
+            self,
+            "_mode_c_nav2_restart",
+            None,
+        )
+
+        if restart is not None and restart[0] == goal_id:
+            self._mode_c_nav2_restart = None
+
+        self.execution_authorization_deadlines.pop(
+            goal_id,
+            None,
+        )
+
+        if hasattr(self, "resume_authorization_deadlines"):
+            self.resume_authorization_deadlines.pop(
+                goal_id,
+                None,
+            )
+
+        with self.trajectory_lock:
+            self.pending_resume_path_ids.pop(
+                goal_id,
+                None,
+            )
+
+            self.authorized_resume_path_ids.pop(
+                goal_id,
+                None,
+            )
+
+    def _resume_authorization_fresh_locked_old(self, goal_id):
+        """Check that the accepted execution transaction is still fresh."""
+        handle = self.public_navigation_goals.get(goal_id)
+
+        if (
+            handle is None
+            or not handle.is_active
+            or handle.is_cancel_requested
+            or self.navigation_control_states.get(goal_id)
+                == self.CONTROL_STOPPING
+        ):
+            return False
+
+        deadline = self.execution_authorization_deadlines.get(
+            goal_id
+        )
+
+        source = self.authorization_sources.get(
+            goal_id
+        )
+
+        if (
+            deadline is None
+            or source is None
+            or not math.isfinite(deadline)
+            or time.monotonic() >= deadline
+        ):
+            return False
+
+        stamp, path_id = source
+
         if not (
             -0.1 <= self._source_age(stamp)
             < self.execution_authorization_max_age_sec
@@ -1205,22 +2333,31 @@ class NavigationGoalGateNode(Node):
         action = self.authorization_actions.get(goal_id)
 
         if action == "START":
-            return (
-                not path_id
-                and goal_id not in self.goals_with_social_hold
-                and goal_id not in self.goals_ever_sent
-            )
+            if path_id:
+                return False
+
+            if not self.navigation_control_requests.get(goal_id):
+                return False
+
+            if goal_id in self.goals_with_social_hold:
+                # The callback checked the exact latest WAIT
+                # acknowledgement before accepting this START.
+                return bool(
+                    self.confirmed_hold_requests.get(goal_id)
+                )
+
+            return goal_id not in self.goals_ever_sent
 
         if action != "RESUME" or not path_id:
             return False
 
-        validation = self.social_validation_cache.get(
-            path_id
-        )
+        validation = self.social_validation_cache.get(path_id)
 
-        return (
+        return bool(
             validation is not None
-            and str(validation.validation).upper() == "VALID"
+            and str(
+                validation.validation or ""
+            ).strip().upper() == "VALID"
             and -0.1 <= self._source_age(
                 validation.header.stamp
             ) < self.validation_max_age_sec
@@ -1376,7 +2513,7 @@ class NavigationGoalGateNode(Node):
     # NAVIGATION CONTROL
     # ====================================================================
     
-    def _watch_authorization_deadlines(self):
+    def _watch_authorization_deadlines_old(self):
         now = time.monotonic()
         expired_goals = []
 
@@ -1453,11 +2590,13 @@ class NavigationGoalGateNode(Node):
             f"reason={payload['reason']}"
         )
 
-    def _collaborative_decision_callback(self, msg):
+    def _collaborative_decision_callback_old(self, msg):
+        """Process collaborative commands with exact goal and recovery ownership."""
         goal_id = str(msg.navigation_goal_id or "").strip()
         request_id = str(msg.request_id or "").strip()
         action = str(msg.action or "").strip().upper()
         path_id = str(msg.path_id or "").strip()
+        command_reason = str(msg.reason or "").strip().upper()
 
         if not goal_id or not request_id:
             return
@@ -1481,7 +2620,7 @@ class NavigationGoalGateNode(Node):
             + int(stamp.nanosec)
         )
 
-        valid_stamp = (
+        valid_stamp = bool(
             int(stamp.sec) >= 0
             and 0 <= int(stamp.nanosec) < 1_000_000_000
             and stamp_ns > 0
@@ -1497,6 +2636,9 @@ class NavigationGoalGateNode(Node):
             if handle is None or not handle.is_active:
                 reason = "PUBLIC_GOAL_NOT_ACTIVE"
 
+            elif handle.is_cancel_requested and action != "STOP":
+                reason = "PUBLIC_GOAL_CANCEL_REQUESTED"
+
             elif (
                 self.navigation_control_requests.get(goal_id)
                 == request_id
@@ -1510,12 +2652,21 @@ class NavigationGoalGateNode(Node):
             elif (
                 action != "STOP"
                 and stamp_ns <= self.last_control_stamp_ns.get(
-                    goal_id, 0
+                    goal_id,
+                    0,
                 )
             ):
                 reason = "OUT_OF_ORDER_CONTROL_COMMAND"
 
-            elif action != "RESUME" and path_id:
+            elif (
+                action != "RESUME"
+                and path_id
+                and not (
+                    action == "START"
+                    and command_reason
+                        == "MODE_C_VALIDATED_NAV2_RESTART"
+                )
+            ):
                 reason = "UNEXPECTED_PATH_ID"
 
             else:
@@ -1533,12 +2684,10 @@ class NavigationGoalGateNode(Node):
                 elif action in {"WAIT", "REPLAN", "STOP"}:
                     self._clear_resume_authorization_locked(goal_id)
                     self.authorization_actions.pop(goal_id, None)
+                    self.authorization_sources.pop(goal_id, None)
 
-                    if (
-                        action in {"REPLAN", "STOP"}
-                        or goal_id in self.goals_ever_sent
-                    ):
-                        self.goals_with_social_hold.add(goal_id)
+                    # Every explicit hold prevents ordinary START reuse.
+                    self.goals_with_social_hold.add(goal_id)
 
                     self.navigation_control_requests[goal_id] = (
                         request_id
@@ -1554,7 +2703,7 @@ class NavigationGoalGateNode(Node):
                                 goal_id in self.internal_goal_handles
                             )
 
-                        internal_busy = (
+                        internal_busy = bool(
                             has_handle
                             or goal_id in self.internal_send_pending
                             or goal_id in self.internal_cancel_pending
@@ -1594,9 +2743,7 @@ class NavigationGoalGateNode(Node):
                             self.PHASE_STOPPING
                         )
 
-                        self.pending_hold_requests.pop(
-                            goal_id, None
-                        )
+                        self.pending_hold_requests.pop(goal_id, None)
 
                     result = "ACCEPTED"
                     reason = "CONTROL_APPLIED"
@@ -1611,18 +2758,61 @@ class NavigationGoalGateNode(Node):
                         )
 
                     with self.trajectory_lock:
-                        has_resume = (
+                        has_resume = bool(
                             goal_id in self.authorized_resume_path_ids
                             or goal_id in self.pending_resume_path_ids
                         )
 
-                    phase = self.public_navigation_phases.get(
+                    phase = self.public_navigation_phases.get(goal_id)
+
+                    mode_c_restart = (
+                        command_reason
+                        == "MODE_C_VALIDATED_NAV2_RESTART"
+                    )
+
+                    direct_handoff = (
+                        command_reason
+                        == "CONFIRMED_PASSAGE_NAV2_HANDOFF"
+                    )
+
+                    pending_hold = self.pending_hold_requests.get(
                         goal_id
                     )
 
-                    allowed = (
-                        bool(msg.navigation_authorized)
+                    confirmed_hold_id = self.confirmed_hold_requests.get(
+                        goal_id
+                    )
+
+                    confirmed_wait = bool(
+                        pending_hold is not None
+                        and pending_hold[0] == "WAIT"
+                        and pending_hold[1] == confirmed_hold_id
+                        and confirmed_hold_id
+                    )
+
+                    confirmed_replan = bool(
+                        pending_hold is not None
+                        and pending_hold[0] == "REPLAN"
+                        and pending_hold[1] == confirmed_hold_id
+                        and confirmed_hold_id
+                    )
+
+                    internal_idle = bool(
+                        not has_internal_handle
+                        and not has_resume
+                        and goal_id not in self.internal_send_pending
+                        and goal_id not in self.internal_cancel_pending
+                    )
+
+                    common_ready = bool(
+                        msg.navigation_authorized
                         and expiration is not None
+                        and internal_idle
+                    )
+
+                    initial_start = bool(
+                        not mode_c_restart
+                        and not direct_handoff
                         and not path_id
                         and current_state == self.CONTROL_WAITING
                         and goal_id not in self.goals_with_social_hold
@@ -1631,10 +2821,43 @@ class NavigationGoalGateNode(Node):
                             self.PHASE_WAITING_FOR_SPEECH,
                             self.PHASE_WAITING,
                         }
-                        and not has_internal_handle
-                        and not has_resume
-                        and goal_id not in self.internal_send_pending
-                        and goal_id not in self.internal_cancel_pending
+                    )
+
+                    reauthorized_start = bool(
+                        not mode_c_restart
+                        and direct_handoff
+                        and not path_id
+                        and current_state == self.CONTROL_WAITING
+                        and confirmed_wait
+                        and phase == self.PHASE_WAITING
+                    )
+
+                    validated_mode_c_restart = bool(
+                        mode_c_restart
+                        and path_id
+                        and confirmed_replan
+                        and current_state in {
+                            self.CONTROL_SOCIAL_HOLD,
+                            self.CONTROL_REPLANNING,
+                        }
+                        and phase in {
+                            self.PHASE_SOCIAL_HOLD,
+                            self.PHASE_REPLANNING,
+                        }
+                        and goal_id in self.goals_with_social_hold
+                        and self._mode_c_candidate_valid_locked(
+                            goal_id,
+                            path_id,
+                        )
+                    )
+
+                    allowed = bool(
+                        common_ready
+                        and (
+                            initial_start
+                            or reauthorized_start
+                            or validated_mode_c_restart
+                        )
                     )
 
                     if not allowed:
@@ -1645,9 +2868,32 @@ class NavigationGoalGateNode(Node):
                             goal_id
                         ] = expiration
 
-                        self.authorization_actions[goal_id] = (
-                            "START"
+                        self.authorization_sources[goal_id] = (
+                            msg.header.stamp,
+                            path_id if mode_c_restart else "",
                         )
+
+                        self.authorization_actions[goal_id] = "START"
+
+                        if mode_c_restart:
+                            self._mode_c_nav2_restart = (
+                                goal_id,
+                                request_id,
+                                path_id,
+                            )
+
+                        else:
+                            restart = getattr(
+                                self,
+                                "_mode_c_nav2_restart",
+                                None,
+                            )
+
+                            if (
+                                restart is not None
+                                and restart[0] == goal_id
+                            ):
+                                self._mode_c_nav2_restart = None
 
                         self.navigation_control_states[goal_id] = (
                             self.CONTROL_RUNNING
@@ -1657,9 +2903,7 @@ class NavigationGoalGateNode(Node):
                             request_id
                         )
 
-                        self.pending_hold_requests.pop(
-                            goal_id, None
-                        )
+                        self.pending_hold_requests.pop(goal_id, None)
 
                         result = "ACCEPTED"
                         reason = "START_AUTHORIZED"
@@ -1682,9 +2926,12 @@ class NavigationGoalGateNode(Node):
                             goal_id
                         ] = expiration
 
-                        self.authorization_actions[goal_id] = (
-                            "RESUME"
+                        self.authorization_sources[goal_id] = (
+                            msg.header.stamp,
+                            path_id,
                         )
+
+                        self.authorization_actions[goal_id] = "RESUME"
 
                         promotion = self._promote_resume_locked(
                             goal_id,
@@ -1727,31 +2974,35 @@ class NavigationGoalGateNode(Node):
                                 goal_id
                             )
 
+                            self.authorization_actions.pop(
+                                goal_id,
+                                None,
+                            )
+
+                            self.authorization_sources.pop(
+                                goal_id,
+                                None,
+                            )
+
                             if (
-                                self.navigation_control_states.get(
-                                    goal_id
-                                ) != self.CONTROL_STOPPING
+                                self.navigation_control_states.get(goal_id)
+                                != self.CONTROL_STOPPING
                             ):
-                                self.navigation_control_states[
-                                    goal_id
-                                ] = self.CONTROL_WAITING
+                                self.navigation_control_states[goal_id] = (
+                                    self.CONTROL_WAITING
+                                )
 
                             reason = "CANDIDATE_PROMOTION_REJECTED"
 
                         if result != "REJECTED":
-                            self.navigation_control_requests[
-                                goal_id
-                            ] = request_id
-
-                            self.pending_hold_requests.pop(
-                                goal_id, None
+                            self.navigation_control_requests[goal_id] = (
+                                request_id
                             )
 
+                            self.pending_hold_requests.pop(goal_id, None)
                             self.goals_with_social_hold.add(goal_id)
-
                             publish_state = True
 
-                # Record only commands actually accepted.
                 if result != "REJECTED":
                     self.last_control_stamp_ns[goal_id] = max(
                         stamp_ns,
@@ -1769,7 +3020,7 @@ class NavigationGoalGateNode(Node):
 
         if publish_state:
             self._publish_navigation_state()
-
+                
     def _get_navigation_control_state(
         self,
         goal_id: str,
@@ -2529,10 +3780,7 @@ class NavigationGoalGateNode(Node):
 
         with self.navigation_state_lock:
 
-            server_ready = (
-                self.internal_action_client.server_is_ready()
-                or self.follow_path_action_client.server_is_ready()
-            )
+            server_ready = self.internal_action_client.server_is_ready()
 
             if (
                 self.internal_server_was_ready
@@ -2779,7 +4027,7 @@ class NavigationGoalGateNode(Node):
 
         return "ROS_SHUTDOWN"
 
-    def _send_internal_goal_if_running(
+    def _send_internal_goal_if_running_old(
         self,
         public_goal_handle,
         public_goal_id,
@@ -3902,6 +5150,12 @@ class NavigationGoalGateNode(Node):
             # ====================================================
             # 10. PROPAGATE THE ACTUAL NAV2 TERMINAL RESULT
             # ====================================================
+            if self._retain_failed_directional_attempt(
+                public_goal_id,
+                sending_command_id,
+                status,
+            ):
+                continue
 
             return finish(
                 status,
@@ -3924,30 +5178,21 @@ class NavigationGoalGateNode(Node):
         public_goal_id: str,
     ):
         """
-        Corroborate a Nav2 SUCCEEDED result against the robot's current pose.
+        Corroborate a genuine internal Nav2 SUCCEEDED result.
 
-        This verification deliberately checks position only.
+        Nav2 remains responsible for its goal checker,
+        including orientation.
 
-        Nav2 remains responsible for its normal goal checker, including yaw.
-        The Gate adds an independent protection against the pathological case
-        already observed where Nav2 reports SUCCEEDED while the robot remains
-        physically far from the requested destination.
+        The Gate independently checks the final XY position
+        with a small verification margin to accommodate
+        measurement differences.
 
         Returns:
-            (True, distance)
-                Current base_footprint position is inside the configured
-                goal tolerance.
-
-            (False, distance)
-                TF is available but the robot is too far from the destination.
-
-            (None, None)
-                The current pose cannot be established reliably.
+            (True, distance): arrival corroborated
+            (False, distance): position outside tolerance
+            (None, None): position cannot be verified
         """
-
-        goal_pose = (
-            public_goal_handle.request.pose
-        )
+        goal_pose = public_goal_handle.request.pose
 
         goal_frame = str(
             goal_pose.header.frame_id or ""
@@ -3956,37 +5201,30 @@ class NavigationGoalGateNode(Node):
         if not goal_frame:
             self.get_logger().error(
                 "[GOAL GATE] "
-                "SUCCESS_VERIFICATION_FAILED="
-                f"{public_goal_id} | "
+                f"SUCCESS_VERIFICATION_FAILED={public_goal_id} | "
                 "REASON=GOAL_FRAME_EMPTY"
             )
-
             return None, None
 
         try:
-            transform = (
-                self.tf_buffer.lookup_transform(
-                    goal_frame,
-                    "base_footprint",
-                    Time(),
-                )
+            transform = self.tf_buffer.lookup_transform(
+                goal_frame,
+                "base_footprint",
+                Time(),
             )
 
         except Exception as exc:
             self.get_logger().error(
                 "[GOAL GATE] "
-                "SUCCESS_VERIFICATION_FAILED="
-                f"{public_goal_id} | "
+                f"SUCCESS_VERIFICATION_FAILED={public_goal_id} | "
                 f"TF={goal_frame}->base_footprint | "
                 f"ERROR={exc}"
             )
-
             return None, None
 
         robot_x = float(
             transform.transform.translation.x
         )
-
         robot_y = float(
             transform.transform.translation.y
         )
@@ -3994,7 +5232,6 @@ class NavigationGoalGateNode(Node):
         goal_x = float(
             goal_pose.pose.position.x
         )
-
         goal_y = float(
             goal_pose.pose.position.y
         )
@@ -4012,11 +5249,9 @@ class NavigationGoalGateNode(Node):
         ):
             self.get_logger().error(
                 "[GOAL GATE] "
-                "SUCCESS_VERIFICATION_FAILED="
-                f"{public_goal_id} | "
+                f"SUCCESS_VERIFICATION_FAILED={public_goal_id} | "
                 "REASON=NON_FINITE_POSITION"
             )
-
             return None, None
 
         distance = math.hypot(
@@ -4024,25 +5259,38 @@ class NavigationGoalGateNode(Node):
             goal_y - robot_y,
         )
 
+        # The configured value remains the nominal target.
+        nominal_tolerance = float(
+            self.goal_success_position_tolerance_m
+        )
+
+        # Additional corroboration margin, applied only
+        # after Nav2 has returned an actual SUCCEEDED.
+        verification_margin_m = 0.05
+
+        effective_tolerance = (
+            nominal_tolerance
+            + verification_margin_m
+        )
+
         reached = (
-            distance
-            <= self.goal_success_position_tolerance_m
+            distance <= effective_tolerance
         )
 
         self.get_logger().info(
             "[GOAL GATE] "
-            "SUCCESS_VERIFICATION="
-            f"{public_goal_id} | "
+            f"SUCCESS_VERIFICATION={public_goal_id} | "
             f"ROBOT=({robot_x:.3f},{robot_y:.3f}) | "
             f"GOAL=({goal_x:.3f},{goal_y:.3f}) | "
             f"DISTANCE={distance:.3f} | "
-            "TOLERANCE="
-            f"{self.goal_success_position_tolerance_m:.3f} | "
+            f"NOMINAL_TOLERANCE={nominal_tolerance:.3f} | "
+            f"VERIFICATION_MARGIN={verification_margin_m:.3f} | "
+            f"TOLERANCE={effective_tolerance:.3f} | "
             f"REACHED={reached}"
         )
 
         return reached, distance
-                
+               
     def _finish_navigation(
         self,
         public_goal_handle,

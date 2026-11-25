@@ -1,6 +1,9 @@
 # Persistent person identifier associated with this social zone.
 string person_id
 
+# Identity generation of the person represented by this zone.
+uint64 identity_generation
+
 # Center of the social zone in the parent array frame.
 geometry_msgs/Point center
 

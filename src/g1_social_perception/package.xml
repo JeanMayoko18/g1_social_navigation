@@ -1,28 +1,83 @@
 <?xml version="1.0"?>
-<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd"
+  schematypens="http://www.w3.org/2001/XMLSchema"?>
+
 <package format="3">
   <name>g1_social_perception</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
-  <maintainer email="icmayoko18@gmail.com">jean</maintainer>
-  <license>TODO: License declaration</license>
 
-  <depend>rclpy</depend>
-  <depend>sensor_msgs</depend>
-  <depend>yolo_msgs</depend>
-  <depend>g1_qos_manager</depend>
-  <depend>visualization_msgs</depend>
-  <depend>g1_social_msgs</depend>
+  <description>
+    Person observation enrichment, temporal tracking, spatial perception
+    and social-context interpretation for the Unitree G1.
+    Includes shared mathematical models and processing-time diagnostics.
+  </description>
+
+  <maintainer email="icmayoko18@gmail.com">jean</maintainer>
+  <license>Proprietary</license>
+
+  <!-- ================================================================
+       RUNTIME / ROS CLIENT
+       ================================================================ -->
+
+  <exec_depend>rclpy</exec_depend>
+
+  <!-- ================================================================
+       RUNTIME / STANDARD MESSAGE INTERFACES
+       ================================================================ -->
+
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+
+  <!-- ================================================================
+       RUNTIME / PERCEPTION AND SOCIAL CONTRACTS
+       ================================================================ -->
+
+  <exec_depend>yolo_msgs</exec_depend>
+  <exec_depend>g1_social_msgs</exec_depend>
+
+  <!-- ================================================================
+       RUNTIME / SHARED PROJECT UTILITIES
+       ================================================================ -->
+
+  <exec_depend>g1_qos_manager</exec_depend>
   <exec_depend>g1_social_common</exec_depend>
-  <depend>geometry_msgs</depend>
-  <depend>tf2_ros</depend>
-  <depend>tf2_geometry_msgs</depend>
+
+  <!-- ================================================================
+       RUNTIME / SPATIAL TRANSFORMS
+       ================================================================ -->
+
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>tf2_geometry_msgs</exec_depend>
+
+  <!-- ================================================================
+       RUNTIME / NUMERICAL PROCESSING
+       ================================================================ -->
+
+  <exec_depend>python3-numpy</exec_depend>
+
+  <!-- ================================================================
+       RUNTIME / VISUALIZATION
+       Retained from the existing manifest.
+       ================================================================ -->
+
+  <exec_depend>rviz2</exec_depend>
+
+  <!-- ================================================================
+       TESTING
+       ================================================================ -->
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
   <test_depend>python3-pytest</test_depend>
-  <exec_depend>rviz2</exec_depend>
+
+  <!-- ================================================================
+       BUILD SYSTEM
+       Python modules and executable entry points are installed by setup.py.
+       ROS message generation belongs to g1_social_msgs.
+       ================================================================ -->
 
   <export>
     <build_type>ament_python</build_type>

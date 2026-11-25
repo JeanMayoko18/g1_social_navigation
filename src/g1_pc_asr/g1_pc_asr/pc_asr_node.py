@@ -3,7 +3,9 @@
 import tempfile
 import threading
 import wave
+import json
 
+from std_msgs.msg import String
 import numpy as np
 import rclpy
 import sounddevice as sd
@@ -119,19 +121,26 @@ class PCASRNode(Node):
                 "language must be one of: fr, en, es, auto"
             )
 
-        self.listening_enabled = threading.Event()
+        # Each capture belongs to one exact HRI dialogue turn.
+        self.audio_lock = threading.RLock()
+        self.audio_turn = None
+        self.audio_phase = "IDLE"
+        self.audio_sequence = 0
+        self.audio_queue = deque(maxlen=128)
 
-        self.asr_gate_sub = self.create_subscription(
-            Bool,
-            "/hri/asr_listening_enabled",
-            self._listening_enabled_callback,
+        self.audio_command_sub = self.create_subscription(
+            String,
+            "/hri/asr_turn_command",
+            self._audio_command_callback,
             10,
         )
 
-        # Safe default:
-        # do not listen until HRI explicitly opens a human-response window.
-        self.listening_enabled.clear()
-
+        self.audio_status_pub = self.create_publisher(
+            String,
+            "/hri/asr_turn_status",
+            20,
+        )
+        
         # ------------------------------------------------------------------
         # ROS4HRI publishers
         # ------------------------------------------------------------------
@@ -139,12 +148,6 @@ class PCASRNode(Node):
         self.voices_pub = self.create_publisher(
             IdsList,
             "/humans/voices/tracked",
-            10,
-        )
-
-        self.speech_pub = self.create_publisher(
-            LiveSpeech,
-            f"/humans/voices/{self.voice_id}/speech",
             10,
         )
 
@@ -209,338 +212,291 @@ class PCASRNode(Node):
         msg.ids = [self.voice_id]
         self.voices_pub.publish(msg)
 
-    def _publish_final_speech(
-        self,
-        text: str,
-        language: str,
-        confidence: float,
-    ):
-        text = text.strip()
-
-        if not text:
-            return
-
-        msg = LiveSpeech()
-
-        msg.header.stamp = self.get_clock().now().to_msg()
-
-        msg.incremental = ""
-        msg.final = text
-
-        msg.confidence = max(
-            0.0,
-            min(float(confidence), 1.0),
-        )
-
-        msg.locale = self.LOCALES.get(
-            language,
-            language,
-        )
-
-        # Legacy field still present in the installed hri_msgs.
-        msg.language = language
-
-        self.speech_pub.publish(msg)
-
-        self.get_logger().info(
-            f'RECOGNIZED [{msg.locale}] '
-            f'confidence={msg.confidence:.2f}: "{text}"'
-        )
-
     # ----------------------------------------------------------------------
     # Audio + ASR
     # ----------------------------------------------------------------------
 
-    def _listening_enabled_callback(
-        self,
-        msg: Bool,
-    ):
-        """
-        Enable or disable microphone capture according to the HRI turn-taking
-        authority.
+    def _audio_status_locked(self, state, **extra):
+        """Publish ordered progress while holding audio_lock."""
+        if self.audio_turn is None:
+            return
 
-        False:
-            - immediately invalidate any active capture;
-            - no microphone pre-roll is accumulated;
-            - no recognition result is allowed to be published.
+        self.audio_sequence += 1
 
-        True:
-            - the next _record_utterance() call opens a fresh audio stream;
-            - therefore audio emitted by the robot before this transition cannot
-            leak into the next human utterance.
-        """
+        payload = dict(self.audio_turn)
+        payload.update(
+            version=1,
+            state=state,
+            sequence=self.audio_sequence,
+        )
+        payload.update(extra)
 
-        enabled = bool(
-            msg.data
+        self.audio_status_pub.publish(
+            String(data=json.dumps(payload))
         )
 
-        previous = (
-            self.listening_enabled.is_set()
-        )
+    def _audio_command_callback(self, msg):
+        """Prepare, open or cancel one exactly identified audio turn."""
+        try:
+            data = json.loads(msg.data)
 
-        if enabled:
-            self.listening_enabled.set()
-        else:
-            self.listening_enabled.clear()
+            if (
+                not isinstance(data, dict)
+                or data.get("version") != 1
+            ):
+                return
 
-        if enabled != previous:
-            self.get_logger().info(
-                "ASR listening gate changed | "
-                f"enabled={enabled}"
+            keys = (
+                "turn_id",
+                "interaction_id",
+                "request_id",
             )
 
+            if any(
+                not isinstance(data.get(key), str)
+                or not data[key]
+                for key in keys
+            ):
+                return
+
+            turn = {
+                key: data[key]
+                for key in keys
+            }
+
+            command = data.get("command")
+
+        except (ValueError, TypeError, AttributeError):
+            return
+
+        with self.audio_lock:
+            if command == "PREPARE":
+                if self.audio_turn == turn:
+                    return
+
+                self.audio_turn = turn
+                self.audio_phase = "PREPARING"
+                self.audio_sequence = 0
+                self.audio_queue.clear()
+
+            elif (
+                self.audio_turn == turn
+                and command == "LISTEN"
+            ):
+                if self.audio_phase not in {
+                    "READY",
+                    "RESULT",
+                }:
+                    return
+
+                self.audio_queue.clear()
+                self.audio_phase = "OPENING"
+
+            elif (
+                self.audio_turn == turn
+                and command == "CANCEL"
+            ):
+                self.audio_turn = None
+                self.audio_phase = "IDLE"
+                self.audio_queue.clear()
+
+    def _audio_callback(self, data, frames, timing, status):
+        """Discard robot audio and retain only authorized human audio."""
+        with self.audio_lock:
+            if self.audio_turn is None:
+                return
+
+            if status:
+                self.audio_phase = "FAILED"
+                self.audio_queue.clear()
+
+                self._audio_status_locked(
+                    "FAILED",
+                    reason="INPUT_STREAM_STATUS",
+                )
+                return
+
+            if self.audio_phase == "PREPARING":
+                # A real device callback confirms that capture is running.
+                # This block is discarded.
+                self.audio_phase = "READY"
+
+                self._audio_status_locked("READY")
+                return
+
+            if self.audio_phase == "OPENING":
+                self.audio_phase = "LISTENING"
+
+                self._audio_status_locked("LISTENING")
+
+                # Discard the block spanning the LISTEN transition.
+                return
+
+            if self.audio_phase not in {
+                "LISTENING",
+                "RECORDING",
+            }:
+                # Robot speech, cue audio and transcription-time audio
+                # must never enter the next utterance.
+                return
+
+            if len(self.audio_queue) == self.audio_queue.maxlen:
+                self.audio_phase = "FAILED"
+                self.audio_queue.clear()
+
+                self._audio_status_locked(
+                    "FAILED",
+                    reason="AUDIO_QUEUE_OVERFLOW",
+                )
+                return
+
+            self.audio_queue.append((
+                dict(self.audio_turn),
+                data.reshape(-1).copy(),
+            ))
+
     def _record_utterance(self):
-        """
-        Capture exactly one human utterance while the HRI listening gate is open.
+        """Capture one bounded utterance from an already running stream."""
+        chunk_sec = self.chunk_ms / 1000.0
 
-        Important:
-            The microphone stream is opened only after HRI explicitly authorizes
-            human speech.
+        pre_roll = deque(
+            maxlen=max(
+                1,
+                int(self.pre_roll_sec / chunk_sec),
+            )
+        )
 
-            If HRI closes the gate while recording, the current utterance is
-            discarded immediately.
-
-            This prevents robot speech, anti-echo guard audio and the turn cue
-            from leaking into the next Whisper transcription.
-        """
-
-        # ------------------------------------------------------------------
-        # Wait until HRI explicitly allows human speech.
-        # ------------------------------------------------------------------
+        utterance = []
+        owner = None
+        recording = False
+        silence_chunks = 0
+        voiced_frames = 0
+        total_frames = 0
 
         while (
             rclpy.ok()
             and not self.stop_event.is_set()
-            and not self.listening_enabled.is_set()
         ):
-            self.stop_event.wait(
-                0.05
-            )
-
-        if (
-            not rclpy.ok()
-            or self.stop_event.is_set()
-        ):
-            return None
-
-        chunk_frames = max(
-            1,
-            int(
-                self.sample_rate
-                * self.chunk_ms
-                / 1000.0
-            ),
-        )
-
-        pre_roll_chunks = max(
-            1,
-            int(
-                self.pre_roll_sec
-                / (
-                    self.chunk_ms
-                    / 1000.0
-                )
-            ),
-        )
-
-        end_silence_chunks = max(
-            1,
-            int(
-                self.end_silence_sec
-                / (
-                    self.chunk_ms
-                    / 1000.0
-                )
-            ),
-        )
-
-        min_speech_frames = int(
-            self.min_speech_sec
-            * self.sample_rate
-        )
-
-        max_speech_frames = int(
-            self.max_speech_sec
-            * self.sample_rate
-        )
-
-        pre_roll = deque(
-            maxlen=pre_roll_chunks
-        )
-
-        utterance = []
-        recording = False
-        silence_chunks = 0
-        voiced_frames = 0
-
-        self.get_logger().debug(
-            "Listening for human speech..."
-        )
-
-        # ------------------------------------------------------------------
-        # Important:
-        # Open the device only AFTER the HRI gate becomes true.
-        #
-        # That gives us a fresh PortAudio stream instead of retaining samples
-        # produced while the robot was speaking.
-        # ------------------------------------------------------------------
-
-        with sd.InputStream(
-            samplerate=self.sample_rate,
-            channels=1,
-            dtype="int16",
-            device=self.audio_device,
-            blocksize=chunk_frames,
-        ) as stream:
-
-            while (
-                rclpy.ok()
-                and not self.stop_event.is_set()
-            ):
-
-                # ----------------------------------------------------------
-                # HRI may close the response window at any time.
-                #
-                # Drop absolutely everything captured so far.
-                # ----------------------------------------------------------
-
-                if not self.listening_enabled.is_set():
-
-                    if recording or utterance or pre_roll:
-                        self.get_logger().debug(
-                            "ASR capture discarded because "
-                            "the HRI listening gate closed."
-                        )
-
+            with self.audio_lock:
+                if (
+                    owner is not None
+                    and self.audio_turn != owner
+                ):
                     return None
 
-                data, overflowed = stream.read(
-                    chunk_frames
+                if self.audio_phase not in {
+                    "LISTENING",
+                    "RECORDING",
+                    "OPENING",
+                }:
+                    if owner is not None:
+                        return None
+
+                item = (
+                    self.audio_queue.popleft()
+                    if self.audio_queue
+                    else None
                 )
 
-                if overflowed:
-                    self.get_logger().warning(
-                        "Microphone input overflow."
-                    )
+            if item is None:
+                self.stop_event.wait(0.01)
+                continue
 
-                # Check once more after the blocking read.
-                if not self.listening_enabled.is_set():
-                    return None
+            turn, chunk = item
 
-                chunk = (
-                    data
-                    .reshape(-1)
-                    .copy()
-                )
+            if owner is None:
+                owner = turn
 
-                rms = self._rms(
-                    chunk
-                )
+            if turn != owner:
+                return None
 
-                # ----------------------------------------------------------
-                # Waiting for beginning of human speech.
-                # ----------------------------------------------------------
+            rms = self._rms(chunk)
 
-                if not recording:
+            if not recording:
+                pre_roll.append(chunk)
 
-                    pre_roll.append(
-                        chunk
-                    )
-
-                    if (
-                        rms
-                        >= self.speech_start_rms
-                    ):
-                        recording = True
-                        silence_chunks = 0
-
-                        utterance.extend(
-                            pre_roll
-                        )
-
-                        pre_roll.clear()
-
-                        voiced_frames += (
-                            chunk.size
-                        )
-
-                        self.get_logger().debug(
-                            "Speech started: "
-                            f"rms={rms:.1f}"
-                        )
-
+                if rms < self.speech_start_rms:
                     continue
 
-                # ----------------------------------------------------------
-                # Active human utterance.
-                # ----------------------------------------------------------
-
-                utterance.append(
-                    chunk
-                )
-
-                if (
-                    rms
-                    >= self.speech_end_rms
-                ):
-                    silence_chunks = 0
-                    voiced_frames += (
-                        chunk.size
-                    )
-                else:
-                    silence_chunks += 1
+                recording = True
+                utterance.extend(pre_roll)
+                pre_roll.clear()
 
                 total_frames = sum(
                     block.size
                     for block in utterance
                 )
 
-                if (
-                    total_frames
-                    >= max_speech_frames
-                ):
-                    self.get_logger().warning(
-                        "Maximum utterance duration reached."
-                    )
-                    break
+                voiced_frames = chunk.size
 
-                if (
-                    silence_chunks
-                    >= end_silence_chunks
-                ):
-                    break
+                with self.audio_lock:
+                    if (
+                        self.audio_turn != owner
+                        or self.audio_phase != "LISTENING"
+                    ):
+                        return None
 
-        # ------------------------------------------------------------------
-        # The gate may have closed exactly while InputStream was leaving.
-        # Never return stale robot-contaminated audio.
-        # ------------------------------------------------------------------
+                    self.audio_phase = "RECORDING"
+                    self._audio_status_locked("SPEECH_STARTED")
 
-        if not self.listening_enabled.is_set():
-            return None
+            else:
+                utterance.append(chunk)
+                total_frames += chunk.size
 
-        if not utterance:
-            return None
+                if rms >= self.speech_end_rms:
+                    silence_chunks = 0
+                    voiced_frames += chunk.size
+                else:
+                    silence_chunks += 1
 
-        if (
-            voiced_frames
-            < min_speech_frames
-        ):
-            self.get_logger().debug(
-                "Discarding too-short speech candidate."
-            )
-            return None
+            if total_frames >= int(
+                self.max_speech_sec * self.sample_rate
+            ):
+                with self.audio_lock:
+                    if self.audio_turn == owner:
+                        self.audio_phase = "RESULT"
+                        self.audio_queue.clear()
 
-        audio = np.concatenate(
-            utterance
-        )
+                        # Do not interpret an arbitrarily truncated sentence.
+                        self._audio_status_locked(
+                            "EMPTY",
+                            reason="UTTERANCE_TOO_LONG",
+                        )
 
-        self.get_logger().debug(
-            "Utterance captured: "
-            f"{audio.size / self.sample_rate:.2f}s"
-        )
+                return None
 
-        return audio
+            if (
+                recording
+                and silence_chunks * chunk_sec
+                    >= self.end_silence_sec
+            ):
+                with self.audio_lock:
+                    if (
+                        self.audio_turn != owner
+                        or self.audio_phase != "RECORDING"
+                    ):
+                        return None
 
+                    self.audio_queue.clear()
+
+                    if voiced_frames < int(
+                        self.min_speech_sec * self.sample_rate
+                    ):
+                        self.audio_phase = "RESULT"
+
+                        self._audio_status_locked(
+                            "EMPTY",
+                            reason="SPEECH_TOO_SHORT",
+                        )
+                        return None
+
+                    self.audio_phase = "TRANSCRIBING"
+                    self._audio_status_locked("TRANSCRIBING")
+
+                return owner, np.concatenate(utterance)
+
+        return None
+    
     @staticmethod
     def _rms(audio):
         if audio.size == 0:
@@ -620,85 +576,80 @@ class PCASRNode(Node):
             )
 
     def _recognition_loop(self):
-        """
-        Continuously recognize human speech while respecting the HRI listening
-        authority.
-
-        A recognition result is published only if the listening gate remains open
-        throughout capture and transcription.
-
-        This prevents a stale transcription from being emitted after the robot has
-        already reclaimed the speaking turn.
-        """
+        """Keep capture warm and reject results from obsolete turns."""
+        chunk_frames = max(
+            1,
+            int(
+                self.sample_rate
+                * self.chunk_ms
+                / 1000.0
+            ),
+        )
 
         while (
             rclpy.ok()
             and not self.stop_event.is_set()
         ):
-
             try:
-
-                audio = (
-                    self._record_utterance()
-                )
-
-                if (
-                    audio is None
-                    or audio.size == 0
+                with sd.InputStream(
+                    samplerate=self.sample_rate,
+                    channels=1,
+                    dtype="int16",
+                    device=self.audio_device,
+                    blocksize=chunk_frames,
+                    callback=self._audio_callback,
                 ):
-                    continue
+                    while (
+                        rclpy.ok()
+                        and not self.stop_event.is_set()
+                    ):
+                        captured = self._record_utterance()
 
-                # The turn may have been closed immediately after capture.
-                if not self.listening_enabled.is_set():
-                    self.get_logger().debug(
-                        "Discarding captured audio because "
-                        "the HRI gate closed before transcription."
-                    )
-                    continue
+                        if captured is None:
+                            continue
 
-                text, language, confidence = (
-                    self._transcribe(
-                        audio
-                    )
-                )
+                        owner, audio = captured
 
-                if not text:
-                    continue
+                        text, language, confidence = (
+                            self._transcribe(audio)
+                        )
 
-                # ----------------------------------------------------------
-                # Critical race barrier.
-                #
-                # Whisper may take hundreds of milliseconds. During that time
-                # HRI may have accepted a previous answer and started the next
-                # robot utterance.
-                #
-                # Never publish a result belonging to the old listening turn.
-                # ----------------------------------------------------------
+                        with self.audio_lock:
+                            if (
+                                self.audio_turn != owner
+                                or self.audio_phase != "TRANSCRIBING"
+                            ):
+                                self.get_logger().info(
+                                    "Discarded stale ASR result"
+                                )
+                                continue
 
-                if not self.listening_enabled.is_set():
-                    self.get_logger().debug(
-                        "Discarding recognition result because "
-                        "the HRI gate closed during transcription | "
-                        f"text={text!r}"
-                    )
-                    continue
+                            self.audio_phase = "RESULT"
 
-                self._publish_final_speech(
-                    text,
-                    language,
-                    confidence,
-                )
+                            # HRI validates ownership before forwarding
+                            # the text to the existing ROS4HRI backend.
+                            self._audio_status_locked(
+                                "RESULT" if text.strip() else "EMPTY",
+                                text=text.strip(),
+                                language=language,
+                                confidence=float(confidence),
+                            )
 
             except Exception as exc:
-
                 self.get_logger().error(
                     f"ASR loop error: {exc}"
                 )
 
-                self.stop_event.wait(
-                    1.0
-                )
+                with self.audio_lock:
+                    self.audio_phase = "FAILED"
+                    self.audio_queue.clear()
 
+                    self._audio_status_locked(
+                        "FAILED",
+                        reason="ASR_WORKER_EXCEPTION",
+                    )
+
+                self.stop_event.wait(1.0)
     def destroy_node(self):
         self.stop_event.set()
 

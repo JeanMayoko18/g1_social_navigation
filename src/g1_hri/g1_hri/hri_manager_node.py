@@ -12,6 +12,10 @@ from g1_social_msgs.msg import (
     SpeechStatus,
     SpeechCancelRequest,
 )
+import re
+import math
+
+from hri_msgs.msg import LiveSpeech
 import json
 from std_msgs.msg import String
 from g1_social_msgs.msg import SpeechCancelRequest
@@ -207,9 +211,16 @@ class HRIManagerNode(Node):
         # The human timeout starts only after the cue has completed.
         self.response_guard_sec = 0.20
 
+        # Use an audible cue before opening the human response window.
+        self.declare_parameter("turn_cue_enabled", True)
+        self.turn_cue_enabled = bool(
+            self.get_parameter("turn_cue_enabled").value
+        )
+
         self.turn_cue_pending = False
         self.turn_cue_ready_at = None
         self.turn_cue_decision_id = ""
+        self._turn_cue_authorized = False
 
         # ---------------------------------------------------------
         # ROS interfaces
@@ -240,6 +251,8 @@ class HRIManagerNode(Node):
             "/explainability/text",
             10,
         )
+        
+        self._initialize_audio_turn_protocol()
 
         self.asr_listening_pub = self.create_publisher(
             Bool,
@@ -315,51 +328,36 @@ class HRIManagerNode(Node):
     # DialogueRequest
     # =========================================================
 
-    def _set_asr_listening(
-        self,
-        enabled: bool,
-    ) -> None:
-        """
-        Control the PC ASR microphone according to the HRI turn-taking state.
+    def _set_asr_listening(self, enabled):
+        """Publish gate diagnostics and send scoped ASR commands."""
+        enabled = bool(enabled)
 
-        True:
-            The human response window is open and microphone capture is allowed.
-
-        False:
-            Robot speech, anti-echo guard, turn cue or non-listening state is
-            active. The ASR must stop/discard any current microphone capture.
-
-        HRI is the authority for this gate.
-        """
-
-        enabled = bool(
-            enabled
-        )
-
-        changed = (
-            enabled
-            != self.asr_listening_enabled
-        )
-
-        self.asr_listening_enabled = (
-            enabled
-        )
-
-        msg = Bool()
-        msg.data = enabled
+        self.asr_listening_enabled = enabled
 
         self.asr_listening_pub.publish(
-            msg
+            Bool(data=enabled)
         )
 
-        if changed:
-            self.get_logger().info(
-                "ASR listening gate | "
-                f"enabled={enabled} | "
-                f"interaction="
-                f"{self.active_interaction_id or 'NONE'}"
+        if not hasattr(self, "_audio_turn"):
+            return
+
+        if enabled and self._audio_turn:
+            self._audio_phase = "OPENING"
+
+            self._audio_deadline = (
+                time.monotonic()
+                + self.asr_ready_timeout_sec
             )
 
+            self._send_audio_command("LISTEN")
+
+        elif not enabled:
+            if self._audio_turn:
+                self._send_audio_command("CANCEL")
+
+            self._audio_turn = None
+            self._audio_phase = "IDLE"
+            self._audio_deadline = None
     def _publish_dialogue_rejection(self, request, reason):
         interaction_id = str(
             request.interaction_id or ""
@@ -418,13 +416,16 @@ class HRIManagerNode(Node):
             )
             return
 
+        # Reject a previously closed exact turn, but allow
+        # a new request_id within the same interaction.
         if any(
             c["interaction_id"] == request.interaction_id
+            and c.get("request_id") == request.request_id
             for c in self.closed_control_ids.values()
         ):
             self._reject_dialogue_request(
                 request,
-                "INTERACTION_ALREADY_CLOSED"
+                "DIALOGUE_TURN_ALREADY_CLOSED"
             )
             return
 
@@ -583,45 +584,40 @@ class HRIManagerNode(Node):
             self._speak_question(
                 question,
                 decision_id=decision_id,
-                language=self.active_language
+                language=self.active_language,
             )
+
+            # Prepare capture during robot speech.
+            # PREPARE does not authorize listening or audio retention.
+            if not self.mock_response_enabled:
+                self._prepare_audio_turn(with_cue=True)
+
             return
 
         self._open_human_response_window()
 
     def _speech_status_callback(self, msg):
-        decision_id = str(
-            msg.decision_id or ""
-        ).strip()
+        """Handle robot speech completion and authorize the human turn."""
 
-        state = str(
-            msg.state or ""
-        ).upper()
-
-        retryable = (
-            state == "FAILED"
-            and str(msg.detail).startswith(
-                "AUDIO_RETRYABLE|"
-            )
-        )
-
-        terminal_safe = (
-            state in {"COMPLETED", "CANCELED"}
-            or retryable
-        )
+        decision_id = str(msg.decision_id or "").strip()
+        state = str(msg.state or "").upper()
 
         if not decision_id:
             return
 
+        retryable = (
+            state == "FAILED"
+            and str(msg.detail).startswith("AUDIO_RETRYABLE|")
+        )
+        terminal_safe = state in {"COMPLETED", "CANCELED"} or retryable
+
+        # Resolve an earlier cancellation or uncertain audio termination.
         if decision_id == self.audio_uncertain_decision_id:
             if not terminal_safe:
-                if (
-                    state == "FAILED"
-                    and self.pending_close_control is not None
-                ):
+                if state == "FAILED" and self.pending_close_control is not None:
                     self._publish_close_result(
                         self.pending_close_control,
-                        "TERMINATION_UNCONFIRMED"
+                        "TERMINATION_UNCONFIRMED",
                     )
                 return
 
@@ -630,21 +626,15 @@ class HRIManagerNode(Node):
             if self.pending_close_control is not None:
                 command = self.pending_close_control
                 self.pending_close_control = None
-
                 self._reset_interaction()
-
-                self._publish_close_result(
-                    command,
-                    "CLOSED"
-                )
+                self._publish_close_result(command, "CLOSED")
             else:
-                self._report_audio_event(
-                    "AUDIO_TERMINATED"
-                )
+                self._report_audio_event("AUDIO_TERMINATED")
                 self._reset_interaction()
 
             return
 
+        # Ignore playback events belonging to another request.
         if (
             not self.active_interaction_id
             or not self.waiting_for_speech_completion
@@ -655,52 +645,47 @@ class HRIManagerNode(Node):
         if state == "STARTED":
             if not self.pending_speech_started:
                 self.pending_speech_started = True
-                self.pending_speech_started_at = (
-                    time.monotonic()
-                )
+                self.pending_speech_started_at = time.monotonic()
             return
 
         if state == "COMPLETED":
-            is_cue = (
-                decision_id == self.turn_cue_decision_id
-            )
+            is_cue = decision_id == self.turn_cue_decision_id
 
             self.pending_speech_decision_id = ""
             self.waiting_for_speech_completion = False
-
             self.pending_speech_requested_at = None
             self.pending_speech_started = False
             self.pending_speech_started_at = None
 
             if is_cue:
+                # The audible cue has finished. The person may now speak.
                 self.turn_cue_decision_id = ""
                 self._open_human_response_window()
-            else:
+
+            elif self.turn_cue_enabled:
+                # The question has finished. Use the existing guard and cue.
                 self.turn_cue_pending = True
                 self.turn_cue_ready_at = (
-                    time.monotonic()
-                    + self.response_guard_sec
+                    time.monotonic() + self.response_guard_sec
                 )
+
+            else:
+                # The question has finished. Release the cue requirement
+                # for this turn before checking microphone readiness.
+                self._audio_with_cue = False
+                self._turn_cue_authorized = False
+                self._open_human_response_window()
+
             return
 
         if state in {"FAILED", "CANCELED"}:
             if terminal_safe:
-                # Failure and exact terminal evidence
-                # belong to the same turn.
-                self._report_audio_event(
-                    "ROBOT_SPEECH_FAILED"
-                )
-
-                self._report_audio_event(
-                    "AUDIO_TERMINATED"
-                )
-
+                self._report_audio_event("ROBOT_SPEECH_FAILED")
+                self._report_audio_event("AUDIO_TERMINATED")
                 self._reset_interaction()
             else:
-                self._request_audio_reconciliation(
-                    "ROBOT_SPEECH_FAILED"
-                )
-
+                self._request_audio_reconciliation("ROBOT_SPEECH_FAILED")
+                
     def _request_pending_speech_cancellation(self):
         """Request cancellation without assuming audio termination."""
         decision_id = str(
@@ -722,30 +707,50 @@ class HRIManagerNode(Node):
 
         self.speech_cancel_pub.publish(request)
 
+
     def _request_turn_cue(self):
-        """
-        Request the short audio cue announcing that the human may speak.
-
-        The cue is routed through the Common Speech Manager so that it can use
-        exactly the same audio-output policy as robot speech:
-
-            Unitree
-                -> bounded Unitree retry
-                -> PC fallback
-
-        This cue does not represent dialogue content and must never generate a
-        HumanIntent.
-
-        The human-response timeout starts only after the matching cue transaction
-        reaches COMPLETED.
-
-        If cue playback itself fails, HRI will fail open and start the human
-        response window anyway. An ergonomic cue must never deadlock dialogue.
-        """
+        """Emit the human-turn cue only after speech and capture readiness."""
+        self.turn_cue_pending = False
+        self.turn_cue_ready_at = None
 
         if not self.active_interaction_id:
             return
 
+        if self.mock_response_enabled:
+            self._emit_turn_cue()
+            return
+
+        # Called after robot speech COMPLETED and anti-echo guard.
+        self._turn_cue_authorized = True
+
+        if self._audio_turn is None:
+            # Defensive fallback if preparation was not started.
+            self._prepare_audio_turn(with_cue=True)
+            return
+
+        if self._audio_phase == "READY":
+            self._emit_turn_cue()
+            return
+
+        if self._audio_phase == "PREPARING":
+            # READY callback will emit the cue.
+            return
+
+        self.get_logger().error(
+            "[HRI ASR] Unexpected audio phase before turn cue | "
+            f"phase={self._audio_phase}"
+        )
+
+        self._report_audio_event(
+            "DIALOGUE_REQUEST_REJECTED"
+        )
+        self._reset_interaction()
+
+    def _emit_turn_cue(self):
+        """Emit the cue while human-audio retention remains disabled."""
+        if not self.active_interaction_id:
+            return
+        self._turn_cue_authorized = False
         self.turn_cue_pending = False
         self.turn_cue_ready_at = None
 
@@ -754,62 +759,39 @@ class HRIManagerNode(Node):
             f"{uuid.uuid4().hex[:12]}"
         )
 
-        # Reuse the existing speech barrier. While the cue is pending, another
-        # DialogueRequest for the same interaction remains blocked.
         self.waiting_for_speech_completion = True
-
         self.pending_speech_decision_id = (
             self.turn_cue_decision_id
         )
 
-        self.pending_speech_requested_at = (
-            time.monotonic()
-        )
-
+        self.pending_speech_requested_at = time.monotonic()
         self.pending_speech_started = False
         self.pending_speech_started_at = None
 
         msg = ExplanationText()
 
-        msg.header.stamp = (
-            self.get_clock().now().to_msg()
-        )
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.decision_id = self.turn_cue_decision_id
 
-        msg.decision_id = (
-            self.turn_cue_decision_id
-        )
-
-        # TURN_CUE is not linguistic content.
-        #
-        # The Speech Manager must intercept speech_kind=TURN_CUE before normal
-        # text/Piper validation and synthesize a short tone instead.
+        # The speech manager handles TURN_CUE as a tone.
         msg.language = "en"
         msg.text = ""
-
         msg.fallback_language = "en"
         msg.fallback_text = ""
 
         msg.provider = "g1_hri"
         msg.model = ""
-
         msg.used_fallback = False
         msg.used_cache = False
-
         msg.speech_kind = "TURN_CUE"
 
-        msg.context_stamp = (
-            msg.header.stamp
-        )
-
+        msg.context_stamp = msg.header.stamp
         msg.navigation_state = ""
         msg.navigation_goal_id = ""
-
         msg.navigation_active = False
         msg.social_conflict_active = True
 
-        self.speech_request_pub.publish(
-            msg
-        )
+        self.speech_request_pub.publish(msg)
 
         self.get_logger().info(
             "Published human turn cue request | "
@@ -817,42 +799,27 @@ class HRIManagerNode(Node):
             f"decision_id={self.turn_cue_decision_id}"
         )
 
-    def _open_human_response_window(
-        self,
-    ):
-        """
-        Start the interval during which a human response is expected.
-
-        Robot-initiated dialogue reaches this method only after:
-
-            robot question COMPLETED
-                -> anti-echo guard
-                -> turn-taking cue COMPLETED
-
-        If cue playback failed, this method is also used as the non-blocking
-        fail-open path.
-
-        Passive HUMAN_INITIATIVE_WINDOW enters here immediately because there is
-        no preceding robot dialogue question.
-
-        The human timeout and ASR microphone become active exactly here.
-        """
-
+    def _open_human_response_window(self):
+        """Enable recognition only after capture readiness and cue completion."""
         if not self.active_interaction_id:
-
             self.get_logger().warning(
-                "Cannot open human response window without "
-                "an active interaction."
+                "Cannot open a response window without an active interaction"
             )
 
-            self._set_asr_listening(
-                False
-            )
+            self._set_asr_listening(False)
+            return
 
+        if (
+            not self.mock_response_enabled
+            and self._audio_phase != "READY"
+        ):
+            # Passive initiative has no preceding robot question or cue.
+            self._prepare_audio_turn(
+                with_cue=False,
+            )
             return
 
         self.waiting_for_speech_completion = False
-
         self.pending_speech_decision_id = ""
         self.pending_speech_requested_at = None
         self.pending_speech_started = False
@@ -862,20 +829,10 @@ class HRIManagerNode(Node):
         self.turn_cue_ready_at = None
         self.turn_cue_decision_id = ""
 
-        # ---------------------------------------------------------
-        # This timestamp defines the true beginning of the human turn.
-        #
-        # Robot speech, anti-echo guard and TURN_CUE consume none of
-        # the human-response timeout.
-        # ---------------------------------------------------------
-
-        self.interaction_started_at = (
-            time.monotonic()
-        )
-
         self.waiting_for_human = True
 
         if self.mock_response_enabled:
+            self.interaction_started_at = time.monotonic()
 
             self.mock_response_at = (
                 self.interaction_started_at
@@ -883,26 +840,17 @@ class HRIManagerNode(Node):
             )
 
         else:
+            # The onset deadline starts on the LISTENING acknowledgment.
+            self.interaction_started_at = None
             self.mock_response_at = None
 
-        # ---------------------------------------------------------
-        # LAST operation of the turn transition:
-        #
-        # only now may the microphone start accumulating samples.
-        # g1_pc_asr opens a fresh InputStream after receiving True.
-        # ---------------------------------------------------------
-
-        self._set_asr_listening(
-            True
-        )
+        self._set_asr_listening(True)
 
         self.get_logger().info(
-            "Human response window opened | "
-            f"interaction={self.active_interaction_id} | "
-            f"timeout={self.active_response_timeout:.2f}s | "
-            "human_may_speak=YES"
+            "[HRI ASR] Human response window requested | "
+            f"interaction={self.active_interaction_id}"
         )
-        
+
     def _handle_mock_response(self):
         """Generate a simulated human response for testing."""
 
@@ -928,29 +876,139 @@ class HRIManagerNode(Node):
     # =========================================================
     # Robot speech
     # =========================================================
-    def _build_english_dialogue_fallback(
-        self,
-    ) -> str:
-        """
-        Rebuild the currently active robot dialogue turn in English.
 
-        Dialogue wording remains owned by g1_social_common.
 
-        No free-form translation is performed here.
-        """
-
+    def _build_english_dialogue_fallback(self) -> str:
+        """Build English fallback from explicit dialogue semantics."""
         request = self.active_request
 
         if request is None:
             return ""
 
+        language = normalize_dialogue_language(
+            getattr(request, "language", "en")
+        )
+
+        question = str(
+            request.question or ""
+        ).strip()
+
         request_type = str(
             request.request_type or ""
         ).strip().upper()
 
-        # ---------------------------------------------------------
-        # Passage clarification
-        # ---------------------------------------------------------
+        context = str(
+            request.context or ""
+        ).strip().upper()
+
+        if context == "AUTONOMOUS_ADAPTATION_PERMISSION":
+            return (
+                "I cannot guarantee passage on the requested side. "
+                "May I freely look for another route "
+                "while respecting social distance?"
+            )
+
+        if request_type in {
+            "DIRECTION_REFERENCE_CLARIFICATION",
+            "DIRECTION_FINAL_CONFIRMATION",
+        }:
+            direction = str(
+                request.direction_to_confirm or ""
+            ).strip().upper()
+
+            reference = str(
+                request.directional_reference or ""
+            ).strip().upper()
+
+            resolved = str(
+                request.resolved_robot_direction or ""
+            ).strip().upper()
+
+            retry = int(request.directional_retry_index)
+
+            if (
+                direction not in {"LEFT", "RIGHT"}
+                or retry not in {0, 1, 2}
+            ):
+                return ""
+
+            # Already exact when the primary language is English.
+            if language == "en":
+                return question
+
+            side = direction.lower()
+
+            if request_type == "DIRECTION_REFERENCE_CLARIFICATION":
+                if (
+                    reference != "AMBIGUOUS"
+                    or resolved != "NONE"
+                ):
+                    return ""
+
+                questions = (
+                    (
+                        "To make sure I understand your instruction "
+                        "correctly, do you mean "
+                        f"your {side} or mine?"
+                    ),
+                    (
+                        "Excuse me, I didn't receive your answer. "
+                        "Could you please clarify whether you mean "
+                        f"your {side} or mine?"
+                    ),
+                    (
+                        "Thank you for your patience. "
+                        "To avoid any misunderstanding, could you "
+                        "please confirm whether you mean "
+                        f"your {side} or mine?"
+                    ),
+                )
+
+                return questions[retry]
+
+            if reference == "PERSON":
+                expected = (
+                    "RIGHT" if direction == "LEFT"
+                    else "LEFT"
+                )
+
+                if resolved != expected:
+                    return ""
+
+                statement = (
+                    f"You would like me to pass on your {side}. "
+                    "Assuming we are facing each other, "
+                    f"that corresponds to my {resolved.lower()}. "
+                )
+
+            elif reference == "ROBOT":
+                if resolved != direction:
+                    return ""
+
+                statement = (
+                    f"You would like me to pass on my {side}. "
+                )
+
+            else:
+                return ""
+
+            prefixes = (
+                "To make sure I respect your instruction, ",
+                "Excuse me, I didn't receive your confirmation. ",
+                "Thank you for your patience. ",
+            )
+
+            endings = (
+                "Is that what you would like?",
+                "Could you please confirm that this is correct?",
+                "Could you please confirm your preference one last time?",
+            )
+
+            return (
+                prefixes[retry]
+                + statement
+                + endings[retry]
+            )
 
         if request_type == "PASSAGE_CLARIFICATION":
             return get_dialogue_text(
@@ -958,12 +1016,7 @@ class HRIManagerNode(Node):
                 "en",
             )
 
-        # ---------------------------------------------------------
-        # Semantic confirmation
-        # ---------------------------------------------------------
-
         if request_type == "INTENT_CONFIRMATION":
-
             intent = str(
                 request.intent_to_confirm or ""
             ).strip().upper()
@@ -984,17 +1037,9 @@ class HRIManagerNode(Node):
             else:
                 key = "confirm_allow"
 
-            return get_dialogue_text(
-                key,
-                "en",
-            )
-
-        # ---------------------------------------------------------
-        # Alternative proposal
-        # ---------------------------------------------------------
+            return get_dialogue_text(key, "en")
 
         if request_type == "ALTERNATIVE_PROPOSAL":
-
             direction = str(
                 request.direction_to_confirm or "NONE"
             ).strip().upper()
@@ -1008,14 +1053,11 @@ class HRIManagerNode(Node):
             else:
                 self.get_logger().warning(
                     "Cannot construct English fallback for "
-                    "ALTERNATIVE_PROPOSAL without LEFT/RIGHT direction."
+                    "ALTERNATIVE_PROPOSAL without LEFT/RIGHT."
                 )
                 return ""
 
-            return get_dialogue_text(
-                key,
-                "en",
-            )
+            return get_dialogue_text(key, "en")
 
         self.get_logger().warning(
             "No English dialogue fallback mapping for "
@@ -1143,15 +1185,113 @@ class HRIManagerNode(Node):
     # =========================================================
 
     def _timer_callback(self):
+        """
+        Supervise HRI with bounded audio reconciliation.
+
+        Human silence and audio failure remain distinct.
+
+        Never invent CLOSED when audio termination is
+        unconfirmed.
+
+        Report an unresolved CLOSE after 10 seconds so
+        CollaborationManager can execute its technical
+        recovery policy.
+
+        Keep ASR disabled while audio is uncertain.
+        """
         now = time.monotonic()
 
-        if (
-            self.pending_close_control is not None
-            or self.audio_uncertain_decision_id
-        ):
+        # ==========================================
+        # A. AUDIO RECONCILIATION
+        # ==========================================
+        pending = self.pending_close_control
+
+        uncertain_id = str(
+            self.audio_uncertain_decision_id or ""
+        ).strip()
+
+        if pending is not None or uncertain_id:
             self._set_asr_listening(False)
+
+            current_key = (
+                str(
+                    pending.get("close_id") or ""
+                )
+                if pending is not None
+                else "",
+                uncertain_id,
+            )
+
+            if getattr(
+                self,
+                "_audio_watch_key",
+                None,
+            ) != current_key:
+                self._audio_watch_key = current_key
+                self._audio_watch_started_at = now
+                self._audio_watch_reported = False
+                self._audio_watch_last_cancel_at = 0.0
+
+            elapsed = (
+                now - self._audio_watch_started_at
+            )
+
+            # Retry cancellation while terminal audio
+            # evidence is still missing.
+            if (
+                uncertain_id
+                and elapsed < 10.0
+                and (
+                    now - self._audio_watch_last_cancel_at
+                    >= 2.0
+                )
+            ):
+                cancel = SpeechCancelRequest()
+                cancel.decision_id = uncertain_id
+                cancel.reason = "AUDIO_RECONCILIATION"
+
+                self.speech_cancel_pub.publish(cancel)
+
+                self._audio_watch_last_cancel_at = now
+
+            # Report the unresolved transaction once.
+            if (
+                elapsed >= 10.0
+                and not self._audio_watch_reported
+            ):
+                self._audio_watch_reported = True
+
+                self.get_logger().error(
+                    "[HRI AUDIO] Reconciliation timeout | "
+                    f"decision={uncertain_id} | "
+                    "audio_terminated=False | "
+                    "navigation_decision_owner="
+                    "COLLABORATION_MANAGER"
+                )
+
+                if pending is not None:
+                    self._publish_close_result(
+                        pending,
+                        "TERMINATION_UNCONFIRMED"
+                    )
+
+            # Keep the transaction available for a
+            # possible late, exact terminal status.
+            #
+            # Do not claim CLOSED.
+            # Do not reopen ASR.
             return
 
+        # A previous uncertain transaction has been
+        # resolved by the exact speech-status callback.
+        self._audio_watch_key = None
+        self._audio_watch_started_at = None
+        self._audio_watch_reported = False
+        self._audio_watch_last_cancel_at = 0.0
+
+        # ==========================================
+        # B. MOCK RESPONSE
+        # ==========================================
         if (
             self.mock_response_enabled
             and self.waiting_for_human
@@ -1161,6 +1301,9 @@ class HRIManagerNode(Node):
             self._handle_mock_response()
             return
 
+        # ==========================================
+        # C. HUMAN TURN CUE
+        # ==========================================
         if (
             self.turn_cue_pending
             and self.turn_cue_ready_at is not None
@@ -1169,8 +1312,11 @@ class HRIManagerNode(Node):
             self._request_turn_cue()
             return
 
+        # ==========================================
+        # D. ROBOT SPEECH
+        # ==========================================
         if self.waiting_for_speech_completion:
-            started = (
+            started_at = (
                 self.pending_speech_started_at
                 if self.pending_speech_started
                 else self.pending_speech_requested_at
@@ -1183,21 +1329,57 @@ class HRIManagerNode(Node):
             )
 
             if (
-                started is not None
-                and now - started >= timeout
+                started_at is not None
+                and now - started_at >= timeout
             ):
                 self._request_audio_reconciliation(
                     "ROBOT_SPEECH_TIMEOUT"
                 )
+
             return
 
+        # ==========================================
+        # E. MOCK HUMAN TIMEOUT
+        # ==========================================
+        if self.mock_response_enabled:
+            if (
+                self.waiting_for_human
+                and self.interaction_started_at is not None
+                and now - self.interaction_started_at
+                    >= self.active_response_timeout
+            ):
+                self._handle_timeout()
+
+            return
+
+        # ==========================================
+        # F. REAL AUDIO TURN DEADLINE
+        # ==========================================
         if (
-            self.waiting_for_human
-            and self.interaction_started_at is not None
-            and now - self.interaction_started_at
-            >= self.active_response_timeout
+            not self._audio_turn
+            or self._audio_deadline is None
+            or now < self._audio_deadline
         ):
+            return
+
+        # A genuine absence of speech is human silence.
+        if self._audio_phase == "LISTENING":
             self._handle_timeout()
+            return
+
+        # Every other audio-phase timeout is technical,
+        # not human silence and not a refusal.
+        self.get_logger().error(
+            "[HRI ASR] Phase timeout | "
+            f"phase={self._audio_phase}"
+        )
+
+        self._report_audio_event(
+            "DIALOGUE_REQUEST_REJECTED"
+        )
+
+        self._reset_interaction()
+        
     # =========================================================
     # Timeout
     # =========================================================
@@ -1286,23 +1468,42 @@ class HRIManagerNode(Node):
         modality,
     ):
         """
-        Process a human response in the currently open window.
+        Process the current ROS4HRI response.
 
-        UNKNOWN records incomprehension but does not
-        immediately terminate the interaction.
+        During a directional dialogue, distinguish:
+          - "No" = negative answer;
+          - "No, on your left/right" = correction of the
+            robot's directional interpretation.
+
+        Preserve the original utterance and the exact
+        interaction/request identifiers.
+
+        This method never authorizes navigation.
         """
-
         if not self.enabled:
             return
 
-        if not self.waiting_for_human:
+        if (
+            not self.mock_response_enabled
+            and self._audio_phase != "RESULT"
+        ):
             self.get_logger().warning(
-                "[HRI] Intent ignored: no human response window."
+                "[HRI] Intent ignored outside validated ASR result"
             )
             return
 
-        if not self.active_interaction_id:
+        if (
+            not self.waiting_for_human
+            or not self.active_interaction_id
+        ):
+            self.get_logger().warning(
+                "[HRI] Intent ignored: no human response window"
+            )
             return
+
+        # ----------------------------------------------
+        # 1. Preserve normal intent processing
+        # ----------------------------------------------
 
         hri_intent = self.hri_manager.process_intent(
             intent=intent,
@@ -1319,42 +1520,110 @@ class HRIManagerNode(Node):
             hri_intent.intent or "UNKNOWN"
         ).strip().upper()
 
-        if normalized_intent == "UNKNOWN":
+        output_direction = str(
+            hri_intent.direction or "NONE"
+        ).strip().upper()
 
+        # ----------------------------------------------
+        # 2. Detect corrections only in directional turns
+        # ----------------------------------------------
+
+        request_type = (
+            str(self.active_request.request_type or "")
+            .strip()
+            .upper()
+            if self.active_request is not None
+            else ""
+        )
+
+        directional_turn = request_type in {
+            "DIRECTION_REFERENCE_CLARIFICATION",
+            "DIRECTION_FINAL_CONFIRMATION",
+        }
+
+        original_utterance = str(
+            hri_intent.utterance or utterance or ""
+        ).strip()
+
+        if directional_turn:
+            normalized_text = re.sub(
+                r"[,.!?;:]+",
+                " ",
+                original_utterance.lower(),
+            )
+
+            normalized_text = " ".join(
+                normalized_text.split()
+            )
+
+            # The negation corrects the proposed side.
+            # It is not a denial of passage.
+            #
+            # Match the complete utterance to avoid
+            # confusing longer, unrelated sentences.
+            correction = re.fullmatch(
+                r"no\s+(?:on\s+)?your\s+(left|right)",
+                normalized_text,
+            )
+
+            if correction is not None:
+                corrected_direction = (
+                    correction.group(1).upper()
+                )
+
+                normalized_intent = (
+                    "REQUEST_LEFT"
+                    if corrected_direction == "LEFT"
+                    else "REQUEST_RIGHT"
+                )
+
+                output_direction = corrected_direction
+
+                self.get_logger().info(
+                    "[HRI DIRECTION] Contextual correction | "
+                    f"request_type={request_type} | "
+                    f"direction={corrected_direction} | "
+                    "reference=ROBOT | "
+                    "passage_denied=False"
+                )
+
+        # ----------------------------------------------
+        # 3. Preserve UNKNOWN handling
+        # ----------------------------------------------
+
+        if normalized_intent == "UNKNOWN":
             self.unrecognized_response_received = True
 
-            recognized_text = str(
-                hri_intent.utterance or utterance or ""
-            ).strip()
-
-            if recognized_text:
+            if original_utterance:
                 self.last_unrecognized_utterance = (
-                    recognized_text
+                    original_utterance
                 )
 
             self.get_logger().warning(
                 "[HRI] HUMAN_RESPONSE_UNRECOGNIZED | "
                 f"interaction={self.active_interaction_id} | "
-                f"utterance={recognized_text!r}"
+                f"utterance={original_utterance!r}"
             )
 
-            # Keep the response window open.
-            # Do not restart the timeout.
+            self._handle_timeout()
             return
+
+        # ----------------------------------------------
+        # 4. Publish the recognized response
+        # ----------------------------------------------
 
         interaction_id = self.active_interaction_id
 
         self.waiting_for_human = False
-
         self._set_asr_listening(False)
 
         self._publish_human_intent(
-            intent=hri_intent.intent,
-            direction=hri_intent.direction,
+            intent=normalized_intent,
+            direction=output_direction,
             target=hri_intent.target,
             constraint=hri_intent.constraint,
             confidence=hri_intent.confidence,
-            utterance=hri_intent.utterance,
+            utterance=original_utterance,
             source=hri_intent.source,
             modality=hri_intent.modality,
         )
@@ -1362,11 +1631,12 @@ class HRIManagerNode(Node):
         self.get_logger().info(
             "[HRI] HUMAN_INTENT_ACCEPTED | "
             f"interaction={interaction_id} | "
-            f"intent={normalized_intent}"
+            f"intent={normalized_intent} | "
+            f"direction={output_direction}"
         )
 
         self._reset_interaction()
-        
+
     # =========================================================
     # HumanIntent
     # =========================================================
@@ -1712,7 +1982,278 @@ class HRIManagerNode(Node):
 
         # Deliberately NOT reset:
         # self.audio_uncertain_decision_id
-        
+
+    def _initialize_audio_turn_protocol(self):
+        """Initialize the ASR turn protocol and optional audible cue."""
+
+        # Default to the existing audible-cue behavior.
+        if not self.has_parameter("turn_cue_enabled"):
+            self.declare_parameter("turn_cue_enabled", True)
+
+        self.turn_cue_enabled = self.get_parameter(
+            "turn_cue_enabled"
+        ).value
+
+        defaults = {
+            "asr_onset_timeout_sec": 5.0,
+            "asr_ready_timeout_sec": 3.0,
+            "asr_utterance_timeout_sec": 10.0,
+            "asr_transcription_timeout_sec": 10.0,
+            "asr_intent_timeout_sec": 3.0,
+            "asr_voice_id": "pc_user",
+        }
+
+        for name, default in defaults.items():
+            self.declare_parameter(name, default)
+            value = self.get_parameter(name).value
+
+            if name == "asr_voice_id":
+                value = str(value).strip()
+                if not value:
+                    raise ValueError("asr_voice_id must not be empty")
+            else:
+                value = float(value)
+                if not math.isfinite(value) or value <= 0.0:
+                    raise ValueError(
+                        f"{name} must be finite and positive"
+                    )
+
+            setattr(self, name, value)
+
+        self._audio_turn = None
+        self._audio_phase = "IDLE"
+        self._audio_deadline = None
+        self._audio_last_sequence = 0
+        self._audio_with_cue = False
+
+        self._audio_command_pub = self.create_publisher(
+            String,
+            "/hri/asr_turn_command",
+            10,
+        )
+
+        self._audio_status_sub = self.create_subscription(
+            String,
+            "/hri/asr_turn_status",
+            self._audio_turn_status_callback,
+            20,
+        )
+
+        self._validated_speech_pub = self.create_publisher(
+            LiveSpeech,
+            f"/humans/voices/{self.asr_voice_id}/speech",
+            10,
+        )
+
+    def _send_audio_command(self, command):
+        """Send a command for the currently owned audio turn."""
+        if not self._audio_turn:
+            return
+
+        payload = dict(self._audio_turn)
+        payload.update(
+            version=1,
+            command=command,
+        )
+
+        self._audio_command_pub.publish(
+            String(data=json.dumps(payload))
+        )
+
+    def _prepare_audio_turn(self, *, with_cue):
+        """Request capture readiness for one exact dialogue request."""
+        if (
+            not self.active_interaction_id
+            or self.active_request is None
+        ):
+            return
+
+        if self._audio_turn:
+            return
+
+        request_id = str(
+            self.active_request.request_id or ""
+        ).strip()
+
+        if not request_id:
+            self._report_audio_event(
+                "DIALOGUE_REQUEST_REJECTED"
+            )
+            self._reset_interaction()
+            return
+
+        self._audio_turn = {
+            "turn_id": uuid.uuid4().hex,
+            "interaction_id": str(self.active_interaction_id),
+            "request_id": request_id,
+        }
+
+        self._audio_last_sequence = 0
+        self._audio_with_cue = with_cue
+        self._audio_phase = "PREPARING"
+
+        self._audio_deadline = (
+            time.monotonic()
+            + self.asr_ready_timeout_sec
+        )
+
+        self._send_audio_command("PREPARE")
+
+    def _audio_turn_status_callback(self, msg):
+        """Accept progress and results only from the current audio turn."""
+        try:
+            data = json.loads(msg.data)
+
+            if (
+                not isinstance(data, dict)
+                or data.get("version") != 1
+            ):
+                return
+
+            if (
+                not self._audio_turn
+                or any(
+                    data.get(key) != value
+                    for key, value in self._audio_turn.items()
+                )
+            ):
+                return
+
+            sequence = int(data.get("sequence", 0))
+
+            if sequence <= self._audio_last_sequence:
+                return
+
+            state = str(data.get("state", ""))
+
+        except (ValueError, TypeError, AttributeError):
+            return
+
+        self._audio_last_sequence = sequence
+
+        now = time.monotonic()
+        phase = self._audio_phase
+
+        if state == "READY" and phase == "PREPARING":
+            self._audio_phase = "READY"
+            self._audio_deadline = None
+
+            self.get_logger().info(
+                "[HRI ASR] Capture ready before turn cue"
+            )
+
+            if self._audio_with_cue:
+                # The microphone may be ready while the robot is still speaking.
+                # Wait until question COMPLETED and anti-echo guard elapsed.
+                if self._turn_cue_authorized:
+                    self._emit_turn_cue()
+            else:
+                self._open_human_response_window()
+
+        elif state == "LISTENING" and phase == "OPENING":
+            self._audio_phase = "LISTENING"
+            self.interaction_started_at = now
+
+            self._audio_deadline = now + min(
+                self.active_response_timeout,
+                self.asr_onset_timeout_sec,
+            )
+
+        elif (
+            state == "SPEECH_STARTED"
+            and phase == "LISTENING"
+        ):
+            self._audio_phase = "RECORDING"
+
+            self._audio_deadline = (
+                now + self.asr_utterance_timeout_sec
+            )
+
+        elif (
+            state == "TRANSCRIBING"
+            and phase == "RECORDING"
+        ):
+            self._audio_phase = "TRANSCRIBING"
+
+            self._audio_deadline = (
+                now + self.asr_transcription_timeout_sec
+            )
+
+        elif state == "RESULT" and phase == "TRANSCRIBING":
+            text = str(data.get("text", "")).strip()
+
+            try:
+                confidence = float(
+                    data.get("confidence", 0.0)
+                )
+            except (ValueError, TypeError):
+                confidence = float("nan")
+
+            if (
+                not text
+                or not math.isfinite(confidence)
+            ):
+                self.unrecognized_response_received = True
+                self._handle_timeout()
+                return
+
+            self._audio_phase = "RESULT"
+
+            self._audio_deadline = (
+                now + self.asr_intent_timeout_sec
+            )
+
+            language = str(data.get("language", ""))
+
+            speech = LiveSpeech()
+            speech.header.stamp = self.get_clock().now().to_msg()
+            speech.incremental = ""
+            speech.final = text
+            speech.confidence = max(
+                0.0,
+                min(confidence, 1.0),
+            )
+
+            speech.locale = {
+                "fr": "fr_FR",
+                "en": "en_US",
+                "es": "es_ES",
+            }.get(language, language)
+
+            speech.language = language
+
+            self._validated_speech_pub.publish(speech)
+
+        elif (
+            state == "EMPTY"
+            and phase in {
+                "RECORDING",
+                "TRANSCRIBING",
+            }
+        ):
+            self.unrecognized_response_received = True
+            self._handle_timeout()
+
+        elif state == "FAILED":
+            self.get_logger().error(
+                "[HRI ASR] Capture failed | "
+                f"reason={data.get('reason', '')}"
+            )
+
+            self._report_audio_event(
+                "DIALOGUE_REQUEST_REJECTED"
+            )
+            self._reset_interaction()
+
+        else:
+            return
+
+        self.get_logger().info(
+            "[HRI ASR] "
+            f"state={state} | "
+            f"turn={data.get('turn_id')}"
+        )
+
 def main(args=None):
     rclpy.init(args=args)
 

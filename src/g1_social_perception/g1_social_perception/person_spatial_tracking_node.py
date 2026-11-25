@@ -1,349 +1,350 @@
+
+#!/usr/bin/env python3
 """
-Maintain spatial state for already identified persons.
+person_spatial_tracking_node.py
 
-Responsibility:
-    Consume 3D person detections expressed in base_footprint and maintain
-    persistent spatial state for each person ID.
+Adapt the new identified PersonDetectionArray to the existing
+social tracking outputs.
 
-Flow:
-    INPUT
-        /yolo/detections_3d_base
-            ↓
-    VALIDATION
-            ↓
-    TRACK STATE UPDATE
-            ↓
-    VELOCITY ESTIMATION
-            ↓
-    TRACK STATE CLASSIFICATION
-            ↓
-    RESULT OBJECTS
-            ↓
-    OUTPUT
-        /social_perception/tracked_persons
+INPUT
+    /social_perception/detections_identified
+        g1_social_msgs/msg/PersonDetectionArray
 
-This node does not perform:
-    - YOLO detection,
-    - 2D identity association,
-    - RGB-D fusion,
-    - TF transformation.
+OUTPUTS
+    /social_perception/tracked_persons_odom
+        g1_social_msgs/msg/TrackedPersonArray
 
-Those responsibilities belong to earlier pipeline stages.
+    /social_perception/tracked_persons
+        g1_social_msgs/msg/TrackedPersonArray
+
+IDENTITY
+    Identity is exclusively assigned by person_tracking.
+    This node never creates, matches or confirms identities.
+
+GEOMETRY
+    Only actual, valid position observations enter motion estimates.
+    Missing positions do not become zero-position observations.
+    Historical tracks never refresh their observation timestamps.
+    Robot-frame transforms use the source observation timestamp.
+
+SOCIAL CONTRACT
+    TrackedPersonArray preserves:
+      tracking_session_id
+      source_detection_count
+      source_observation_complete
+
+    Each TrackedPerson preserves:
+      id, identity_generation
+      last_observation_stamp
+      observed_in_current_array
+      tracking_state
+      position, velocity, velocity_valid
+      observation_count
 """
 
+import copy
 import math
-from dataclasses import dataclass
-from typing import Dict, Optional
 import time
-import rclpy
+from dataclasses import dataclass
 
+import rclpy
+from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.time import Time
 
-from yolo_msgs.msg import DetectionArray
+from tf2_ros import (
+    Buffer,
+    TransformException,
+    TransformListener,
+)
 
 from g1_social_msgs.msg import (
+    FeatureMetadata,
+    PersonDetectionArray,
     TrackedPerson,
     TrackedPersonArray,
 )
 
-from g1_qos_manager.diagnostics import log_qos_resolution
+from g1_social_perception.mathematical_model.geometry import (
+    rotation_from_quaternion,
+)
+
 from g1_qos_manager.profiles import reliable_qos
 from g1_qos_manager.resolver import resolve_subscription_qos
+from g1_qos_manager.diagnostics import log_qos_resolution
 
 
-# =============================================================================
-# RESULT OBJECTS / INTERNAL STATE
-# =============================================================================
+# ============================================================================
+# DATA / VALIDATION
+# ============================================================================
 
+VALID_IDENTITY_STATES = frozenset({
+    "NEW",
+    "MATCHED",
+    "RETURNING",
+    "AMBIGUOUS",
+    "INSUFFICIENT",
+})
+
+
+def stamp_ns(stamp):
+    sec = int(stamp.sec)
+    nanosec = int(stamp.nanosec)
+
+    if sec < 0 or not 0 <= nanosec < 1_000_000_000:
+        raise ValueError("INVALID_TIMESTAMP")
+
+    result = sec * 1_000_000_000 + nanosec
+
+    if result <= 0:
+        raise ValueError("ZERO_TIMESTAMP")
+
+    return result
+
+
+def finite_vector(values):
+    vector = tuple(float(value) for value in values)
+
+    if len(vector) != 3 or not all(
+        math.isfinite(value) for value in vector
+    ):
+        raise ValueError("INVALID_VECTOR")
+
+    return vector
+
+
+def rotate(matrix, vector):
+    return tuple(
+        sum(matrix[i][j] * vector[j] for j in range(3))
+        for i in range(3)
+    )
+
+
+def transform_pose(transform):
+    """
+    Read base_footprint <- odom from a timestamped TF.
+
+    Position: p_base = R * p_odom + t
+    Velocity: v_base = R * v_odom
+    """
+
+    q = transform.transform.rotation
+    t = transform.transform.translation
+
+    rotation = rotation_from_quaternion(
+        float(q.x),
+        float(q.y),
+        float(q.z),
+        float(q.w),
+    )
+
+    translation = finite_vector((t.x, t.y, t.z))
+
+    return rotation, translation
+
+
+def position_measurement(candidate, *, source_ns, frame):
+    """
+    Read only a genuine AVAILABLE odom position.
+
+    An unavailable or zero-quality feature is not valid geometry.
+    """
+
+    metadata = candidate.position.metadata
+
+    if (
+        metadata.status != FeatureMetadata.AVAILABLE
+        or metadata.quality <= 0.0
+    ):
+        return None
+
+    if metadata.header.frame_id != frame:
+        raise ValueError("POSITION_FRAME_MISMATCH")
+
+    if stamp_ns(metadata.header.stamp) != source_ns:
+        raise ValueError("POSITION_SOURCE_TIMESTAMP_MISMATCH")
+
+    if not (
+        math.isfinite(float(metadata.quality))
+        and 0.0 < metadata.quality <= 1.0
+    ):
+        raise ValueError("INVALID_POSITION_QUALITY")
+
+    p = candidate.position.value
+
+    return finite_vector((p.x, p.y, p.z))
+
+
+# ============================================================================
+# DATA / TRACK RECORD
+# ============================================================================
 
 @dataclass
-class SpatialTrackState:
-    """
-    Store spatial history for one persistent person ID.
-
-    Attributes:
-        person_id:
-            Persistent identifier inherited from person_tracking_node.
-
-        class_id:
-            Semantic detector class ID.
-
-        class_name:
-            Semantic detector class name.
-
-        confidence:
-            Latest detector confidence.
-
-        x, y, z:
-            Latest position in target frame.
-
-        last_observation_stamp_sec:
-            ROS timestamp carried by the latest spatial observation.
-            Used only for velocity and motion estimation.
-
-        last_update_ros_sec:
-            ROS node time at which the latest observation was processed.
-            Used only for TRACKED / LOST / DELETE lifecycle management.
-
-        vx, vy, vz:
-            Current filtered velocity estimate.
-
-        observation_count:
-            Number of successful spatial observations.
-    """
-
+class SpatialTrack:
     person_id: str
+    generation: int
+    confirmed: bool
 
     class_id: int
     class_name: str
     confidence: float
 
-    x: float
-    y: float
-    z: float
+    position: tuple
+    velocity: tuple
+    velocity_valid: bool
 
-    # Timestamp carried by the spatial observation.
-    # Used only for motion/velocity estimation.
-    last_observation_stamp_sec: float
+    stamp_ns: int
+    received_monotonic: float
 
-    # ROS time at which this track was last received by this node.
-    # Used only for lifecycle management.
-    last_update_ros_sec: float
+    observation_count: int
 
-    vx: float = 0.0
-    vy: float = 0.0
-    vz: float = 0.0
+    # Historical base-frame coordinates correspond to the same
+    # original source timestamp as position and stamp_ns.
+    base_position: object = None
+    base_velocity: object = None
 
-    observation_count: int = 1
 
-# =============================================================================
-# NODE
-# =============================================================================
-
+# ============================================================================
+# ROS NODE
+# ============================================================================
 
 class PersonSpatialTrackingNode(Node):
-    """
-    Maintain spatial motion state for person IDs.
-
-    Input:
-        /yolo/detections_3d_base
-
-    Output:
-        /social_perception/tracked_persons
-    """
 
     def __init__(self):
-        super().__init__(
-            "person_spatial_tracking"
+        super().__init__("person_spatial_tracking")
+
+        self._configure()
+        self._initialize_state()
+        self._create_interfaces()
+
+        self.get_logger().info(
+            "[SPATIAL] "
+            f"input={self.input_topic} | "
+            f"odom_output={self.odom_topic} | "
+            f"robot_output={self.output_topic} | "
+            "identity=INHERITED"
         )
 
-        # =====================================================================
-        # INPUT / CONFIGURATION
-        # =====================================================================
+    # ========================================================================
+    # DATA / CONFIGURATION
+    # ========================================================================
 
-        self.declare_parameter(
+    def _configure(self):
+        def parameter(name, default):
+            return self.declare_parameter(name, default).value
+
+        self.input_topic = parameter(
             "input_topic",
-            "/yolo/detections_3d_base",
+            "/social_perception/detections_identified",
         )
 
-        self.declare_parameter(
+        self.odom_topic = parameter(
+            "odom_output_topic",
+            "/social_perception/tracked_persons_odom",
+        )
+
+        self.output_topic = parameter(
             "output_topic",
             "/social_perception/tracked_persons",
         )
 
-        self.declare_parameter(
-            "expected_frame",
-            "base_footprint",
+        self.expected_frame = parameter("expected_frame", "odom")
+        self.robot_frame = parameter(
+            "robot_frame", "base_footprint"
         )
 
-        self.declare_parameter(
-            "person_class_id",
-            0,
+        self.alpha = float(
+            parameter("velocity_filter_alpha", 0.35)
+        )
+        self.min_dt = float(
+            parameter("minimum_velocity_dt_sec", 0.02)
+        )
+        self.max_dt = float(
+            parameter("maximum_velocity_dt_sec", 1.0)
+        )
+        self.max_speed = float(
+            parameter("maximum_speed_mps", 4.0)
         )
 
-        self.declare_parameter(
-            "velocity_filter_alpha",
-            0.35,
+        self.freshness = float(
+            parameter("observation_freshness_timeout_sec", 1.0)
+        )
+        self.retention = float(
+            parameter("delete_timeout_sec", 5.0)
+        )
+        self.tf_timeout = float(
+            parameter("transform_timeout_sec", 0.05)
         )
 
-        self.declare_parameter(
-            "minimum_velocity_dt_sec",
-            0.02,
-        )
-
-        self.declare_parameter(
-            "maximum_velocity_dt_sec",
-            1.00,
-        )
-
-        self.declare_parameter(
-            "minimum_tracking_observations",
-            3,
-        )
-
-        self.declare_parameter(
-            "lost_timeout_sec",
-            3.0,
-        )
-
-        self.declare_parameter(
-            "delete_timeout_sec",
-            5.0,
-        )
-
-        self.declare_parameter(
-            "maximum_speed_mps",
-            4.0,
-        )
-
-        self.declare_parameter(
-            "publish_frequency_hz",
-            15.0,
-        )
-
-        self.input_topic = (
-            self.get_parameter("input_topic")
-            .get_parameter_value()
-            .string_value
-        )
-
-        self.output_topic = (
-            self.get_parameter("output_topic")
-            .get_parameter_value()
-            .string_value
-        )
-
-        self.expected_frame = (
-            self.get_parameter("expected_frame")
-            .get_parameter_value()
-            .string_value
-        )
-
-        self.person_class_id = (
-            self.get_parameter("person_class_id")
-            .get_parameter_value()
-            .integer_value
-        )
-
-        self.velocity_filter_alpha = (
-            self.get_parameter("velocity_filter_alpha")
-            .get_parameter_value()
-            .double_value
-        )
-
-        self.minimum_velocity_dt_sec = (
-            self.get_parameter("minimum_velocity_dt_sec")
-            .get_parameter_value()
-            .double_value
-        )
-
-        self.maximum_velocity_dt_sec = (
-            self.get_parameter("maximum_velocity_dt_sec")
-            .get_parameter_value()
-            .double_value
-        )
-
-        self.minimum_tracking_observations = (
-            self.get_parameter("minimum_tracking_observations")
-            .get_parameter_value()
-            .integer_value
-        )
-
-        self.lost_timeout_sec = (
-            self.get_parameter("lost_timeout_sec")
-            .get_parameter_value()
-            .double_value
-        )
-
-        self.delete_timeout_sec = (
-            self.get_parameter("delete_timeout_sec")
-            .get_parameter_value()
-            .double_value
-        )
-
-        self.maximum_speed_mps = (
-            self.get_parameter("maximum_speed_mps")
-            .get_parameter_value()
-            .double_value
-        )
-
-        self.publish_frequency_hz = (
-            self.get_parameter("publish_frequency_hz")
-            .get_parameter_value()
-            .double_value
-        )
-
-        # =====================================================================
-        # VALIDATION
-        # =====================================================================
-
-        self.velocity_filter_alpha = max(
-            0.0,
-            min(
-                1.0,
-                self.velocity_filter_alpha,
-            ),
-        )
-
-        if self.publish_frequency_hz <= 0.0:
-            self.publish_frequency_hz = 15.0
-
-        # =====================================================================
-        # INTERNAL STATE
-        # =====================================================================
-
-        self.tracks: Dict[
-            str,
-            SpatialTrackState,
-        ] = {}
-
-        # ================================================================
-        # OBSERVATION PROVENANCE
-        # ================================================================
-
-        self.last_input_stamp = None
-        self.last_input_stamp_ns = None
-        self.last_input_received_monotonic = None
-
-        self.new_observation_pending = False
-
-        self.accepted_observation_arrays = 0
-        self.empty_observation_arrays = 0
-        self.rejected_observation_timestamps = 0
-        self.stale_observation_cycles = 0
-
-        self.declare_parameter(
-            "observation_freshness_timeout_sec",
-            1.0,
-        )
-
-        self.observation_freshness_timeout_sec = float(
-            self.get_parameter(
-                "observation_freshness_timeout_sec"
-            ).value
+        self.log_period = float(
+            parameter("log_period_sec", 5.0)
         )
 
         if (
-            not math.isfinite(self.observation_freshness_timeout_sec)
-            or self.observation_freshness_timeout_sec <= 0.0
-        ):
-            raise ValueError(
-                "observation_freshness_timeout_sec must be positive and finite"
+            not all(
+                math.isfinite(value)
+                for value in (
+                    self.alpha,
+                    self.min_dt,
+                    self.max_dt,
+                    self.max_speed,
+                    self.freshness,
+                    self.retention,
+                    self.tf_timeout,
+                    self.log_period,
+                )
             )
+            or not 0.0 < self.alpha <= 1.0
+            or not 0.0 < self.min_dt <= self.max_dt
+            or min(
+                self.max_speed,
+                self.freshness,
+                self.retention,
+                self.log_period,
+            ) <= 0.0
+            or not 0.0 <= self.tf_timeout < self.freshness
+            or self.expected_frame != "odom"
+            or self.robot_frame != "base_footprint"
+        ):
+            raise ValueError("INVALID_SPATIAL_CONFIGURATION")
 
-        self.arrays_received = 0
-        self.persons_received = 0
-        self.valid_updates = 0
+        if len({
+            self.input_topic,
+            self.odom_topic,
+            self.output_topic,
+        }) != 3:
+            raise ValueError("SPATIAL_TOPIC_COLLISION")
 
-        self.invalid_id = 0
-        self.invalid_position = 0
-        self.invalid_frame = 0
-        self.rejected_velocity = 0
+    # ========================================================================
+    # DATA / STATE
+    # ========================================================================
 
-        # =====================================================================
-        # QOS
-        # =====================================================================
+    def _initialize_state(self):
+        self.session = ""
+        self.retired_sessions = set()
+
+        self.last_source_ns = 0
+        self.last_source_sequence = 0
+
+        self.tracks = {}
+
+        self.accepted = 0
+        self.rejected = 0
+        self.tf_failures = 0
+        self.velocity_rejected = 0
+        self.odom_published = 0
+        self.base_published = 0
+
+    # ========================================================================
+    # ROS INTERFACES
+    # ========================================================================
+
+    def _create_interfaces(self):
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(
+            self.tf_buffer,
+            self,
+        )
 
         input_qos = resolve_subscription_qos(
             self,
@@ -358,681 +359,644 @@ class PersonSpatialTrackingNode(Node):
             input_qos,
         )
 
-        output_qos = reliable_qos(
-            depth=10,
-        )
-
-        # =====================================================================
-        # ROS INTERFACES
-        # =====================================================================
-
-        self.subscription = self.create_subscription(
-            DetectionArray,
-            self.input_topic,
-            self.detections_callback,
-            input_qos,
+        self.odom_publisher = self.create_publisher(
+            TrackedPersonArray,
+            self.odom_topic,
+            reliable_qos(depth=10),
         )
 
         self.publisher = self.create_publisher(
             TrackedPersonArray,
             self.output_topic,
-            output_qos,
+            reliable_qos(depth=10),
         )
 
-        self.publish_timer = self.create_timer(
-            1.0 / self.publish_frequency_hz,
-            self.publish_tracks,
+        self.subscription = self.create_subscription(
+            PersonDetectionArray,
+            self.input_topic,
+            self.detections_callback,
+            input_qos,
+        )
+
+        # Maintenance never generates new source observations.
+        self.maintenance_timer = self.create_timer(
+            0.5,
+            self.expire_tracks,
         )
 
         self.diagnostics_timer = self.create_timer(
-            5.0,
+            self.log_period,
             self.log_diagnostics,
         )
 
-        # =====================================================================
-        # OUTPUT / REPORTING
-        # =====================================================================
+    # ========================================================================
+    # INPUT / VALIDATION
+    # ========================================================================
 
-        self.get_logger().info("")
-        self.get_logger().info("=" * 82)
-        self.get_logger().info(
-            "  PERSON SPATIAL TRACKING - INITIALIZATION"
-        )
-        self.get_logger().info("=" * 82)
+    def fresh(self, source_ns):
+        age = (
+            self.get_clock().now().nanoseconds - source_ns
+        ) / 1e9
 
-        self.get_logger().info(
-            f"  Input topic                  : {self.input_topic}"
-        )
+        return -0.10 <= age <= self.freshness
 
-        self.get_logger().info(
-            f"  Output topic                 : {self.output_topic}"
-        )
+    def _validate_input(self, msg):
+        if not isinstance(msg, PersonDetectionArray):
+            raise ValueError("INVALID_MESSAGE_TYPE")
 
-        self.get_logger().info(
-            f"  Expected frame               : {self.expected_frame}"
-        )
-
-        self.get_logger().info(
-            f"  Velocity filter alpha        : "
-            f"{self.velocity_filter_alpha:.2f}"
-        )
-
-        self.get_logger().info(
-            f"  Minimum observations         : "
-            f"{self.minimum_tracking_observations}"
-        )
-
-        self.get_logger().info(
-            f"  Lost timeout                 : "
-            f"{self.lost_timeout_sec:.2f} s"
-        )
-
-        self.get_logger().info(
-            f"  Delete timeout               : "
-            f"{self.delete_timeout_sec:.2f} s"
-        )
-
-        self.get_logger().info(
-            f"  Maximum plausible speed      : "
-            f"{self.maximum_speed_mps:.2f} m/s"
-        )
-
-        self.get_logger().info("-" * 82)
-
-    # =========================================================================
-    # COLLECTION
-    # =========================================================================
-
-    def detections_callback(
-        self,
-        msg: DetectionArray,
-    ) -> None:
-        """
-        Accept only new and valid spatial observations.
-
-        An accepted empty DetectionArray is an observation without
-        transformed persons, not proof that the entire scene is clear.
-        """
-
-        self.arrays_received += 1
+        if (
+            msg.processing_stage != PersonDetectionArray.IDENTITY
+            or not msg.identity_evaluated
+            or not str(msg.tracking_session_id).strip()
+        ):
+            raise ValueError("EXPECTED_IDENTIFIED_STAGE")
 
         if msg.header.frame_id != self.expected_frame:
-            self.invalid_frame += 1
+            raise ValueError("EXPECTED_ODOM_FRAME")
 
-            self.get_logger().warning(
-                "[SPATIAL TRACKING] Unexpected frame "
-                f"{msg.header.frame_id!r}; "
-                f"expected {self.expected_frame!r}",
-                throttle_duration_sec=2.0,
-            )
-            return
+        source_ns = stamp_ns(msg.header.stamp)
 
-        stamp = msg.header.stamp
-        stamp_sec = int(stamp.sec)
-        stamp_nanosec = int(stamp.nanosec)
+        if source_ns != stamp_ns(msg.image_header.stamp):
+            raise ValueError("IMAGE_SOURCE_TIMESTAMP_MISMATCH")
+
+        if not self.fresh(source_ns):
+            raise ValueError("SOURCE_NOT_FRESH")
+
+        session = str(msg.tracking_session_id).strip()
+
+        if session in self.retired_sessions:
+            raise ValueError("RETIRED_TRACKING_SESSION")
+
+        if session == self.session:
+            if (
+                source_ns <= self.last_source_ns
+                or int(msg.source_sequence)
+                <= self.last_source_sequence
+            ):
+                raise ValueError("DUPLICATE_OR_REVERSED_SOURCE")
+
+        if int(msg.source_sequence) < 1:
+            raise ValueError("INVALID_SOURCE_SEQUENCE")
 
         if (
-            stamp_sec < 0
-            or stamp_nanosec < 0
-            or stamp_nanosec >= 1_000_000_000
+            int(msg.source_detection_count)
+            != len(msg.candidates)
         ):
-            self.rejected_observation_timestamps += 1
-            return
+            raise ValueError("SOURCE_COUNT_MISMATCH")
 
-        stamp_ns = (
-            stamp_sec * 1_000_000_000
-            + stamp_nanosec
-        )
-
-        if (
-            stamp_ns <= 0
-            or (
-                self.last_input_stamp_ns is not None
-                and stamp_ns <= self.last_input_stamp_ns
-            )
-        ):
-            self.rejected_observation_timestamps += 1
-
-            self.get_logger().warning(
-                "[SPATIAL TRACKING] Duplicate, invalid "
-                "or out-of-order observation timestamp",
-                throttle_duration_sec=2.0,
-            )
-            return
-
+        indices = set()
+        person_ids = set()
         accepted = []
-        seen_ids = set()
 
-        for detection in msg.detections:
-            if detection.class_id != self.person_class_id:
+        for candidate in msg.candidates:
+            index = int(candidate.source_index)
+
+            if index in indices:
+                raise ValueError("DUPLICATE_CANDIDATE_INDEX")
+
+            indices.add(index)
+
+            identity_state = str(candidate.identity_state)
+            person_id = str(candidate.person_id).strip()
+
+            if identity_state not in VALID_IDENTITY_STATES:
+                raise ValueError("INVALID_IDENTITY_STATE")
+
+            if identity_state in {
+                "AMBIGUOUS", "INSUFFICIENT"
+            }:
+                if (
+                    person_id
+                    or candidate.identity_confirmed
+                    or int(candidate.identity_generation) != 0
+                ):
+                    raise ValueError("UNRESOLVED_IDENTITY_HAS_KEY")
                 continue
 
-            self.persons_received += 1
-
-            person_id = str(detection.id).strip()
-
-            if not person_id or person_id in seen_ids:
-                self.invalid_id += 1
-                self.get_logger().warning(
-                    "[SPATIAL TRACKING] Invalid or duplicate person ID",
-                    throttle_duration_sec=2.0,
-                )
-                return
-
-            position = detection.bbox3d.center.position
-
-            if not self._is_valid_position(
-                position.x,
-                position.y,
-                position.z,
+            if (
+                not person_id
+                or int(candidate.identity_generation) < 1
+                or person_id in person_ids
             ):
-                self.invalid_position += 1
-                self.get_logger().warning(
-                    "[SPATIAL TRACKING] Invalid 3D position",
-                    throttle_duration_sec=2.0,
-                )
-                return
+                raise ValueError("INVALID_OR_DUPLICATE_IDENTITY")
 
-            if not math.isfinite(float(detection.score)):
-                self.invalid_position += 1
-                return
+            person_ids.add(person_id)
 
-            seen_ids.add(person_id)
-            accepted.append((detection, person_id, position))
-
-        # Commit only after the complete array passes validation.
-        self.last_input_stamp = (
-            stamp_sec,
-            stamp_nanosec,
-        )
-        self.last_input_stamp_ns = stamp_ns
-        self.last_input_received_monotonic = time.monotonic()
-
-        self.accepted_observation_arrays += 1
-
-        if not accepted:
-            self.empty_observation_arrays += 1
-
-        observation_stamp_sec = stamp_ns / 1e9
-
-        for detection, person_id, position in accepted:
-            self._update_spatial_track(
-                person_id=person_id,
-                class_id=detection.class_id,
-                class_name=detection.class_name,
-                confidence=float(detection.score),
-                x=float(position.x),
-                y=float(position.y),
-                z=float(position.z),
-                stamp_sec=observation_stamp_sec,
+            # A valid identity without valid position does not
+            # establish a spatial observation.
+            position = position_measurement(
+                candidate,
+                source_ns=source_ns,
+                frame=self.expected_frame,
             )
 
-            self.valid_updates += 1
+            if position is None:
+                continue
 
-        self.new_observation_pending = True
-
-    # =========================================================================
-    # PROCESSING / TRACK UPDATE
-    # =========================================================================
-
-    def _update_spatial_track(
-        self,
-        person_id: str,
-        class_id: int,
-        class_name: str,
-        confidence: float,
-        x: float,
-        y: float,
-        z: float,
-        stamp_sec: float,
-    ) -> None:
-        """
-        Create or update one spatial person track.
-
-        Inputs:
-            person_id:
-                Persistent identity inherited from the 2D tracker.
-
-            class_id, class_name, confidence:
-                Latest semantic detection information.
-
-            x, y, z:
-                Current spatial observation in expected_frame.
-
-            stamp_sec:
-                ROS timestamp carried by the spatial observation.
-
-        Processing:
-            - Use observation timestamps for velocity estimation.
-            - Use node ROS time for lifecycle management.
-            - Reject physically implausible velocity spikes.
-            - Apply exponential velocity smoothing.
-
-        Output:
-            None.
-
-        Side effects:
-            Creates or updates one SpatialTrackState.
-        """
-
-        now_ros_sec = (
-            self.get_clock()
-            .now()
-            .nanoseconds
-            / 1e9
-        )
-
-        track = self.tracks.get(
-            person_id
-        )
-
-        # -------------------------------------------------------------------------
-        # NEW TRACK
-        # -------------------------------------------------------------------------
-
-        if track is None:
-            self.tracks[
-                person_id
-            ] = SpatialTrackState(
-                person_id=person_id,
-                class_id=class_id,
-                class_name=class_name,
-                confidence=confidence,
-                x=x,
-                y=y,
-                z=z,
-                last_observation_stamp_sec=stamp_sec,
-                last_update_ros_sec=now_ros_sec,
-            )
-
-            return
-
-        # -------------------------------------------------------------------------
-        # OBSERVATION TIME DELTA
-        # -------------------------------------------------------------------------
-
-        dt = (
-            stamp_sec
-            - track.last_observation_stamp_sec
-        )
-
-        filtered_vx = track.vx
-        filtered_vy = track.vy
-        filtered_vz = track.vz
-
-        # -------------------------------------------------------------------------
-        # VELOCITY ESTIMATION
-        # -------------------------------------------------------------------------
-
-        if (
-            self.minimum_velocity_dt_sec
-            <= dt
-            <= self.maximum_velocity_dt_sec
-        ):
-            raw_vx = (
-                x - track.x
-            ) / dt
-
-            raw_vy = (
-                y - track.y
-            ) / dt
-
-            raw_vz = (
-                z - track.z
-            ) / dt
-
-            raw_speed = math.hypot(
-                raw_vx,
-                raw_vy,
-            )
+            detection = candidate.source_detection
+            confidence = float(detection.score)
 
             if (
-                raw_speed
-                <= self.maximum_speed_mps
+                not math.isfinite(confidence)
+                or not 0.0 <= confidence <= 1.0
             ):
-                alpha = (
-                    self.velocity_filter_alpha
+                raise ValueError("INVALID_DETECTION_CONFIDENCE")
+
+            accepted.append(
+                (
+                    candidate,
+                    position,
+                    person_id,
+                    confidence,
                 )
+            )
 
-                filtered_vx = (
-                    alpha * raw_vx
-                    + (1.0 - alpha) * track.vx
-                )
+        return source_ns, session, accepted
 
-                filtered_vy = (
-                    alpha * raw_vy
-                    + (1.0 - alpha) * track.vy
-                )
+    # ========================================================================
+    # PROCESSING / VELOCITY
+    # ========================================================================
 
-                filtered_vz = (
-                    alpha * raw_vz
-                    + (1.0 - alpha) * track.vz
-                )
-
-            else:
-                self.rejected_velocity += 1
-
-        # -------------------------------------------------------------------------
-        # TRACK UPDATE
-        # -------------------------------------------------------------------------
-
-        track.class_id = class_id
-        track.class_name = class_name
-        track.confidence = confidence
-
-        track.x = x
-        track.y = y
-        track.z = z
-
-        track.vx = filtered_vx
-        track.vy = filtered_vy
-        track.vz = filtered_vz
-
-        # Observation time:
-        # only used for motion estimation.
-        track.last_observation_stamp_sec = (
-            stamp_sec
-        )
-
-        # Node ROS time:
-        # only used for track lifecycle management.
-        track.last_update_ros_sec = (
-            now_ros_sec
-        )
-
-        track.observation_count += 1
-
-    # =========================================================================
-    # PROCESSING / TRACK STATE
-    # =========================================================================
-
-    def _get_tracking_state(
+    def motion(
         self,
-        track: SpatialTrackState,
-        now_sec: float,
-    ) -> str:
+        previous,
+        position,
+        generation,
+        source_ns,
+        previous_frame_ns,
+    ):
         """
-        Classify current track lifecycle state.
+        Differentiate two genuine observations in one continuous
+        identity generation.
 
-        Inputs:
-            track:
-                Current spatial track.
-
-            now_sec:
-                Current ROS node time in seconds.
-
-        Output:
-            TENTATIVE:
-                Track has not yet accumulated enough observations.
-
-            TRACKED:
-                Track is confirmed and was recently updated.
-
-            LOST:
-                Track has temporarily stopped receiving observations but
-                remains retained until delete_timeout_sec.
+        An observation gap invalidates the velocity derivative.
         """
 
-        age = max(
-            0.0,
-            now_sec
-            - track.last_update_ros_sec,
+        zero = (0.0, 0.0, 0.0)
+
+        if (
+            previous is None
+            or previous.generation != generation
+            or previous.stamp_ns != previous_frame_ns
+        ):
+            return zero, False, False
+
+        dt = (source_ns - previous.stamp_ns) / 1e9
+
+        if not self.min_dt <= dt <= self.max_dt:
+            return zero, False, False
+
+        measured = tuple(
+            (now - old) / dt
+            for now, old in zip(
+                position, previous.position
+            )
+        )
+
+        speed = math.sqrt(
+            sum(value * value for value in measured)
+        )
+
+        if not math.isfinite(speed) or speed > self.max_speed:
+            return zero, False, True
+
+        if previous.velocity_valid:
+            velocity = tuple(
+                self.alpha * current
+                + (1.0 - self.alpha) * old
+                for current, old in zip(
+                    measured,
+                    previous.velocity,
+                )
+            )
+        else:
+            velocity = measured
+
+        return velocity, True, False
+
+    # ========================================================================
+    # PROCESSING / SOURCE-TIME TF
+    # ========================================================================
+
+    def _lookup_base_transform(self, msg):
+        transform = self.tf_buffer.lookup_transform(
+            self.robot_frame,
+            self.expected_frame,
+            Time.from_msg(msg.header.stamp),
+            timeout=Duration(seconds=self.tf_timeout),
         )
 
         if (
-            age
-            >= self.lost_timeout_sec
+            transform.header.frame_id != self.robot_frame
+            or transform.child_frame_id != self.expected_frame
         ):
-            return "LOST"
+            raise ValueError("BASE_TF_FRAME_MISMATCH")
 
-        if (
-            track.observation_count
-            < self.minimum_tracking_observations
-        ):
-            return "TENTATIVE"
+        return transform_pose(transform)
 
-        return "TRACKED"
+    # ========================================================================
+    # PROCESSING / OBSERVATION
+    # ========================================================================
 
+    def detections_callback(self, msg):
+        try:
+            source_ns, session, accepted = (
+                self._validate_input(msg)
+            )
 
+            changed = session != self.session
 
-    def _remove_expired_tracks(
+            previous_frame_ns = (
+                0 if changed else self.last_source_ns
+            )
+
+            now = time.monotonic()
+
+            # A new tracking session starts a new spatial history.
+            # Retained tracks belong only to their original session.
+            staged = (
+                {}
+                if changed
+                else {
+                    person_id: copy.deepcopy(track)
+                    for person_id, track in self.tracks.items()
+                    if (
+                        0.0 <= (
+                            source_ns - track.stamp_ns
+                        ) / 1e9 <= self.retention
+                        and 0.0 <= (
+                            now - track.received_monotonic
+                        ) <= self.retention
+                    )
+                }
+            )
+
+            projection = None
+
+            if accepted:
+                try:
+                    projection = self._lookup_base_transform(
+                        msg
+                    )
+
+                except (
+                    TransformException,
+                    ValueError,
+                    TypeError,
+                    OverflowError,
+                ) as exc:
+                    self.tf_failures += 1
+                    self.get_logger().warning(
+                        "[SPATIAL TF] "
+                        "base_footprint projection unavailable: "
+                        + str(exc),
+                        throttle_duration_sec=2.0,
+                    )
+
+            if not self.fresh(source_ns):
+                raise ValueError("SOURCE_EXPIRED_DURING_PROCESSING")
+
+            rejected_velocity_count = 0
+
+            for candidate, position, person_id, confidence in accepted:
+                generation = int(
+                    candidate.identity_generation
+                )
+
+                previous = staged.get(person_id)
+
+                velocity, velocity_valid, velocity_rejected = (
+                    self.motion(
+                        previous,
+                        position,
+                        generation,
+                        source_ns,
+                        previous_frame_ns,
+                    )
+                )
+
+                rejected_velocity_count += int(
+                    velocity_rejected
+                )
+
+                count = (
+                    previous.observation_count + 1
+                    if (
+                        previous is not None
+                        and previous.generation == generation
+                    )
+                    else 1
+                )
+
+                detection = candidate.source_detection
+
+                track = SpatialTrack(
+                    person_id=person_id,
+                    generation=generation,
+                    confirmed=bool(
+                        candidate.identity_confirmed
+                    ),
+                    class_id=int(detection.class_id),
+                    class_name=str(
+                        getattr(
+                            detection,
+                            "class_name",
+                            "person",
+                        )
+                    ) or "person",
+                    confidence=confidence,
+                    position=position,
+                    velocity=velocity,
+                    velocity_valid=velocity_valid,
+                    stamp_ns=source_ns,
+                    received_monotonic=now,
+                    observation_count=count,
+                )
+
+                if projection is not None:
+                    rotation, translation = projection
+
+                    rotated_position = rotate(
+                        rotation,
+                        position,
+                    )
+
+                    track.base_position = tuple(
+                        rotated_position[i] + translation[i]
+                        for i in range(3)
+                    )
+
+                    track.base_velocity = rotate(
+                        rotation,
+                        velocity,
+                    )
+
+                staged[person_id] = track
+
+            # Source coverage is not the same as the number
+            # of tracks retained from earlier observations.
+            complete = bool(
+                msg.source_observation_complete
+                and len(accepted) == len(msg.candidates)
+            )
+
+            odom_output = self.build_array(
+                msg=msg,
+                tracks=staged,
+                source_ns=source_ns,
+                complete=complete,
+                robot=False,
+            )
+
+            base_output = None
+
+            if not accepted or projection is not None:
+                base_output = self.build_array(
+                    msg=msg,
+                    tracks=staged,
+                    source_ns=source_ns,
+                    complete=complete,
+                    robot=True,
+                )
+
+            # Commit only after successful validation and
+            # construction of the output messages.
+            if changed and self.session:
+                self.retired_sessions.add(self.session)
+
+            self.tracks = staged
+            self.session = session
+            self.last_source_ns = source_ns
+            self.last_source_sequence = int(
+                msg.source_sequence
+            )
+
+            self.accepted += 1
+            self.velocity_rejected += rejected_velocity_count
+
+            self.odom_publisher.publish(odom_output)
+            self.odom_published += 1
+
+            if base_output is not None:
+                self.publisher.publish(base_output)
+                self.base_published += 1
+
+            if changed:
+                self.get_logger().info(
+                    "[SPATIAL] Inherited identity session="
+                    + self.session
+                )
+
+        except (
+            ValueError,
+            TypeError,
+            AttributeError,
+            OverflowError,
+        ) as exc:
+            self.rejected += 1
+
+            self.get_logger().warning(
+                "[SPATIAL] Rejected observation: "
+                + str(exc),
+                throttle_duration_sec=2.0,
+            )
+
+    # ========================================================================
+    # OUTPUT / TRACKED PERSON ARRAYS
+    # ========================================================================
+
+    def build_array(
         self,
-        now_sec: float,
-    ) -> None:
-        """
-        Remove tracks that have not received a new observation within
-        delete_timeout_sec.
-
-        Inputs:
-            now_sec:
-                Current ROS node time in seconds.
-
-        Side effects:
-            Deletes expired tracks from self.tracks.
-        """
-
-        expired_ids = [
-            person_id
-            for person_id, track
-            in self.tracks.items()
-            if (
-                now_sec
-                - track.last_update_ros_sec
-            ) > self.delete_timeout_sec
-        ]
-
-        for person_id in expired_ids:
-            del self.tracks[
-                person_id
-            ]
-
-    # =========================================================================
-    # OUTPUT / RESULT OBJECTS
-    # =========================================================================
-
-    def publish_tracks(self) -> None:
-        """
-        Publish the tracking snapshot only after a new observation.
-
-        The timer maintains track expiration, but does not create
-        artificial camera observations.
-        """
-
-        now_sec = (
-            self.get_clock().now().nanoseconds / 1e9
-        )
-
-        self._remove_expired_tracks(now_sec)
-
-        if not self.new_observation_pending:
-            self.stale_observation_cycles += 1
-            return
-
-        if (
-            self.last_input_stamp is None
-            or self.last_input_received_monotonic is None
-        ):
-            self.new_observation_pending = False
-            return
-
-        observation_age = (
-            time.monotonic()
-            - self.last_input_received_monotonic
-        )
-
-        if observation_age > self.observation_freshness_timeout_sec:
-            self.new_observation_pending = False
-            self.stale_observation_cycles += 1
-            return
-
+        *,
+        msg,
+        tracks,
+        source_ns,
+        complete,
+        robot,
+    ):
         output = TrackedPersonArray()
 
-        # Keep the exact accepted upstream observation timestamp.
-        output.header.stamp.sec = self.last_input_stamp[0]
-        output.header.stamp.nanosec = self.last_input_stamp[1]
-        output.header.frame_id = self.expected_frame
+        output.header = copy.deepcopy(msg.header)
+        output.header.frame_id = (
+            self.robot_frame
+            if robot
+            else self.expected_frame
+        )
 
-        for person_id, track in sorted(self.tracks.items()):
+        output.tracking_session_id = (
+            msg.tracking_session_id
+        )
+
+        output.source_detection_count = int(
+            msg.source_detection_count
+        )
+
+        output.source_observation_complete = complete
+
+        now_ros_ns = self.get_clock().now().nanoseconds
+
+        for person_id, track in sorted(tracks.items()):
+            if robot and track.base_position is None:
+                output.source_observation_complete = False
+                continue
+
+            observed = track.stamp_ns == source_ns
+
+            position = (
+                track.base_position
+                if robot
+                else track.position
+            )
+
+            velocity = (
+                track.base_velocity
+                if robot
+                else track.velocity
+            )
+
             person = TrackedPerson()
 
             person.id = person_id
             person.class_id = track.class_id
             person.class_name = track.class_name
-            person.confidence = track.confidence
-
-            person.position.x = track.x
-            person.position.y = track.y
-            person.position.z = track.z
-
-            person.velocity.x = track.vx
-            person.velocity.y = track.vy
-            person.velocity.z = track.vz
-
-            person.speed = float(
-                math.hypot(track.vx, track.vy)
+            person.confidence = float(
+                track.confidence
             )
 
-            if person.speed > 1e-4:
-                person.motion_heading = float(
-                    math.atan2(track.vy, track.vx)
-                )
-            else:
-                person.motion_heading = 0.0
-
-            person.time_since_last_seen = float(
-                max(
-                    0.0,
-                    now_sec - track.last_update_ros_sec,
-                )
+            person.tracking_session_id = (
+                msg.tracking_session_id
             )
 
-            person.observation_count = int(
+            person.identity_generation = (
+                track.generation
+            )
+
+            seconds, nanoseconds = divmod(
+                track.stamp_ns,
+                1_000_000_000,
+            )
+
+            person.last_observation_stamp.sec = seconds
+            person.last_observation_stamp.nanosec = nanoseconds
+
+            person.observed_in_current_array = observed
+            person.observation_count = (
                 track.observation_count
             )
 
-            person.tracking_state = self._get_tracking_state(
-                track,
-                now_sec,
+            person.time_since_last_seen = max(
+                0.0,
+                (now_ros_ns - track.stamp_ns) / 1e9,
+            )
+
+            if not observed:
+                person.tracking_state = "LOST"
+            elif track.confirmed:
+                # Confirmation belongs to the identity engine.
+                person.tracking_state = "TRACKED"
+            else:
+                person.tracking_state = "TENTATIVE"
+
+            for axis, value in zip("xyz", position):
+                setattr(
+                    person.position,
+                    axis,
+                    float(value),
+                )
+
+            for axis, value in zip("xyz", velocity):
+                setattr(
+                    person.velocity,
+                    axis,
+                    float(value),
+                )
+
+            person.velocity_valid = bool(
+                observed and track.velocity_valid
+            )
+
+            person.speed = float(
+                math.hypot(
+                    velocity[0],
+                    velocity[1],
+                )
+            )
+
+            person.motion_heading = (
+                float(
+                    math.atan2(
+                        velocity[1],
+                        velocity[0],
+                    )
+                )
+                if person.speed > 1e-4
+                else 0.0
             )
 
             output.persons.append(person)
 
-        self.publisher.publish(output)
+        return output
 
-        self.new_observation_pending = False
+    # ========================================================================
+    # MAINTENANCE
+    # ========================================================================
 
-    # =========================================================================
-    # VALIDATION / UTILITY
-    # =========================================================================
+    def expire_tracks(self):
+        """
+        Remove expired history.
 
-    @staticmethod
-    def _is_valid_position(
-        x: float,
-        y: float,
-        z: float,
-    ) -> bool:
-        """Return True when all spatial coordinates are finite."""
+        No publication:
+        a timer is not a new source observation.
+        """
 
-        return (
-            math.isfinite(x)
-            and math.isfinite(y)
-            and math.isfinite(z)
-        )
+        now = time.monotonic()
 
-    @staticmethod
-    def _stamp_to_seconds(
-        stamp,
-    ) -> float:
-        """Convert builtin_interfaces/Time to floating-point seconds."""
-
-        return (
-            float(stamp.sec)
-            + float(stamp.nanosec) * 1e-9
-        )
-
-    # =========================================================================
-    # OUTPUT / REPORTING
-    # =========================================================================
-    
-    def log_diagnostics(self) -> None:
-        """Report spatial tracking and observation freshness."""
-
-        now_sec = (
-            self.get_clock().now().nanoseconds / 1e9
-        )
-
-        tracked_count = 0
-        tentative_count = 0
-        lost_count = 0
-
-        for track in self.tracks.values():
-            state = self._get_tracking_state(
-                track,
-                now_sec,
+        self.tracks = {
+            person_id: track
+            for person_id, track in self.tracks.items()
+            if (
+                0.0 <= (
+                    now - track.received_monotonic
+                ) <= self.retention
             )
+        }
 
-            if state == "TRACKED":
-                tracked_count += 1
-            elif state == "TENTATIVE":
-                tentative_count += 1
-            elif state == "LOST":
-                lost_count += 1
+    # ========================================================================
+    # DIAGNOSTICS
+    # ========================================================================
 
-        if self.last_input_received_monotonic is None:
-            observation_age = float("inf")
-        else:
-            observation_age = max(
-                0.0,
-                time.monotonic()
-                - self.last_input_received_monotonic,
-            )
-
+    def log_diagnostics(self):
         self.get_logger().info(
-            "[SPATIAL TRACKING] "
-            f"ARRAYS={self.arrays_received} | "
-            f"PERSONS={self.persons_received} | "
-            f"UPDATES={self.valid_updates} | "
-            f"ACTIVE={len(self.tracks)} | "
-            f"TRACKED={tracked_count} | "
-            f"TENTATIVE={tentative_count} | "
-            f"LOST={lost_count} | "
-            f"INVALID_ID={self.invalid_id} | "
-            f"INVALID_POS={self.invalid_position} | "
-            f"INVALID_FRAME={self.invalid_frame} | "
-            f"VEL_REJECTED={self.rejected_velocity} | "
-            f"OBS_ACCEPTED={self.accepted_observation_arrays} | "
-            f"OBS_EMPTY={self.empty_observation_arrays} | "
-            f"OBS_REJECTED_STAMPS="
-            f"{self.rejected_observation_timestamps} | "
-            f"STALE_CYCLES={self.stale_observation_cycles} | "
-            f"OBS_AGE={observation_age:.2f}s"
+            "[SPATIAL] "
+            f"accepted={self.accepted} | "
+            f"rejected={self.rejected} | "
+            f"retained={len(self.tracks)} | "
+            f"odom_tx={self.odom_published} | "
+            f"base_tx={self.base_published} | "
+            f"tf_failures={self.tf_failures} | "
+            f"velocity_rejected={self.velocity_rejected}"
         )
 
 
-# =============================================================================
-# ORCHESTRATION
-# =============================================================================
-
+# ============================================================================
+# MAIN
+# ============================================================================
 
 def main(args=None):
-    """Run the spatial person tracking node."""
+    rclpy.init(args=args)
 
-    rclpy.init(
-        args=args
-    )
-
-    node = PersonSpatialTrackingNode()
+    node = None
 
     try:
-        rclpy.spin(
-            node
-        )
+        node = PersonSpatialTrackingNode()
+        rclpy.spin(node)
 
     except KeyboardInterrupt:
         pass
 
     finally:
-        node.destroy_node()
+        if node is not None:
+            node.destroy_node()
 
         if rclpy.ok():
             rclpy.shutdown()

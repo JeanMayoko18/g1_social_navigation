@@ -4,11 +4,10 @@ local_costmap:
       plugins:
         - voxel_layer
         - camera_obstacle_layer
-        - social_layer
         - inflation_layer
 
       camera_obstacle_layer:
         enabled: true
 
       social_layer:
-        enabled: true
+        enabled: false

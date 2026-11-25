@@ -1,61 +1,60 @@
+# Development thresholds. Calibrate on held-out recordings before trials.
 person_tracking:
   ros__parameters:
-
-    input_topic: "/yolo/detections"
-    output_topic: "/yolo/detections_tracked"
-
+    input_topic: /yolo/detections
+    output_topic: /yolo/detections_tracked
+    identity_output_topic: /social_perception/detections_2d
+    rgb_topic: /camera/camera/color/image_raw
     person_class_id: 0
-
+    minimum_detection_score: 0.50
+    rgb_buffer_size: 90
+    pending_detection_limit: 16
+    image_wait_timeout_sec: 0.15
+    observation_freshness_timeout_sec: 1.0
+    appearance_upper_region: [0.20, 0.15, 0.80, 0.48]
+    appearance_lower_region: [0.20, 0.52, 0.80, 0.90]
     minimum_iou: 0.20
     maximum_center_distance_px: 100.0
-
     iou_weight: 0.70
     center_weight: 0.30
-
+    appearance_weight: 0.35
     minimum_match_score: 0.35
-
-    max_missed_frames: 10
+    minimum_geometry_only_score: 0.60
+    minimum_appearance_score: 0.50
+    ambiguity_margin: 0.08
+    confirm_observations: 3
+    # Replaces frame-count retirement; no observation is created by a timer.
+    active_timeout_sec: 0.75
+    gallery_retention_sec: 30.0
+    return_minimum_score: 0.90
+    return_ambiguity_margin: 0.08
+    max_tracks: 128
 
 person_depth_fusion:
   ros__parameters:
-
-    detections_topic: /yolo/detections_tracked
+    detections_topic: /social_perception/detections_2d
+    output_topic: /social_perception/detections_3d
     depth_topic: /camera/camera/aligned_depth_to_color/image_raw
     camera_info_topic: /camera/camera/aligned_depth_to_color/camera_info
-    #camera_info_topic: /camera/camera/color/camera_info
-
     person_class_id: 0
-
     min_score: 0.50
-
     roi_scale: 0.30
-
     depth_scale: 0.001
-
     min_depth_m: 0.20
     max_depth_m: 8.0
-
     max_sync_error_s: 0.10
-
     depth_buffer_size: 90
-
     log_period_s: 5.0
   
 person_frame_transform:
   ros__parameters:
-
-    input_topic: "/yolo/detections_3d"
-    output_topic: "/yolo/detections_3d_base"
-
-    target_frame: "base_footprint"
-
+    input_topic: /social_perception/detections_3d
+    output_topic: /social_perception/detections_3d_base
+    target_frame: base_footprint
     person_class_id: 0
-
-    tf_timestamp_policy: "latest"
+    tf_timestamp_policy: detection
     transform_timeout_sec: 0.10
-
     diagnostics_period_sec: 5.0
-
 
 person_3d_marker:
   ros__parameters:
@@ -79,11 +78,11 @@ person_3d_marker:
     show_social_zones: true
     social_zone_height: 0.02
 
-
 person_spatial_tracking:
   ros__parameters:
 
-    input_topic: "/yolo/detections_3d_base"
+    input_topic: /social_perception/detections_3d_base
+    #input_topic: "/yolo/detections_3d_base" 
 
     output_topic: "/social_perception/tracked_persons"
 
@@ -129,7 +128,7 @@ social_zone_generator:
     include_tentative_tracks: false
     include_lost_tracks: false
 
-
+# Existing non-perception settings retained for callers using this shared file.
 social_navigation_decision:
   ros__parameters:
 
@@ -182,7 +181,6 @@ explanation_trigger:
     drop_duplicate_decision_ids: true
 
     decision_history_size: 100
-
 
 explanation_context:
   ros__parameters:

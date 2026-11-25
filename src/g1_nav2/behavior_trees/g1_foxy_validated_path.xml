@@ -1,0 +1,14 @@
+
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <Sequence name="ExecuteValidatedSocialPath">
+      <LoadValidatedPath
+        token="__EXECUTION_TOKEN__"
+        path="{path}"/>
+
+      <FollowPath
+        path="{path}"
+        controller_id=""/>
+    </Sequence>
+  </BehaviorTree>
+</root>

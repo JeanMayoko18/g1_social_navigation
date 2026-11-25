@@ -56,7 +56,8 @@ from tf2_ros import (
     TransformException,
     TransformListener,
 )
-
+import json
+from std_msgs.msg import String
 from g1_social_msgs.msg import (
     CandidateTrajectory,
     SocialZone,
@@ -285,6 +286,21 @@ class TrajectorySocialValidator(Node):
         self.tf_transforms_succeeded = 0
         self.tf_transforms_failed = 0
         self.last_social_source_ns = None
+        self.latest_social_coverage_complete = False
+
+        self.individual_source_session = ""
+        self.individual_source_stamp_ns = 0
+
+        self.individual_source_fresh = False
+        self.individual_source_complete = False
+
+        self.individual_received_at = None
+        self.individual_records = []
+
+        self.retired_individual_sessions = set()
+        
+        self.social_source_session = ""
+        self.retired_social_source_sessions = set()
 
         # =====================================================================
         # TF2
@@ -344,6 +360,14 @@ class TrajectorySocialValidator(Node):
                 social_zones_qos,
             )
         )
+        self.individual_situation_subscription = (
+            self.create_subscription(
+                String,
+                "/social_perception/individual_social_situation",
+                self._individual_situation_callback,
+                social_zones_qos,
+            )
+        )
 
         self.candidate_subscription = (
             self.create_subscription(
@@ -352,6 +376,13 @@ class TrajectorySocialValidator(Node):
                 self._candidate_trajectory_callback,
                 candidate_qos,
             )
+        )
+
+        self.revalidation_subscription = self.create_subscription(
+            CandidateTrajectory,
+            "/social_navigation/trajectory_revalidation_request",
+            self._revalidation_request_callback,
+            candidate_qos,
         )
 
         self.validation_publisher = (
@@ -417,71 +448,391 @@ class TrajectorySocialValidator(Node):
     # =========================================================================
 
     def _social_zones_callback(self, msg):
-        stamp = msg.header.stamp
+        """
+        Conserver les zones valides de l'observation courante.
 
-        source_ns = (
-            stamp.sec * 1000000000
-            + stamp.nanosec
-        )
+        Une couverture partielle permet de détecter un conflit,
+        mais ne permet jamais de produire VALID.
+        """
+        try:
+            session = str(msg.tracking_session_id).strip()
+            stamp = msg.header.stamp
 
-        age = (
-            self.get_clock().now().nanoseconds
-            - source_ns
-        ) / 1e9
+            source_ns = (
+                int(stamp.sec) * 1_000_000_000
+                + int(stamp.nanosec)
+            )
 
-        if (
-            source_ns <= 0
-            or not 0 <= stamp.nanosec < 1000000000
-            or not -0.1 <= age
-            <= self.social_observation_ingress_max_age_sec
-            or (
-                self.last_social_source_ns is not None
+            age = (
+                self.get_clock().now().nanoseconds
+                - source_ns
+            ) / 1e9
+
+            valid_header = bool(
+                session
+                and session not in self.retired_social_source_sessions
+                and str(msg.header.frame_id).strip()
+                and stamp.sec >= 0
+                and 0 <= stamp.nanosec < 1_000_000_000
+                and source_ns > 0
+                and (
+                    -0.10
+                    <= age
+                    <= self.social_observation_ingress_max_age_sec
+                )
+            )
+
+            if not valid_header:
+                return
+
+            if (
+                session == self.social_source_session
+                and self.last_social_source_ns is not None
                 and source_ns <= self.last_social_source_ns
+            ):
+                return
+
+            # Une identité dupliquée est ambiguë :
+            # aucune de ses occurrences ne sera conservée.
+            identity_counts = {}
+
+            for zone in msg.zones:
+                person_id = str(zone.person_id).strip()
+
+                identity_counts[person_id] = (
+                    identity_counts.get(person_id, 0) + 1
+                )
+
+            valid_zones = []
+
+            for zone in msg.zones:
+                try:
+                    person_id = str(zone.person_id).strip()
+                    zone_stamp = zone.observation_stamp
+
+                    zone_ns = (
+                        int(zone_stamp.sec) * 1_000_000_000
+                        + int(zone_stamp.nanosec)
+                    )
+
+                    valid = bool(
+                        person_id
+                        and identity_counts[person_id] == 1
+                        and zone.tracking_session_id == session
+                        and zone_stamp.sec >= 0
+                        and (
+                            0 <= zone_stamp.nanosec
+                            < 1_000_000_000
+                        )
+                        and zone_ns == source_ns
+                        and zone.tracking_state == "TRACKED"
+                        and self._is_valid_zone(zone)
+                        and math.isfinite(float(zone.center.z))
+                        and math.isfinite(float(zone.person_speed))
+                        and zone.person_speed >= 0.0
+                    )
+
+                except (
+                    ValueError,
+                    TypeError,
+                    AttributeError,
+                    OverflowError,
+                ):
+                    valid = False
+
+                if valid:
+                    valid_zones.append(zone)
+
+            complete = bool(
+                msg.source_observation_complete
+                and msg.source_person_count >= 0
+                and msg.source_person_count == len(msg.zones)
+                and len(valid_zones) == len(msg.zones)
             )
+
+            # Ne pas modifier le message reçu.
+            current = copy.deepcopy(msg)
+            current.zones = copy.deepcopy(valid_zones)
+
+            # Le filtrage ne transforme jamais une source
+            # incomplète en observation complète.
+            current.source_observation_complete = complete
+
+        except (
+            ValueError,
+            TypeError,
+            AttributeError,
+            OverflowError,
         ):
-            self.get_logger().warning(
-                "[SOCIAL OBSERVATION REJECTED] "
-                f"source_age={age:.3f}s | "
-                f"source_ns={source_ns} | "
-                f"last_accepted_ns={self.last_social_source_ns} | "
-                "last_valid_observation_preserved=True",
-                throttle_duration_sec=2.0,
-            )
             return
 
-        self.last_social_source_ns = source_ns
-        self.latest_social_zones = msg
+        if (
+            self.social_source_session
+            and session != self.social_source_session
+        ):
+            self.retired_social_source_sessions.add(
+                self.social_source_session
+            )
 
-        self.latest_social_zones_received_at = (
-            time.monotonic()
-        )
+        self.social_source_session = session
+        self.last_social_source_ns = source_ns
+
+        self.latest_social_zones = current
+        self.latest_social_zones_received_at = time.monotonic()
+        self.latest_social_coverage_complete = complete
+
+        if not complete:
+            self.get_logger().warning(
+                "[SOCIAL VALIDATION] Partial source | "
+                f"session={session} | "
+                f"source_ns={source_ns} | "
+                f"usable_zones={len(valid_zones)} | "
+                "valid_result_allowed=False",
+                throttle_duration_sec=2.0,
+            )
+
     # =========================================================================
     # CANDIDATE VALIDATION
     # =========================================================================
 
+    def _revalidation_request_callback(self, msg):
+        """
+        Revalidate an existing immutable candidate path.
+
+        This uses the exact same conservative social-geometry
+        validation as ordinary candidate generation.
+
+        The request does not start Nav2 planning.
+        It never authorizes navigation.
+        """
+
+        path_id = str(msg.path_id or "").strip()
+        request_id = str(msg.request_id or "").strip()
+        goal_id = str(msg.navigation_goal_id or "").strip()
+
+        if not all((path_id, request_id, goal_id)):
+            self.get_logger().warning(
+                "[PATH REVALIDATION] Missing candidate identity."
+            )
+            return
+
+        if (
+            not msg.path.header.frame_id
+            or not msg.path.poses
+            or not self._is_valid_path(msg.path)
+        ):
+            self._publish_validation(
+                path_id,
+                TRAJECTORY_VALIDATION_UNKNOWN,
+                "",
+                "INVALID_REVALIDATION_CANDIDATE",
+            )
+            return
+
+        self.get_logger().info(
+            "[PATH REVALIDATION] "
+            f"goal={goal_id} | "
+            f"request={request_id} | "
+            f"path={path_id} | "
+            "using_current_social_observation=True"
+        )
+
+        # Do not duplicate or weaken the existing geometry checks.
+        self._candidate_trajectory_callback(msg)
+
+    def _individual_situation_callback(self, msg):
+        """Accepter un instantané individuel horodaté."""
+
+        try:
+            data = json.loads(msg.data)
+
+            if (
+                not isinstance(data, dict)
+                or data.get("version") != 1
+            ):
+                return
+
+            session = str(data["source_session"]).strip()
+            stamp_ns = int(data["source_stamp_ns"])
+
+            fresh = data["source_fresh"]
+            complete = data["source_coverage_complete"]
+            rows = data["participants"]
+
+            if (
+                not session
+                or stamp_ns <= 0
+                or type(fresh) is not bool
+                or type(complete) is not bool
+                or not isinstance(rows, list)
+                or len(rows) > 512
+            ):
+                return
+
+            records = []
+            keys = set()
+
+            for row in rows:
+                key = row["key"]
+
+                if (
+                    not isinstance(key, list)
+                    or len(key) != 3
+                    or not isinstance(key[0], str)
+                    or not key[0].strip()
+                    or not isinstance(key[1], str)
+                    or not key[1].strip()
+                    or type(key[2]) is not int
+                    or key[2] < 0
+                    or type(row["unresolved"]) is not bool
+                    or type(row["observed_now"]) is not bool
+                    or type(row["retired"]) is not bool
+                ):
+                    return
+
+                identity = tuple(key)
+
+                if identity in keys:
+                    return
+
+                keys.add(identity)
+
+                records.append(
+                    (
+                        identity,
+                        row["unresolved"],
+                        row["observed_now"],
+                        str(row["observation_status"]),
+                        row["retired"],
+                    )
+                )
+
+        except (
+            ValueError,
+            TypeError,
+            KeyError,
+            AttributeError,
+        ):
+            return
+
+        if session in self.retired_individual_sessions:
+            return
+
+        if session == self.individual_source_session:
+            if stamp_ns < self.individual_source_stamp_ns:
+                return
+
+        elif self.individual_source_session:
+            self.retired_individual_sessions.add(
+                self.individual_source_session
+            )
+
+        self.individual_source_session = session
+        self.individual_source_stamp_ns = stamp_ns
+
+        self.individual_source_fresh = fresh
+        self.individual_source_complete = complete
+
+        self.individual_records = records
+        self.individual_received_at = time.monotonic()
+
+
+    def _individual_validation_blocker(self, zones):
+        """
+        Retourner la raison qui interdit une validation positive.
+
+        Cette méthode n'autorise aucun mouvement.
+        """
+
+        if self.individual_received_at is None:
+            return "NO_INDIVIDUAL_EPISODE_SNAPSHOT"
+
+        source = zones.header.stamp
+
+        source_ns = (
+            int(source.sec) * 1_000_000_000
+            + int(source.nanosec)
+        )
+
+        if (
+            not self.individual_source_fresh
+            or not self.individual_source_complete
+            or self.individual_source_session
+            != str(zones.tracking_session_id)
+            or self.individual_source_stamp_ns != source_ns
+        ):
+            return "INDIVIDUAL_SNAPSHOT_SOURCE_MISMATCH"
+
+        age = (
+            self.get_clock().now().nanoseconds - source_ns
+        ) / 1e9
+
+        receipt_age = (
+            time.monotonic() - self.individual_received_at
+        )
+
+        if (
+            not -0.10 <= age
+            <= self.social_observation_timeout_sec
+            or not 0.0 <= receipt_age
+            <= self.social_observation_timeout_sec
+        ):
+            return "INDIVIDUAL_SNAPSHOT_STALE"
+
+        current_zone_ids = {
+            str(zone.person_id)
+            for zone in zones.zones
+        }
+
+        for (
+            key,
+            unresolved,
+            observed,
+            status,
+            retired,
+        ) in self.individual_records:
+
+            if not unresolved:
+                continue
+
+            if (
+                retired
+                or not observed
+                or status != "OBSERVED"
+            ):
+                return "UNRESOLVED_UNOBSERVED_PERSON"
+
+            if (
+                key[0] != self.individual_source_session
+                or key[1] not in current_zone_ids
+            ):
+                return "UNRESOLVED_PERSON_ZONE_MISSING"
+
+        return ""
+
     def _candidate_trajectory_callback(self, msg):
+        """
+        Valider une trajectoire exacte contre les zones courantes.
+
+        CONFLICT est possible avec une couverture partielle.
+        VALID exige une couverture complète et fraîche.
+        """
         self.candidates_received += 1
 
-        path_id = str(
-            msg.path_id or ""
-        ).strip()
+        path_id = str(msg.path_id or "").strip()
 
-        def publish(
-            result,
-            reason,
-            person_id=""
-        ):
+        def publish(result, reason, person_id=""):
             self._publish_validation(
                 path_id,
                 result,
                 person_id,
-                reason
+                reason,
             )
 
         if not path_id:
             publish(
                 TRAJECTORY_VALIDATION_UNKNOWN,
-                "MISSING_PATH_ID"
+                "MISSING_PATH_ID",
             )
             return
 
@@ -494,30 +845,24 @@ class TrajectorySocialValidator(Node):
         ):
             publish(
                 TRAJECTORY_VALIDATION_UNKNOWN,
-                "INVALID_PATH"
+                "INVALID_PATH",
             )
             return
 
         zones = self.latest_social_zones
+        received = self.latest_social_zones_received_at
 
-        received = (
-            self.latest_social_zones_received_at
-        )
-
-        if (
-            zones is None
-            or received is None
-        ):
+        if zones is None or received is None:
             publish(
                 TRAJECTORY_VALIDATION_UNKNOWN,
-                "NO_SOCIAL_OBSERVATION"
+                "NO_SOCIAL_OBSERVATION",
             )
             return
 
         stamp = zones.header.stamp
 
         source_ns = (
-            stamp.sec * 1000000000
+            stamp.sec * 1_000_000_000
             + stamp.nanosec
         )
 
@@ -526,48 +871,53 @@ class TrajectorySocialValidator(Node):
             - source_ns
         ) / 1e9
 
+        receipt_age = time.monotonic() - received
+
         if (
             source_ns <= 0
-            or not 0 <= stamp.nanosec < 1000000000
-            or not -0.1 <= source_age
-            <= self.social_observation_timeout_sec
-            or not 0 <= time.monotonic() - received
-            <= self.social_observation_timeout_sec
+            or not 0 <= stamp.nanosec < 1_000_000_000
+            or not (
+                -0.1
+                <= source_age
+                <= self.social_observation_timeout_sec
+            )
+            or not (
+                0.0
+                <= receipt_age
+                <= self.social_observation_timeout_sec
+            )
             or not zones.header.frame_id.strip()
         ):
             self.get_logger().warning(
                 "[TRAJECTORY VALIDATION FRESHNESS] "
                 f"path={path_id} | "
                 f"source_age={source_age:.3f}s | "
-                f"receipt_age={time.monotonic() - received:.3f}s | "
+                f"receipt_age={receipt_age:.3f}s | "
                 f"frame={zones.header.frame_id!r} | "
                 f"timeout={self.social_observation_timeout_sec:.3f}s"
             )
+
             publish(
                 TRAJECTORY_VALIDATION_UNKNOWN,
-                "INVALID_OR_STALE_SOCIAL_OBSERVATION"
+                "INVALID_OR_STALE_SOCIAL_OBSERVATION",
             )
             return
 
         seen = set()
 
         for zone in zones.zones:
-            person_id = str(
-                zone.person_id
-            ).strip()
+            person_id = str(zone.person_id).strip()
 
             if (
                 not person_id
                 or person_id in seen
                 or zone.tracking_state != "TRACKED"
                 or not self._is_valid_zone(zone)
-                or not math.isfinite(
-                    float(zone.center.z)
-                )
+                or not math.isfinite(float(zone.center.z))
             ):
                 publish(
                     TRAJECTORY_VALIDATION_UNKNOWN,
-                    "INVALID_SOCIAL_ZONE"
+                    "INVALID_SOCIAL_ZONE",
                 )
                 return
 
@@ -578,31 +928,31 @@ class TrajectorySocialValidator(Node):
         if path.header.frame_id != zones.header.frame_id:
             aligned = self._transform_path_to_frame(
                 path=path,
-                target_frame=zones.header.frame_id
+                target_frame=zones.header.frame_id,
             )
 
             if aligned is None:
                 publish(
                     TRAJECTORY_VALIDATION_UNKNOWN,
-                    "TF_UNAVAILABLE"
+                    "TF_UNAVAILABLE",
                 )
                 return
 
         try:
             conflict = self._find_path_conflict(
                 aligned,
-                zones.zones
+                zones.zones,
             )
 
         except (ArithmeticError, ValueError):
             publish(
                 TRAJECTORY_VALIDATION_UNKNOWN,
-                "NUMERICAL_GEOMETRY_FAILURE"
+                "NUMERICAL_GEOMETRY_FAILURE",
             )
             return
 
-        # Processing time must not turn an expired
-        # observation into a fresh result.
+        # Une observation ne doit pas devenir une preuve fraîche
+        # simplement parce que le calcul vient de se terminer.
         if (
             time.monotonic() - received
             > self.social_observation_timeout_sec
@@ -614,18 +964,33 @@ class TrajectorySocialValidator(Node):
         ):
             publish(
                 TRAJECTORY_VALIDATION_UNKNOWN,
-                "OBSERVATION_EXPIRED_DURING_VALIDATION"
+                "OBSERVATION_EXPIRED_DURING_VALIDATION",
             )
             return
 
+        blocker = self._individual_validation_blocker(zones)
+
         if conflict is not None:
-            zone, x, y = conflict
+            zone, _, _ = conflict
 
             publish(
                 TRAJECTORY_VALIDATION_CONFLICT,
                 "PATH_INTERSECTS_SOCIAL_ZONE",
-                zone.person_id
+                zone.person_id,
             )
+
+        elif not self.latest_social_coverage_complete:
+            publish(
+                TRAJECTORY_VALIDATION_UNKNOWN,
+                "INCOMPLETE_SOCIAL_COVERAGE",
+            )
+
+        elif blocker:
+            publish(
+                TRAJECTORY_VALIDATION_UNKNOWN,
+                blocker,
+            )
+
         else:
             publish(
                 TRAJECTORY_VALIDATION_VALID,
@@ -633,8 +998,9 @@ class TrajectorySocialValidator(Node):
                     "PATH_CLEAR_OF_SOCIAL_ZONES"
                     if zones.zones
                     else "NO_TRACKED_SOCIAL_ZONE"
-                )
+                ),
             )
+
     # =========================================================================
     # TF2
     # =========================================================================

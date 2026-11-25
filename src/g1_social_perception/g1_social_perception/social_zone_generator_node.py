@@ -31,7 +31,12 @@ from g1_social_msgs.msg import (
     SocialZoneArray,
     TrackedPersonArray,
 )
+from g1_social_perception.social_zone_geometry import (
+    build_social_zone,
+)
+import json
 
+from std_msgs.msg import String
 from g1_qos_manager.diagnostics import log_qos_resolution
 from g1_qos_manager.profiles import reliable_qos
 from g1_qos_manager.resolver import resolve_subscription_qos
@@ -259,6 +264,12 @@ class SocialZoneGeneratorNode(Node):
             self.output_topic,
             output_qos,
         )
+        # Report individual generation outcomes without changing SocialZoneArray.
+        self.individual_results_publisher = self.create_publisher(
+            String,
+            "/social_perception/individual_zone_results",
+            reliable_qos(depth=10),
+        )
 
         # =====================================================================
         # DIAGNOSTICS
@@ -276,6 +287,9 @@ class SocialZoneGeneratorNode(Node):
         # ================================================================
 
         self.last_input_stamp_ns = None
+        
+        self.tracking_session_id = ""
+        self.retired_tracking_sessions = set()
 
         self.invalid_timestamps = 0
         self.rejected_arrays = 0
@@ -365,40 +379,44 @@ class SocialZoneGeneratorNode(Node):
         return angle <= half_fov_rad
 
 
+
     def tracked_persons_callback(
         self,
         msg: TrackedPersonArray,
     ) -> None:
         """
-        Generate social zones from valid tracked persons.
+        Generate zones from current, confirmed observations.
 
-        Preserve observation timestamps and existing safety filters.
-        Report why an observed person did not generate a zone.
+        Filtered persons remain represented in the source count.
+        Missing zones never imply missing persons or clearance.
+
+        A derived array is complete only if:
+          - upstream person coverage is complete;
+          - every source person is currently observed and TRACKED;
+          - every source person has a generated social zone.
         """
-
         self.arrays_received += 1
 
-        # -----------------------------------------------------
-        # 1. Validate frame
-        # -----------------------------------------------------
         if msg.header.frame_id != self.expected_frame:
             self.rejected_arrays += 1
-            self.get_logger().warning(
-                "[SOCIAL ZONE] Rejected frame | "
-                f"FRAME={msg.header.frame_id!r} | "
-                f"EXPECTED={self.expected_frame!r}",
-                throttle_duration_sec=2.0,
-            )
             return
 
-        # -----------------------------------------------------
-        # 2. Validate timestamp
-        # -----------------------------------------------------
-        stamp = msg.header.stamp
-        sec = int(stamp.sec)
-        nanosec = int(stamp.nanosec)
+        session = str(msg.tracking_session_id).strip()
 
-        if sec < 0 or not (0 <= nanosec < 1_000_000_000):
+        if (
+            not session
+            or session in self.retired_tracking_sessions
+        ):
+            self.rejected_arrays += 1
+            return
+
+        sec = int(msg.header.stamp.sec)
+        nanosec = int(msg.header.stamp.nanosec)
+
+        if (
+            sec < 0
+            or not 0 <= nanosec < 1_000_000_000
+        ):
             self.invalid_timestamps += 1
             return
 
@@ -407,171 +425,255 @@ class SocialZoneGeneratorNode(Node):
         if (
             stamp_ns <= 0
             or (
-                self.last_input_stamp_ns is not None
+                session == self.tracking_session_id
+                and self.last_input_stamp_ns is not None
                 and stamp_ns <= self.last_input_stamp_ns
             )
         ):
             self.invalid_timestamps += 1
-            self.get_logger().warning(
-                "[SOCIAL ZONE] Invalid or repeated timestamp",
-                throttle_duration_sec=2.0,
-            )
             return
 
-        # -----------------------------------------------------
-        # 3. Initialize output
-        # -----------------------------------------------------
+        source_count = int(msg.source_detection_count)
+
+        if source_count < 0:
+            self.rejected_arrays += 1
+            return
+
         output = SocialZoneArray()
         output.header = msg.header
+        output.tracking_session_id = session
 
-        rejected_geometry = False
-        filtered_in_this_array = 0
+        seen_ids = set()
+        observed_count = 0
+        all_current_tracked = True
 
-        # -----------------------------------------------------
-        # 4. Validate each tracked person
-        # -----------------------------------------------------
+        staged_zones = []
+        staged_filtered = 0
+        staged_persons = 0
+        individual_results = []
+
         for person in msg.persons:
-            self.persons_received += 1
+            staged_persons += 1
 
             person_id = str(person.id).strip()
-            tracking_state = str(person.tracking_state).strip()
+            identity_generation = person.identity_generation
 
-            x = float(person.position.x)
-            y = float(person.position.y)
-            z = float(person.position.z)
-            speed = float(person.speed)
+            source_sec = int(
+                person.last_observation_stamp.sec
+            )
+            source_nanosec = int(
+                person.last_observation_stamp.nanosec
+            )
 
-            if not self._should_use_track(tracking_state):
-                self.filtered_tracks += 1
-                filtered_in_this_array += 1
+            source_ns = (
+                source_sec * 1_000_000_000
+                + source_nanosec
+            )
 
-                self.get_logger().warning(
-                    "[SOCIAL ZONE FILTER] "
-                    f"REASON=TRACK_STATE | "
-                    f"ID={person_id} | "
-                    f"STATE={tracking_state} | "
-                    f"OBS={person.observation_count}",
-                    throttle_duration_sec=2.0,
+            observed = bool(
+                person.observed_in_current_array
+            )
+
+            tracking_state = str(
+                person.tracking_state
+            ).strip()
+
+            if (
+                not person_id
+                or person_id in seen_ids
+                or person.tracking_session_id != session
+                or source_sec < 0
+                or not 0 <= source_nanosec < 1_000_000_000
+                or source_ns <= 0
+                or type(identity_generation) is not int
+                or identity_generation <= 0
+                or source_ns > stamp_ns
+                or observed != (source_ns == stamp_ns)
+                or tracking_state not in {
+                    "TENTATIVE",
+                    "TRACKED",
+                    "LOST",
+                }
+                or (
+                    observed
+                    and tracking_state == "LOST"
                 )
-                continue
-
-            if not (
-                person_id
-                and math.isfinite(x)
-                and math.isfinite(y)
-                and math.isfinite(z)
-                and math.isfinite(speed)
-                and speed >= 0.0
             ):
-                rejected_geometry = True
-                self.filtered_tracks += 1
-
+                self.rejected_arrays += 1
                 self.get_logger().warning(
-                    "[SOCIAL ZONE FILTER] "
-                    f"REASON=INVALID_GEOMETRY | "
-                    f"ID={person_id}",
+                    "[SOCIAL ZONE] Invalid person provenance.",
                     throttle_duration_sec=2.0,
+                )
+                return
+
+            seen_ids.add(person_id)
+
+            def record_individual_result(status, reason, direction_basis="UNKNOWN"):
+                individual_results.append({
+                    "tracking_session_id": session,
+                    "person_id": person_id,
+                    "identity_generation": identity_generation,
+                    "tracking_state": tracking_state,
+                    "observed_in_current_array": observed,
+                    "observation_stamp_ns": source_ns,
+                    "status": status,
+                    "reason": reason,
+                    "direction_basis": direction_basis,
+                })
+
+            if not observed:
+                all_current_tracked = False
+                staged_filtered += 1
+
+                record_individual_result(
+                    "UNAVAILABLE",
+                    "NO_CURRENT_OBSERVATION",
                 )
                 continue
 
-            if speed >= self.dynamic_speed_threshold_mps:
-                heading = float(person.motion_heading)
+            if tracking_state != "TRACKED":
+                all_current_tracked = False
+                staged_filtered += 1
 
-                if not math.isfinite(heading):
-                    rejected_geometry = True
-                    self.filtered_tracks += 1
+                record_individual_result(
+                    "UNAVAILABLE",
+                    "TRACK_NOT_CONFIRMED",
+                )
+                continue
 
-                    self.get_logger().warning(
-                        "[SOCIAL ZONE FILTER] "
-                        f"REASON=INVALID_HEADING | "
-                        f"ID={person_id}",
-                        throttle_duration_sec=2.0,
-                    )
-                    continue
+            # The navigation/social-memory consumer requires
+            # TRACKED persons only. Parameters allowing
+            # tentative/lost visualizations do not override
+            # this authoritative output contract.
+            values = (
+                float(person.position.x),
+                float(person.position.y),
+                float(person.position.z),
+                float(person.speed),
+            )
+
+            if person.speed >= self.dynamic_speed_threshold_mps:
+                values += (float(person.motion_heading),)
+
+            if (
+                not all(
+                    math.isfinite(value)
+                    for value in values
+                )
+                or person.speed < 0.0
+            ):
+                self.rejected_arrays += 1
+                self.get_logger().warning(
+                    "[SOCIAL ZONE] Invalid current geometry.",
+                    throttle_duration_sec=2.0,
+                )
+                return
 
             if not self._is_in_forward_sector(person):
-                self.filtered_tracks += 1
-                filtered_in_this_array += 1
+                staged_filtered += 1
 
-                distance = math.hypot(x, y)
-                angle_deg = math.degrees(math.atan2(y, x))
-
-                self.get_logger().warning(
-                    "[SOCIAL ZONE FILTER] "
-                    f"REASON=OUTSIDE_FORWARD_SECTOR | "
-                    f"ID={person_id} | "
-                    f"X={x:.3f} | "
-                    f"Y={y:.3f} | "
-                    f"Z={z:.3f} | "
-                    f"DIST={distance:.3f} | "
-                    f"ANGLE={angle_deg:.1f} | "
-                    f"MIN_X={self.minimum_forward_x_m:.2f} | "
-                    f"MAX_DIST={self.maximum_distance_m:.2f} | "
-                    f"FOV={self.forward_field_of_view_deg:.1f}",
-                    throttle_duration_sec=2.0,
+                record_individual_result(
+                    "FILTERED",
+                    "OUTSIDE_CONFIGURED_FORWARD_SECTOR",
                 )
                 continue
 
-            # -------------------------------------------------
-            # 5. Generate zone
-            # -------------------------------------------------
             zone = self._build_zone(person)
-            output.zones.append(zone)
+            staged_zones.append(zone)
 
-            self.get_logger().info(
-                "[SOCIAL ZONE GENERATED] "
-                f"ID={person_id} | "
-                f"STATE={tracking_state} | "
-                f"TYPE={zone.zone_type} | "
-                f"X={x:.3f} | Y={y:.3f} | "
-                f"DIST={math.hypot(x, y):.3f}",
-                throttle_duration_sec=2.0,
+            record_individual_result(
+                "GENERATED",
+                "VALID_CURRENT_OBSERVATION",
+                (
+                    "MOTION_DIRECTION"
+                    if zone.zone_type == "DYNAMIC"
+                    else "UNKNOWN"
+                ),
             )
 
-        # -----------------------------------------------------
-        # 6. Reject incomplete geometry
-        # -----------------------------------------------------
-        if rejected_geometry:
+        if observed_count > source_count:
             self.rejected_arrays += 1
             self.get_logger().warning(
-                "[SOCIAL ZONE] Rejected incomplete array",
+                "[SOCIAL ZONE] Observations exceed source count.",
                 throttle_duration_sec=2.0,
             )
             return
 
-        # Do not turn filtered persons into an empty scene.
-        if msg.persons and not output.zones:
+        # The original source may contain candidates that
+        # cannot yet be spatially tracked.
+        source_complete = bool(
+            msg.source_observation_complete
+        )
+
+        output.zones = staged_zones
+        output.source_person_count = len(msg.persons)
+
+        output.source_observation_complete = bool(
+            source_complete
+            and observed_count == source_count
+            and all_current_tracked
+            and len(staged_zones) == len(msg.persons)
+        )
+
+        if (
+            self.tracking_session_id
+            and session != self.tracking_session_id
+        ):
+            self.retired_tracking_sessions.add(
+                self.tracking_session_id
+            )
+
+        self.tracking_session_id = session
+        self.last_input_stamp_ns = stamp_ns
+
+        if msg.persons and not staged_zones:
             self.ambiguous_empty_arrays += 1
 
-            self.get_logger().warning(
-                "[SOCIAL ZONE] All tracks filtered | "
-                f"PERSONS={len(msg.persons)} | "
-                f"FILTERED={filtered_in_this_array}",
-                throttle_duration_sec=2.0,
-            )
-            return
-
-        if not msg.persons:
+        if (
+            not msg.persons
+            and source_count == 0
+            and source_complete
+        ):
             self.confirmed_input_empty_arrays += 1
 
-        # -----------------------------------------------------
-        # 7. Publish valid observation
-        # -----------------------------------------------------
         self.publisher.publish(output)
+
+        # Publish individual results for the same validated source frame.
+        self.individual_results_publisher.publish(
+            String(
+                data=json.dumps(
+                    {
+                        "version": 1,
+                        "producer": "social_zone_generator",
+                        "tracking_session_id": session,
+                        "source_stamp_ns": stamp_ns,
+                        "source_frame": msg.header.frame_id,
+                        "source_observation_complete": bool(
+                            output.source_observation_complete
+                        ),
+                        "persons": individual_results,
+                    },
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+            )
+        )
+
+        self.persons_received += staged_persons
+        self.filtered_tracks += staged_filtered
 
         self.static_zones += sum(
             zone.zone_type == "STATIC"
-            for zone in output.zones
+            for zone in staged_zones
         )
 
         self.dynamic_zones += sum(
             zone.zone_type == "DYNAMIC"
-            for zone in output.zones
+            for zone in staged_zones
         )
 
-        self.last_input_stamp_ns = stamp_ns
         self.published_arrays += 1
-        self.zones_generated += len(output.zones)
+        self.zones_generated += len(staged_zones)
 
     # =========================================================================
     # PROCESSING / VALIDATION
@@ -604,75 +706,25 @@ class SocialZoneGeneratorNode(Node):
     # PROCESSING / SOCIAL ZONE GEOMETRY
     # =========================================================================
 
-    def _build_zone(
-        self,
-        person,
-    ) -> SocialZone:
-        """
-        Create one social zone from one tracked person.
-
-        Static:
-            Circular zone.
-
-        Dynamic:
-            Directional ellipse whose longitudinal radius grows with speed.
-        """
-
-        zone = SocialZone()
-
-        zone.person_id = person.id
-        zone.center = person.position
-
-        zone.person_speed = float(
-            person.speed
+    def _build_zone(self, person) -> SocialZone:
+        """Build a social zone using the shared geometry model."""
+        return build_social_zone(
+            person,
+            static_radius_m=self.static_radius_m,
+            dynamic_speed_threshold_mps=(
+                self.dynamic_speed_threshold_mps
+            ),
+            dynamic_base_longitudinal_radius_m=(
+                self.dynamic_base_longitudinal_radius_m
+            ),
+            dynamic_base_lateral_radius_m=(
+                self.dynamic_base_lateral_radius_m
+            ),
+            dynamic_speed_gain=self.dynamic_speed_gain,
+            maximum_longitudinal_radius_m=(
+                self.maximum_longitudinal_radius_m
+            ),
         )
-
-        zone.tracking_state = (
-            person.tracking_state
-        )
-
-        if (
-            person.speed
-            < self.dynamic_speed_threshold_mps
-        ):
-            zone.zone_type = "STATIC"
-
-            zone.heading = 0.0
-
-            zone.radius_longitudinal = float(
-                self.static_radius_m
-            )
-
-            zone.radius_lateral = float(
-                self.static_radius_m
-            )
-
-            return zone
-
-        zone.zone_type = "DYNAMIC"
-
-        zone.heading = float(
-            person.motion_heading
-        )
-
-        longitudinal_radius = (
-            self.dynamic_base_longitudinal_radius_m
-            + self.dynamic_speed_gain
-            * float(person.speed)
-        )
-
-        zone.radius_longitudinal = float(
-            min(
-                longitudinal_radius,
-                self.maximum_longitudinal_radius_m,
-            )
-        )
-
-        zone.radius_lateral = float(
-            self.dynamic_base_lateral_radius_m
-        )
-
-        return zone
 
     # =========================================================================
     # OUTPUT / REPORTING

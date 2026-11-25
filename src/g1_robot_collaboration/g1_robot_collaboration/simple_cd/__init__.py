@@ -1,0 +1,1 @@
+"""Règles métier du gestionnaire C/D simplifié."""

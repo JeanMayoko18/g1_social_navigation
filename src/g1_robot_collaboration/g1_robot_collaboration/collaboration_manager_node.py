@@ -20,6 +20,8 @@ Important:
 """
 
 import math
+import copy
+import os
 import time
 import uuid
 import json
@@ -46,10 +48,16 @@ from g1_social_msgs.msg import (
     SocialNavigationDecision,
     SpeechCancelRequest,
     SpeechStatus,
+    TrackedPersonArray,
     TrajectoryGenerationRequest,
     TrajectorySocialValidation,
 )
 
+
+from g1_social_msgs.msg import (
+    DirectionalConstraintRequest,
+    DirectionalConstraintStatus,
+)
 from g1_social_common.social_navigation_events import (
     SOCIAL_EVENT_CLEAR,
     SOCIAL_EVENT_INTRUSION_CONFIRMED,
@@ -182,6 +190,36 @@ class CollaborationManager(Node):
         self.declare_parameter(
             "social_resolution_timeout_sec",
             180.0,
+        )
+
+        self.declare_parameter(
+            "planning_reconciliation_timeout_sec",
+            120.0,
+        )
+
+        self.planning_reconciliation_timeout_sec = float(
+            self.get_parameter(
+                "planning_reconciliation_timeout_sec"
+            ).value
+        )
+
+        if (
+            not math.isfinite(
+                self.planning_reconciliation_timeout_sec
+            )
+            or self.planning_reconciliation_timeout_sec <= 0.0
+        ):
+            raise ValueError(
+                "planning_reconciliation_timeout_sec "
+                "must be finite and positive."
+            )
+
+        self.planning_reconciliation = None
+
+        self.generation_status_request_pub = self.create_publisher(
+            String,
+            "/social_navigation/trajectory_generation_status_request",
+            10,
         )
 
         self.human_initiative_timeout_sec = float(
@@ -319,6 +357,17 @@ class CollaborationManager(Node):
         self.social_state_episode = ""
         self.social_state_sequence = 0
         self.retired_social_sessions = set()
+
+        self.individual_participants = {}
+
+        self.individual_source_session = ""
+        self.individual_source_stamp_ns = 0
+        self.individual_source_fresh = False
+        self.individual_source_complete = False
+        self.individual_received_at = None
+
+        self.individual_retired_source_sessions = set()
+
         #self.retired_social_episode_ids = set()
 
         self.active_decision_id = ""
@@ -328,6 +377,7 @@ class CollaborationManager(Node):
         self.latest_observation_health_at = None
         self.empty_observation_since = None
         self.health_session = ""
+        self.route_geometry_person_id = ""
         self.health_stamp_ns = None
 
         self.retired_recovery_goal_id = ""
@@ -338,6 +388,9 @@ class CollaborationManager(Node):
         self.retired_recovery_last_attempt_at = 0.0
         self.retired_recovery_retry_delay_sec = 3.0
         self.retired_recovery_exhaustion_logged = False
+        self._handled_persistent_person_episodes = set()
+        self.reactive_next_search_at = 0.0
+        self.reactive_search_signature = None
 
         self.initial_start_authorized_goal_id = ""
 
@@ -359,6 +412,26 @@ class CollaborationManager(Node):
 
         self.conflict_observed_since = None
         self.persistent_conflict_handled = False
+
+        self._active_actor_scope = None
+        self._actor_semantics = {}
+        self.social_observation_complete = True
+        
+        # 
+        self.mode_d_cases = {}
+
+        # 
+        self.mode_d_hri_owner = None
+
+        # (interaction_id, request_id) -> identité individuelle.
+        self.mode_d_hri_turns = {}
+
+        # 
+        self.mode_d_hri_closures = {}
+
+        # 
+        self.mode_d_anticipation_queues = {}
+
 
         # ------------------------------------------------------------
         # Navigation and physical stop
@@ -466,7 +539,7 @@ class CollaborationManager(Node):
         self.initial_start_max_attempts = 3
         self.initial_start_next_attempt_at = 0.0
 
-        # Clôture d'un dialogue HRI avant toute reprise dépendante.
+
         self.pending_hri_close = None
         self.hri_close_fault_reported = False
         self.deferred_clear_replan_goal_id = ""
@@ -475,17 +548,22 @@ class CollaborationManager(Node):
         self.pending_terminal_stop = None
         self.terminal_stop_fault_reported = False
 
-        # Identité conservée lors d'une récupération audio.
+
         self.dialogue_audio_recovery_pending = False
         self.audio_recovery_interaction_id = ""
         self.audio_recovery_request_id = ""
 
-        # Récupération de l'épisode social retiré.
+
         self.retired_episode_retired_at = None
         self.retired_recovery_attempt_count = 0
         self.retired_recovery_last_attempt_at = 0.0
         self.retired_recovery_retry_delay_sec = 3.0
         self.retired_recovery_exhaustion_logged = False
+        #self.mode_c_cached_candidate = None
+        self.reactive_cached_candidate = None
+        self.mode_c_last_checked_source_ns = 0
+        self.mode_c_last_revalidation_at = 0.0
+
 
         # ------------------------------------------------------------
         # Subscriptions
@@ -496,6 +574,12 @@ class CollaborationManager(Node):
             "/hri/dialogue_control",
             20,
         )
+        
+        self.mode_c_revalidation_pub = self.create_publisher(
+            CandidateTrajectory,
+            "/social_navigation/trajectory_revalidation_request",
+            10,
+        )
 
         self.hri_dialogue_control_result_sub = self.create_subscription(
             String,
@@ -503,10 +587,27 @@ class CollaborationManager(Node):
             self._hri_dialogue_control_result_callback,
             20,
         )
+
+        self.individual_situation_sub = self.create_subscription(
+            String,
+            "/social_perception/individual_social_situation",
+            self._individual_situation_callback,
+            10,
+        )
         self.social_decision_sub = self.create_subscription(
             SocialNavigationDecision,
             self.social_decision_topic,
             self._social_decision_callback,
+            10,
+        )
+        # Subscribe to spatial identity observations for Mode D.
+        self.directional_identity_snapshot = None
+        self.directional_identity_received_at = None
+
+        self.directional_identity_sub = self.create_subscription(
+            TrackedPersonArray,
+            "/social_perception/tracked_persons",
+            self._directional_identity_callback,
             10,
         )
 
@@ -627,6 +728,8 @@ class CollaborationManager(Node):
         )
 
         self.timer = self.create_timer(0.1, self._timer_callback)
+
+        self._initialize_social_reassessment()
 
         self.get_logger().info(
             "[COLLABORATION] Ready | "
@@ -839,22 +942,559 @@ class CollaborationManager(Node):
         self.social_resolution_started_at = None
         self.social_resolution_aborted = False
 
+    def _individual_situation_callback(self, msg):
+        """Mémoriser les épisodes individuels sans réinitialiser le HRI."""
+
+        try:
+            data = json.loads(msg.data)
+
+            if (
+                not isinstance(data, dict)
+                or data.get("version") != 1
+            ):
+                return
+
+            session = str(data["source_session"]).strip()
+            stamp_ns = int(data["source_stamp_ns"])
+
+            fresh = data["source_fresh"]
+            complete = data["source_coverage_complete"]
+
+            if not session or stamp_ns <= 0:
+                return
+
+            if (
+                not isinstance(fresh, bool)
+                or not isinstance(complete, bool)
+            ):
+                return
+
+            age = (
+                self.get_clock().now().nanoseconds - stamp_ns
+            ) / 1e9
+
+            if not (
+                -0.10 <= age <= self.social_decision_max_age_sec
+            ):
+                return
+
+            rows = data["participants"]
+
+            if (
+                not isinstance(rows, list)
+                or len(rows) > 512
+            ):
+                return
+
+            participants = {}
+
+            for row in rows:
+                key = row["key"]
+
+                if (
+                    not isinstance(key, list)
+                    or len(key) != 3
+                    or not isinstance(key[0], str)
+                    or not key[0].strip()
+                    or not isinstance(key[1], str)
+                    or not key[1].strip()
+                    or type(key[2]) is not int
+                    or key[2] < 0
+                    or type(row["unresolved"]) is not bool
+                    or type(row["observed_now"]) is not bool
+                    or type(row["retired"]) is not bool
+                    or type(row["persistent"]) is not bool
+                ):
+                    return
+
+                identity = (key[0], key[1], key[2])
+
+                if identity in participants:
+                    return
+
+                participants[identity] = {
+                    "episode_id": str(row["episode_id"]),
+                    "unresolved": row["unresolved"],
+                    "observed_now": row["observed_now"],
+                    "persistent": row["persistent"],
+                    "observation_status": str(
+                        row["observation_status"]
+                    ),
+                    "conflict_status": str(
+                        row["conflict_status"]
+                    ),
+                    "retired": row["retired"],
+                    "transition": str(row["transition"]),
+                }
+
+        except (
+            ValueError,
+            TypeError,
+            KeyError,
+            AttributeError,
+        ):
+            return
+
+        if session in self.individual_retired_source_sessions:
+            return
+
+        if session == self.individual_source_session:
+            if stamp_ns < self.individual_source_stamp_ns:
+                return
+
+        elif self.individual_source_session:
+            self.individual_retired_source_sessions.add(
+                self.individual_source_session
+            )
+
+        previous = self.individual_participants
+
+        new_conflicts = [
+            identity
+            for identity, state in participants.items()
+            if (
+                state["unresolved"]
+                and state["observed_now"]
+                and state["conflict_status"] in {
+                    "CONFLICT",
+                    "UNRESOLVED",
+                }
+                and (
+                    identity not in previous
+                    or not previous[identity]["unresolved"]
+                )
+            )
+        ]
+
+        self.individual_participants = participants
+        self.individual_source_session = session
+        self.individual_source_stamp_ns = stamp_ns
+        self.individual_source_fresh = fresh
+        self.individual_source_complete = complete
+        self.individual_received_at = time.monotonic()
+
+        if (
+            new_conflicts
+            and self.active_navigation_goal_id
+            and self.fsm_state in {
+                STATE_NAVIGATING,
+                STATE_RESUMING,
+            }
+            and (
+                self.navigation_active
+                or self.fsm_state == STATE_RESUMING
+            )
+            and self.pending_terminal_stop is None
+        ):
+            self.get_logger().warning(
+                "[INDIVIDUAL SOCIAL] New conflict during navigation | "
+                f"identities={new_conflicts!r}"
+            )
+
+            self._invalidate_trajectory_validation(
+                reason="NEW_INDIVIDUAL_SOCIAL_CONFLICT"
+            )
+
+            self.nav2_cancel_requested = True
+            self.nav2_cancel_confirmed = False
+            self.stable_stop_confirmed = False
+
+            self.stop_request_stamp_sec = (
+                self.get_clock().now().nanoseconds / 1e9
+            )
+
+            self._transition_to(
+                STATE_STOPPING_FOR_SOCIAL_CONFLICT,
+                reason="NEW_INDIVIDUAL_SOCIAL_CONFLICT",
+            )
+
+            self._publish_wait(
+                reason="NEW_INDIVIDUAL_SOCIAL_CONFLICT"
+            )
+
+            self._schedule_social_reassessment()
+            
+        for identity, row in participants.items():
+            old = previous.get(identity)
+
+            if (
+                row["transition"]
+                or (
+                    old is not None
+                    and (
+                        old["unresolved"],
+                        old["observation_status"],
+                    ) != (
+                        row["unresolved"],
+                        row["observation_status"],
+                    )
+                )
+            ):
+                self.get_logger().info(
+                    "[INDIVIDUAL SOCIAL] "
+                    f"person={identity!r} | "
+                    f"episode={row['episode_id']} | "
+                    f"transition="
+                    f"{row['transition'] or 'STATE_CHANGE'} | "
+                    f"unresolved={row['unresolved']} | "
+                    f"observation={row['observation_status']}"
+                )
+
+    def _individual_scene_current(self):
+        if (
+            not self.individual_source_session
+            or not self.individual_source_fresh
+            or self.individual_received_at is None
+        ):
+            return False
+
+        age = (
+            self.get_clock().now().nanoseconds
+            - self.individual_source_stamp_ns
+        ) / 1e9
+
+        receipt_age = (
+            time.monotonic() - self.individual_received_at
+        )
+
+        return bool(
+            -0.10 <= age <= self.social_decision_max_age_sec
+            and 0.0 <= receipt_age
+            <= self.social_decision_max_age_sec
+        )
+
+    def _individual_scene_blocks_motion(self):
+        # L'absence ou la péremption des preuves bloque
+        # l'autorisation, jamais le simple calcul de trajectoire.
+        if not self._individual_scene_current():
+            return True
+
+        return any(
+            state["unresolved"]
+            and (
+                not state["observed_now"]
+                or state["observation_status"] != "OBSERVED"
+                or state["retired"]
+            )
+            for state in self.individual_participants.values()
+        )
+
+    def _individual_scene_all_clear(self):
+        # Un CLEAR collectif exige que tous les épisodes
+        # individuels soient effectivement résolus.
+        return bool(
+            self._individual_scene_current()
+            and self.individual_source_complete
+            and not any(
+                state["unresolved"]
+                for state in self.individual_participants.values()
+            )
+        )
+
+    def _reactive_planning_ready(self):
+        """Allow planning only after a verified navigation hold."""
+
+        goal_id = str(self.active_navigation_goal_id or "").strip()
+        nav = self.latest_navigation_state
+        now = time.monotonic()
+
+        if (
+            not goal_id
+            or self.active_navigation_goal_pose is None
+            or self.navigation_active
+            or nav is None
+            or str(nav.navigation_goal_id or "").strip() != goal_id
+            or not self._message_is_recent(nav, 1.0)
+            or self.navigation_state not in {
+                "WAITING",
+                "SOCIAL_HOLD",
+                "REPLANNING",
+            }
+            or not self.stable_stop_confirmed
+            or self.motion_state_received_at is None
+            or self.motion_state_stamp_sec is None
+            or now - self.motion_state_received_at > 0.5
+            or self.pending_terminal_stop is not None
+            or self.pending_gate_command is not None
+            or self.pending_hri_close is not None
+            or self.pending_speech_decision_id
+            or self.pending_dialogue_request_id
+            or self.dialogue_audio_recovery_pending
+            or self.pending_generation_request_id
+            or self.uncertain_generation_request_id
+            or self.social_resolution_aborted
+        ):
+            return False
+
+        motion_age = (
+            self.get_clock().now().nanoseconds / 1e9
+            - self.motion_state_stamp_sec
+        )
+
+        if not -0.1 <= motion_age <= 0.5:
+            return False
+
+        if self.nav2_cancel_requested and not (
+            self.nav2_cancel_confirmed
+            and self.stop_request_stamp_sec is not None
+            and self.motion_state_stamp_sec
+            >= self.stop_request_stamp_sec
+        ):
+            return False
+
+        return True
+
+    def _individual_search_signature(self):
+        """Represent social changes without using camera frame counters."""
+
+        return (
+            self.active_navigation_goal_id,
+            self.individual_source_session,
+            tuple(
+                sorted(
+                    (
+                        key,
+                        row["episode_id"],
+                        row["unresolved"],
+                        row["observation_status"],
+                        row["conflict_status"],
+                        row["retired"],
+                        row["persistent"],
+                    )
+                    for key, row in self.individual_participants.items()
+                )
+            ),
+        )
+
+    def _reactive_search_tick(self, now):
+        """Continue deferred HRI fallback and preserve confirmed route semantics."""
+        deferred = getattr(
+            self,
+            "_readaptation_after_hri_close",
+            None,
+        )
+
+        if deferred is not None:
+            goal_id, scope, reason = deferred
+
+            if (
+                goal_id != self.active_navigation_goal_id
+                or scope != self._social_scope_key()
+            ):
+                self._readaptation_after_hri_close = None
+                return
+
+            if (
+                self.fsm_state == STATE_WAITING
+                and self.pending_hri_close is None
+                and not self.hri_close_fault_reported
+                and not self.pending_dialogue_request_id
+                and not self.dialogue_audio_recovery_pending
+                and not self.pending_speech_decision_id
+                and self.pending_terminal_stop is None
+                and not self.social_resolution_aborted
+            ):
+                self._begin_autonomous_readaptation_announcement(
+                    reason=reason
+                )
+
+            return
+
+        if (
+            self.fsm_state != STATE_WAITING
+            or not self.route_waiting_for_change
+            or not self._reactive_planning_ready()
+            or now < self.reactive_next_search_at
+            or self.anticipatory_pending_request_id
+            or self.anticipatory_uncertain_request_id
+            or self.announcement_context_key is not None
+            or self.current_announcement_action
+        ):
+            return
+
+        if self.interaction == "dialogue":
+            if self.dialogue_outcome == "NONE":
+                if self._route_observation_is_fresh():
+                    self._start_human_initiative_window()
+                return
+
+            if self.dialogue_outcome not in {
+                "ALLOW_CONFIRMED",
+                "DENY_CONFIRMED",
+                "NO_RESPONSE",
+                "NOT_UNDERSTOOD",
+            }:
+                return
+
+            if (
+                self.dialogue_outcome == "ALLOW_CONFIRMED"
+                and not self._permission_applies_to_current_episode()
+            ):
+                return
+
+        signature = self._individual_search_signature()
+
+        if signature != self.reactive_search_signature:
+            self.reactive_search_signature = signature
+            self.route_attempt_count = 0
+            self.route_tried_directions.clear()
+
+        if self.route_attempt_count >= self.route_search_max_attempts:
+            self._request_passage_assistance()
+            return
+
+        self.reactive_next_search_at = now + 2.0
+
+        if self.dialogue_outcome == "DENY_CONFIRMED":
+            self._request_next_social_alternative()
+            return
+
+        direction = (
+            self.confirmed_human_direction
+            if self.dialogue_outcome == "ALLOW_CONFIRMED"
+            else "NONE"
+        )
+
+        self._enter_replanning(
+            reason="INDIVIDUAL_REACTIVE_ROUTE_SEARCH",
+            directional_constraint=direction,
+        )
+
+    def _mode_c_reactive_generation_allowed(self):
+        """
+        Allow mode-C planning after verifying the physical hold
+        and the absence of conflicting transactions.
+
+        This method never authorizes movement.
+        """
+        return bool(
+            self.interaction == "none"
+            and self.human_proximity_active
+            and self.announcement_context_key is None
+            and not self.current_announcement_action
+            and not self.anticipatory_pending_request_id
+            and not self.anticipatory_uncertain_request_id
+            and self._reactive_planning_ready()
+        )
+    
+    def _mode_c_reactive_tick(self):
+        """Relancer une recherche après perte de perception."""
+
+        if (
+            self.fsm_state != STATE_WAITING
+            or self.route_attempt_count != 0
+            or self.pending_generation_request_id
+            or self.uncertain_generation_request_id
+            or not self._mode_c_reactive_generation_allowed()
+        ):
+            return
+
+        self._enter_replanning(
+            reason="MODE_C_REACTIVE_AFTER_OBSERVATION_LOSS",
+            directional_constraint="NONE",
+        )
+        
     def _route_observation_is_fresh(self):
-        if (not self.social_observation_available or self.social_loss_expired
-                or self.social_episode_retired or self.waiting_for_observation_reacquisition):
+        """
+        Require current factual evidence for route resolution.
+
+        Semantic consent and historical episode state never
+        establish current geometric observation.
+        """
+        if (
+            self.individual_source_session
+            and self._individual_scene_blocks_motion()
+        ):
+            return False
+
+        if (
+            not self.social_observation_available
+            or self.social_loss_expired
+            or self.social_episode_retired
+            or self.waiting_for_observation_reacquisition
+            or not self.social_observation_complete
+        ):
+            return False
+
+        if not self._fresh_observation_health_available():
+            return False
+
+        # Observation health and canonical events must belong
+        # to the same DecisionNode producer session.
+        if (
+            self.social_state_session
+            and self.health_session != self.social_state_session
+        ):
             return False
 
         if not self.human_proximity_active:
-            # CLEAR can be supported by a visible person outside the release zone.
-            # OCCUPIED does not imply that the trajectory intersects a social zone.
-            return self._fresh_observation_health_available()
+            # OCCUPIED is compatible with observed clearance.
+            # A person may remain visible outside the release boundary.
+            return True
 
-        return (
-            self.latest_social_decision is not None
-            and self._message_is_recent(
-                self.latest_social_decision,
-                self.social_decision_max_age_sec
+        decision = self.latest_social_decision
+
+        if decision is None:
+            return False
+
+        if not self._message_is_recent(
+            decision,
+            self.social_decision_max_age_sec,
+        ):
+            return False
+
+        event = normalize_social_navigation_event(
+            decision.event
+        )
+
+        if event not in {
+            SOCIAL_EVENT_INTRUSION_CONFIRMED,
+            SOCIAL_EVENT_OBSERVATION_REACQUIRED,
+        }:
+            return False
+
+        try:
+            session, episode, sequence_text = (
+                str(decision.decision_id).split(":")
             )
+            sequence = int(sequence_text)
+
+            position = decision.person_position
+
+            valid_geometry = (
+                bool(str(decision.person_id).strip())
+                and bool(str(decision.header.frame_id).strip())
+                and decision.tracking_state == "TRACKED"
+                and bool(decision.social_conflict_active)
+                and all(
+                    math.isfinite(float(value))
+                    for value in (
+                        position.x,
+                        position.y,
+                        position.z,
+                        decision.person_distance,
+                        decision.social_radius,
+                    )
+                )
+                and float(decision.person_distance) >= 0.0
+                and float(decision.social_radius) > 0.0
+            )
+
+        except (
+            ValueError,
+            TypeError,
+            AttributeError,
+            OverflowError,
+        ):
+            return False
+
+        return bool(
+            valid_geometry
+            and session == self.social_state_session
+            and episode == self.social_state_episode
+            and sequence == self.social_state_sequence
+            and self.announcement_context_key is None
+            and not self.current_announcement_action
         )
     
     def _route_scene_signature(self):
@@ -1015,7 +1655,10 @@ class CollaborationManager(Node):
         ):
             return
 
-        if not self._route_observation_is_fresh():
+        if not (
+            self._route_observation_is_fresh()
+            or self._reactive_planning_ready()
+        ):
             self._hold_route_search(
                 reason="ALTERNATIVE_REQUIRES_FRESH_OBSERVATION",
                 reconsider=True,
@@ -1135,6 +1778,95 @@ class CollaborationManager(Node):
 
         self._publish_wait(reason=reason)
         self._transition_to(STATE_WAITING, reason=reason)
+
+    def _watch_planning_reconciliation(self, now):
+        """Reconcile the exact request against its original public goal."""
+        if (
+            self.fsm_state == STATE_REPLANNING
+            and getattr(self, "_replan_hold_ready", None)
+                == self.active_navigation_goal_id
+            and not self.pending_generation_request_id
+            and not self.uncertain_generation_request_id
+        ):
+            self._request_current_trajectory_validation(
+                generation_reason="REPLAN",
+                directional_constraint=(
+                    self.pending_replan_directional_constraint
+                ),
+            )
+
+        request_id = self.uncertain_generation_request_id
+
+        if (
+            not request_id
+            and self.pending_generation_request_id
+            and self.fsm_state not in {
+                STATE_REPLANNING,
+                STATE_VALIDATING_TRAJECTORY,
+            }
+        ):
+            request_id = self.pending_generation_request_id
+            self.uncertain_generation_request_id = request_id
+            self.pending_generation_request_id = ""
+
+        if not request_id:
+            self.planning_reconciliation = None
+            return
+
+        goal_id = getattr(
+            self,
+            "_generation_owners",
+            {},
+        ).get(request_id)
+
+        if not goal_id:
+            self.get_logger().error(
+                "[PLANNING] Missing request owner; "
+                "new generation remains blocked.",
+                throttle_duration_sec=5.0,
+            )
+            return
+
+        scope = (goal_id, request_id)
+        watch = self.planning_reconciliation
+
+        if watch is None or watch["scope"] != scope:
+            watch = {
+                "scope": scope,
+                "started_at": now,
+                "next_query_at": now,
+                "queries": 0,
+            }
+            self.planning_reconciliation = watch
+
+        if (
+            now - watch["started_at"]
+            >= self.planning_reconciliation_timeout_sec
+        ):
+            if (
+                goal_id == self.active_navigation_goal_id
+                and self.pending_terminal_stop is None
+            ):
+                self._request_terminal_stop(
+                    reason="PLANNING_RECONCILIATION_EXHAUSTED"
+                )
+
+        # Continue querying terminal evidence even after STOP.
+        if now < watch["next_query_at"]:
+            return
+
+        self.generation_status_request_pub.publish(
+            String(
+                data=json.dumps({
+                    "version": 1,
+                    "navigation_goal_id": goal_id,
+                    "request_id": request_id,
+                })
+            )
+        )
+
+        watch["queries"] += 1
+        watch["next_query_at"] = now + 3.0
 
     # ================================================================
     # Observation health
@@ -1296,43 +2028,61 @@ class CollaborationManager(Node):
         elapsed = now - self.resolution_watch_started_at
 
         if elapsed >= self.social_resolution_timeout_sec:
-            self.get_logger().warning(
-                "[SOCIAL RESOLUTION] Resolution remains pending | "
+            self.get_logger().error(
+                "[SOCIAL RESOLUTION] Deadline exceeded | "
                 f"goal={goal_id} | "
                 f"elapsed={elapsed:.1f}s | "
-                "public_goal_retained=True | "
-                "reassessment_enabled=True | "
-                "navigation_authorized=False"
+                "requesting terminal controlled stop"
             )
 
-            # Restart the diagnostic interval only.
-            # Do not reset dialogue, safety barriers or route attempts.
-            self.resolution_watch_started_at = now
+            self._request_terminal_stop(
+                reason="SOCIAL_RESOLUTION_DEADLINE_EXCEEDED"
+            )
+            return False
 
         return True
 
     def _initial_social_start_allowed(self):
         """
-        Authorize an initial goal without requiring a social
-        perception message.
+        Allow the initial navigation start for a fresh public goal.
 
-        Never bypass an active or unresolved social episode.
+        Historical social states cannot block START. A new active
+        intrusion or an unfinished physical-stop transaction
+        must still prevent navigation authorization.
         """
-        if (
-            self.human_proximity_active
-            or self.social_episode_retired
-            or self.social_loss_expired
-            or self.waiting_for_observation_reacquisition
-            or not self.social_observation_available
-        ):
+        goal_id = str(self.active_navigation_goal_id or "").strip()
+
+        if not goal_id or self.active_navigation_goal_pose is None:
             return False
 
         if (
             self.nav2_cancel_requested
             or self.pending_stop_hold_request_id
+            or self.pending_terminal_stop is not None
             or self.social_resolution_aborted
         ):
             return False
+
+        # A newly confirmed intrusion belonging to this goal
+        # remains an active safety barrier.
+        if (
+            self.human_proximity_active
+            and self.social_episode_origin_goal_id == goal_id
+        ):
+            return False
+
+        # Only fresh, actually observed conflicts may block a start.
+        if self._individual_scene_current():
+            for state in self.individual_participants.values():
+                if (
+                    state["unresolved"]
+                    and state["observed_now"]
+                    and state["conflict_status"] in {
+                        "CONFLICT",
+                        "UNRESOLVED",
+                    }
+                ):
+                    return False
 
         return True
 
@@ -1449,11 +2199,516 @@ class CollaborationManager(Node):
             f"request={request_id} | "
             "social_detection_required=False"
         )
-        
+     
+    def _try_cached_path_revalidation(self, now):
+        """
+        Select a reconciled Mode-D candidate and request fresh
+        social validation without starting another Nav2 plan.
+
+        No cache entry authorizes execution by itself.
+        """
+
+        if not (
+            self.interaction == "dialogue"
+            and self.anticipatory_planning_enabled
+            and self.fsm_state == STATE_WAITING
+            and self.dialogue_outcome == "ALLOW_CONFIRMED"
+            and self.confirmed_human_intent == "ALLOW_PASSAGE"
+            and self._permission_applies_to_current_episode()
+        ):
+            return False
+
+        scope = self._anticipation_scope()
+
+        if (
+            scope is None
+            or getattr(self, "_closed_hri_scope", None) != scope
+        ):
+            return False
+
+        if (
+            self.pending_hri_close is not None
+            or self.hri_close_fault_reported
+            or self.pending_dialogue_request_id
+            or self.dialogue_audio_recovery_pending
+            or self.pending_speech_decision_id
+            or self.pending_terminal_stop is not None
+            or self.pending_gate_command is not None
+            or self.pending_generation_request_id
+            or self.uncertain_generation_request_id
+            or self.anticipatory_pending_request_id
+            or getattr(
+                self, "anticipatory_uncertain_request_id", ""
+            )
+            or self.navigation_active
+            or self.social_resolution_aborted
+            or not self._route_observation_is_fresh()
+            or not self._fresh_observation_health_available()
+        ):
+            return False
+
+        nav = self.latest_navigation_state
+
+        if (
+            nav is None
+            or str(nav.navigation_goal_id or "").strip() != scope[0]
+            or not self._message_is_recent(nav, 1.0)
+            or bool(nav.navigation_active)
+            or self.navigation_state not in {
+                "WAITING",
+                "SOCIAL_HOLD",
+                "REPLANNING",
+            }
+        ):
+            return False
+
+        # Preserve the physical hold barrier.
+        if (
+            not self.stable_stop_confirmed
+            or self.motion_state_received_at is None
+            or self.motion_state_stamp_sec is None
+            or now - self.motion_state_received_at > 0.5
+        ):
+            return False
+
+        source_age = (
+            self.get_clock().now().nanoseconds / 1e9
+            - self.motion_state_stamp_sec
+        )
+
+        if not -0.1 <= source_age <= 0.5:
+            return False
+
+        if self.nav2_cancel_requested and not (
+            self.nav2_cancel_confirmed
+            and self.stop_request_stamp_sec is not None
+            and self.motion_state_stamp_sec
+                >= self.stop_request_stamp_sec
+        ):
+            return False
+
+        candidate = self._select_anticipatory_candidate()
+
+        if candidate is None:
+            return False
+
+        request_id = str(candidate.request_id).strip()
+        path_id = str(candidate.path_id).strip()
+
+        entry = self.anticipatory_candidates.get(request_id)
+
+        if entry is None or entry.get("scope") != scope:
+            return False
+
+        # Do not retry the same candidate against the same source
+        # frame, or spin the FSM in a tight validation loop.
+        stamp_ns = self.health_stamp_ns
+
+        if stamp_ns is None:
+            return False
+
+        last_stamp = entry.get("last_revalidation_stamp_ns")
+        last_attempt = entry.get("last_revalidation_at", 0.0)
+
+        if (
+            last_stamp is not None
+            and stamp_ns <= last_stamp
+        ):
+            return False
+
+        if now - last_attempt < 1.0:
+            return False
+
+        # This request retains exactly the previously generated path.
+        # The new message goes ONLY to the validator, not to Nav2
+        # and not to GoalGate's candidate ingestion channel.
+        if not hasattr(self, "_anticipatory_revalidation_pub"):
+            self._anticipatory_revalidation_pub = (
+                self.create_publisher(
+                    CandidateTrajectory,
+                    "/social_navigation/trajectory_revalidation_request",
+                    10,
+                )
+            )
+
+        entry["last_revalidation_stamp_ns"] = stamp_ns
+        entry["last_revalidation_at"] = now
+
+        # Establish the exact selected candidate before the
+        # asynchronous validation response can be processed.
+        self._invalidate_trajectory_validation(
+            reason="CACHED_PATH_REVALIDATION_STARTED"
+        )
+
+        self.candidate_path_id = path_id
+        self.candidate_navigation_goal_id = scope[0]
+        self.generation_requested_at = now
+        self.anticipatory_selected_request_id = request_id
+
+        self._transition_to(
+            STATE_VALIDATING_TRAJECTORY,
+            reason="CACHED_PATH_FRESH_REVALIDATION",
+        )
+
+        self._anticipatory_revalidation_pub.publish(candidate)
+
+        self.get_logger().info(
+            "[MODE D REVALIDATION] "
+            f"goal={scope[0]} | "
+            f"person={scope[4]} | "
+            f"path={path_id} | "
+            "nav2_generation_reused=True | "
+            "movement_authorized=False"
+        )
+
+        return True
+    
     # ================================================================
     # Episode retirement
     # ================================================================
 
+    def _initialize_social_reassessment(self):
+        """
+        Initialize factual reassessment and optional anticipatory planning.
+
+        Anticipatory planning is strictly isolated from mode C.
+        No anticipatory work starts during initialization.
+        """
+
+        self._sr_scope = None
+        self._sr_pending = None
+        self._sr_result = None
+        self._sr_next_at = time.monotonic() + 3.0
+
+        qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+
+        self._sr_request_pub = self.create_publisher(
+            String,
+            "/social_navigation/reassessment_request",
+            qos,
+        )
+
+        self._sr_result_sub = self.create_subscription(
+            String,
+            "/social_navigation/reassessment_result",
+            self._social_reassessment_result_callback,
+            qos,
+        )
+
+        # ---------------------------------------------------------
+        # Optional Mode-D anticipation
+        # ---------------------------------------------------------
+
+        self.declare_parameter(
+            "anticipatory_planning_enabled",
+            False,
+        )
+
+        configured = self.get_parameter(
+            "anticipatory_planning_enabled"
+        ).value
+
+        if not isinstance(configured, bool):
+            raise ValueError(
+                "anticipatory_planning_enabled must be boolean"
+            )
+
+        self.anticipatory_planning_enabled = bool(
+            configured and self.interaction == "dialogue"
+        )
+
+        # Immutable candidate metadata, indexed by request ID.
+        self.anticipatory_requests = {}
+
+        # Successfully generated candidate messages, indexed by
+        # the same request IDs. These do not authorize execution.
+        self.anticipatory_candidates = {}
+
+        # Current anticipatory generation, if any.
+        self.anticipatory_pending_request_id = ""
+        self.anticipatory_uncertain_request_id = ""
+
+        # Scope for which the cache was constructed.
+        self.anticipatory_scope = None
+
+        # Directions awaiting generation.
+        self.anticipatory_queue = []
+
+        # A candidate may be ready but require revalidation.
+        self.anticipatory_selected_request_id = ""
+
+        self.get_logger().info(
+            "[ANTICIPATORY PLANNING] "
+            f"interaction={self.interaction} | "
+            f"enabled={self.anticipatory_planning_enabled} | "
+            "execution_authorization=False"
+        )
+        
+    def _social_reassessment_scope(self):
+        """Identify the public goal and current social episode."""
+        return (
+            self.active_navigation_goal_id,
+            self.social_state_session or self.health_session,
+            self.social_state_episode,
+        )
+
+    def _social_reassessment_tick(self, now):
+        """
+        Request fresh factual assessment while waiting.
+
+        This method never publishes REPLAN or RESUME.
+        Technical transaction uncertainty does not prevent
+        perception reassessment.
+        """
+        scope = self._social_reassessment_scope()
+
+        if scope != self._sr_scope:
+            self._sr_scope = scope
+            self._sr_pending = None
+            self._sr_result = None
+            self._sr_next_at = now + 3.0
+
+        if (
+            not scope[0]
+            or self.fsm_state != STATE_WAITING
+            or self.pending_terminal_stop is not None
+            or self.social_resolution_aborted
+        ):
+            self._sr_pending = None
+            self._sr_result = None
+            self._sr_next_at = now + 3.0
+            return
+
+        pending = self._sr_pending
+
+        if pending is not None:
+            if now >= pending["deadline"]:
+                self.get_logger().warning(
+                    "[SOCIAL REASSESSMENT] "
+                    "Response timeout; motion remains held."
+                )
+
+                self._sr_pending = None
+                self._sr_result = None
+                self._sr_next_at = now + 3.0
+
+            return
+
+        if now < self._sr_next_at:
+            return
+
+        request_id = (
+            f"SOCIAL_REASSESS_{uuid.uuid4().hex}"
+        )
+
+        requested_ns = self.get_clock().now().nanoseconds
+
+        self._sr_pending = {
+            "request_id": request_id,
+            "requested_ns": requested_ns,
+            "deadline": now + 4.0,
+            "scope": scope,
+        }
+
+        self._sr_result = None
+
+        self._sr_request_pub.publish(
+            String(
+                data=json.dumps({
+                    "version": 1,
+                    "request_id": request_id,
+                    "goal_id": scope[0],
+                    "session": scope[1],
+                    "episode": scope[2],
+                    "requested_ns": requested_ns,
+                })
+            )
+        )
+
+    def _social_reassessment_result_callback(self, msg):
+        """
+        Store a matching fresh result.
+
+        Canonical social events remain responsible for updating
+        episode state. This callback never authorizes motion.
+        """
+        pending = self._sr_pending
+
+        if pending is None:
+            return
+
+        try:
+            data = json.loads(msg.data)
+
+            if (
+                not isinstance(data, dict)
+                or data.get("version") != 1
+            ):
+                return
+
+            if (
+                data.get("request_id") != pending["request_id"]
+                or data.get("goal_id") != pending["scope"][0]
+            ):
+                return
+
+            status = str(data["status"])
+            stamp_ns = int(data["observation_stamp_ns"])
+            sequence = int(data["sequence"])
+
+            identity = (
+                str(data["session"]),
+                str(data["episode"]),
+            )
+
+        except (ValueError, TypeError, KeyError):
+            return
+
+        now = time.monotonic()
+
+        self._sr_pending = None
+        self._sr_result = None
+        self._sr_next_at = now + 3.0
+
+        if (
+            now >= pending["deadline"]
+            or self.fsm_state != STATE_WAITING
+            or self._social_reassessment_scope() != pending["scope"]
+            or identity != pending["scope"][1:]
+        ):
+            return
+
+        if status not in {
+            "CONFLICT",
+            "CLEAR",
+            "NO_CURRENT_INTRUSION",
+            "EMPTY_UNRESOLVED",
+        }:
+            self.get_logger().info(
+                "[SOCIAL REASSESSMENT] "
+                f"result={status}; motion remains held."
+            )
+            return
+
+        age = (
+            self.get_clock().now().nanoseconds - stamp_ns
+        ) / 1e9
+
+        if (
+            stamp_ns <= pending["requested_ns"]
+            or not 0.0 <= age <= self.social_decision_max_age_sec
+        ):
+            return
+
+        self._sr_result = {
+            "scope": pending["scope"],
+            "status": status,
+            "stamp_ns": stamp_ns,
+            "sequence": sequence,
+        }
+
+    def _social_reassessment_ready(self, allowed_statuses):
+        """
+        Require a fresh response consistent with canonical episode state.
+
+        This method authorizes policy reconsideration only.
+        It never authorizes navigation execution.
+        """
+        result = self._sr_result
+
+        if result is None:
+            return False
+
+        if (
+            result["scope"] != self._social_reassessment_scope()
+            or result["status"] not in allowed_statuses
+        ):
+            return False
+
+        age = (
+            self.get_clock().now().nanoseconds
+            - result["stamp_ns"]
+        ) / 1e9
+
+        if not 0.0 <= age <= self.social_decision_max_age_sec:
+            self._sr_result = None
+            return False
+
+        if result["sequence"] < 0:
+            self._sr_result = None
+            return False
+
+        # Canonical events and reassessment responses use
+        # separate topics and may arrive in either order.
+        if (
+            self.social_state_episode
+            and self.social_state_sequence < result["sequence"]
+        ):
+            return False
+
+        status = result["status"]
+
+        if status == "CONFLICT":
+            return bool(
+                self.human_proximity_active
+                and self._route_observation_is_fresh()
+            )
+
+        if status == "CLEAR":
+            decision = self.latest_social_decision
+
+            if (
+                decision is None
+                or normalize_social_navigation_event(
+                    decision.event
+                ) != SOCIAL_EVENT_CLEAR
+            ):
+                return False
+
+            return bool(
+                not self.human_proximity_active
+                and not self.social_episode_retired
+                and not self.social_loss_expired
+                and not self.waiting_for_observation_reacquisition
+                and self._message_is_recent(
+                    decision,
+                    self.social_decision_max_age_sec,
+                )
+                and self._route_observation_is_fresh()
+            )
+
+        if status == "NO_CURRENT_INTRUSION":
+            # This response cannot silently resolve an episode
+            # that remains unresolved in canonical state.
+            return bool(
+                not self.human_proximity_active
+                and not self.social_episode_retired
+                and not self.social_loss_expired
+                and not self.waiting_for_observation_reacquisition
+                and self._route_observation_is_fresh()
+            )
+
+        if status == "EMPTY_UNRESOLVED":
+            # Empty observations permit the dedicated recovery
+            # policy to reconsider the situation.
+            # They do not establish CLEAR or permission to move.
+            return bool(
+                self.human_proximity_active
+                and self.latest_observation_health == "EMPTY"
+                and self._fresh_observation_health_available()
+                and (
+                    not self.social_state_session
+                    or self.health_session == self.social_state_session
+                )
+            )
+
+        return False
+    
     def _social_episode_retirement_callback(self, msg):
         parts = str(msg.data or "").strip().split(":")
 
@@ -1573,13 +2828,26 @@ class CollaborationManager(Node):
         )
 
     def _evaluate_route_resolution(self, now):
-        """Supervise initial waiting and bounded reassessment after fresh input."""
+        """Reassess first, then apply the existing collaboration policy."""
+        self._social_reassessment_tick(now)
+
         if not self._resolution_budget_available(now):
             return
-
-        # Initial waiting can use NAVIGATING without actual execution.
-        # Its deadline has already been checked above.
-        if self.fsm_state == STATE_NAVIGATING:
+        
+        # Mode D: the cached-path policy owns route selection
+        # after confirmed human permission.
+        if (
+            self.interaction == "dialogue"
+            and self.anticipatory_planning_enabled
+            and self.dialogue_outcome == "ALLOW_CONFIRMED"
+            and self._permission_applies_to_current_episode()
+            and self.pending_terminal_stop is None
+            and self.fsm_state == STATE_WAITING
+            and (
+                self.anticipatory_candidates
+                or self.anticipatory_pending_request_id
+            )
+        ):
             return
 
         if self.fsm_state in {
@@ -1599,14 +2867,7 @@ class CollaborationManager(Node):
 
                 self._hold_route_search(
                     reason="TRAJECTORY_PIPELINE_TIMEOUT",
-                    reconsider=False,
-                )
-
-                self.get_logger().error(
-                    "[TRAJECTORY PIPELINE] Timeout. "
-                    "Public goal retained; execution inhibited. "
-                    "Outstanding planning termination must "
-                    "be reconciled before another request."
+                    reconsider=True,
                 )
 
             return
@@ -1615,6 +2876,7 @@ class CollaborationManager(Node):
             self.fsm_state != STATE_WAITING
             or not self.route_waiting_for_change
             or self.navigation_active
+            or self.pending_terminal_stop is not None
             or self.pending_hri_close is not None
             or self.pending_gate_command is not None
             or self.pending_speech_decision_id
@@ -1625,7 +2887,7 @@ class CollaborationManager(Node):
         ):
             return
 
-        # Lost and retired episodes retain their separate recovery policy.
+        # Retired episodes retain their explicit recovery policy.
         if (
             self.social_episode_retired
             or self.social_loss_expired
@@ -1633,10 +2895,35 @@ class CollaborationManager(Node):
         ):
             return
 
+        if not self._social_reassessment_ready({
+            "CONFLICT",
+            "CLEAR",
+            "NO_CURRENT_INTRUSION",
+        }):
+            return
+
         if not self._route_observation_is_fresh():
             return
 
         if not self._fresh_observation_health_available():
+            return
+
+        nav = self.latest_navigation_state
+
+        if (
+            nav is None
+            or nav.navigation_goal_id != self.active_navigation_goal_id
+            or not self._message_is_recent(nav, 1.0)
+            or bool(nav.navigation_active)
+            or self.navigation_state not in {
+                "WAITING",
+                "SOCIAL_HOLD",
+                "REPLANNING",
+            }
+        ):
+            return
+
+        if now - self.reassessment_last_at < 3.0:
             return
 
         stamp_ns = self.health_stamp_ns
@@ -1650,11 +2937,6 @@ class CollaborationManager(Node):
         ):
             return
 
-        if now - self.reassessment_last_at < 3.0:
-            return
-
-        # These existing fields also apply to fresh OCCUPIED observations.
-        # A retry after UNKNOWN must use a newer source observation.
         if (
             self.initial_empty_retry_goal_id
             == self.active_navigation_goal_id
@@ -1662,24 +2944,17 @@ class CollaborationManager(Node):
             if now < self.initial_empty_retry_not_before:
                 return
 
-            previous_stamp = self.initial_empty_retry_after_health_ns
+            previous = self.initial_empty_retry_after_health_ns
 
-            if (
-                previous_stamp is not None
-                and stamp_ns <= previous_stamp
-            ):
+            if previous is not None and stamp_ns <= previous:
                 return
 
         if self.route_attempt_count >= self.route_search_max_attempts:
-            # Freshness and the waiting interval were checked above.
             self.route_attempt_count = 0
             self.route_tried_directions.clear()
 
-            self.get_logger().info(
-                "[ROUTE SEARCH] Starting another bounded search cycle | "
-                "human_preferences_preserved=True | "
-                "navigation_authorized=False"
-            )
+        # Consume this assessment for one policy continuation.
+        self._sr_result = None
 
         self.reassessment_last_at = now
         self.reassessment_last_stamp_ns = stamp_ns
@@ -1688,25 +2963,18 @@ class CollaborationManager(Node):
         self.initial_empty_retry_after_health_ns = None
         self.route_waiting_for_change = False
 
-        self.get_logger().info(
-            "[SOCIAL REASSESSMENT] Fresh input received | "
-            f"health={self.latest_observation_health} | "
-            f"source_ns={stamp_ns} | "
-            "navigation_authorized=False"
-        )
-
         if self.confirmed_human_intent == "DENY_PASSAGE":
             self._request_next_social_alternative()
             return
 
-        # Existing mode-D guards require the applicable dialogue outcome.
+        # Mode-D dialogue guards remain inside _enter_replanning().
         self._enter_replanning(
-            reason="FRESH_SOCIAL_REASSESSMENT",
+            reason="SOCIAL_REASSESSMENT_COMPLETED",
             directional_constraint=self.confirmed_human_direction,
         )
 
     def _evaluate_retired_episode_recovery(self):
-        """Schedule repeated, evidence-based recovery assessments."""
+        """Require explicit reassessment before retired-episode recovery."""
         goal_id = str(
             self.active_navigation_goal_id or ""
         ).strip()
@@ -1715,14 +2983,10 @@ class CollaborationManager(Node):
             not goal_id
             or self.active_navigation_goal_pose is None
             or self.social_resolution_aborted
+            or self.fsm_state != STATE_WAITING
         ):
             return
 
-        if self.fsm_state != STATE_WAITING:
-            return
-
-        # Do not overlap unresolved navigation, speech,
-        # dialogue or trajectory-generation transactions.
         if (
             self.pending_terminal_stop is not None
             or self.pending_hri_close is not None
@@ -1743,12 +3007,14 @@ class CollaborationManager(Node):
         ):
             return
 
-        # The Gate must have completed goal reception.
         if self.gate_ready_goal_id != goal_id:
             return
 
-        # Preserve the existing recovery evidence requirements.
-        # Retirement and elapsed time are not clearance.
+        if not self._social_reassessment_ready({
+            "EMPTY_UNRESOLVED",
+        }):
+            return
+
         if not self._retired_recovery_evidence_available(
             require_selected_goal=False
         ):
@@ -1762,24 +3028,20 @@ class CollaborationManager(Node):
         ):
             return
 
-        stamp_ns = self.health_stamp_ns
-
-        if stamp_ns is None:
-            return
-
-        # Repeated delivery of the same observation cannot
-        # trigger another recovery assessment.
-        if (
-            self.reassessment_last_stamp_ns is not None
-            and stamp_ns <= self.reassessment_last_stamp_ns
-        ):
-            return
-
         if now - self.reassessment_last_at < 3.0:
             return
 
-        # Renew only the search budget.
-        # Preserve the episode, dialogue outcome and constraints.
+        stamp_ns = self.health_stamp_ns
+
+        if (
+            stamp_ns is None
+            or (
+                self.reassessment_last_stamp_ns is not None
+                and stamp_ns <= self.reassessment_last_stamp_ns
+            )
+        ):
+            return
+
         if (
             self.retired_recovery_attempt_count
             >= self.route_search_max_attempts
@@ -1791,6 +3053,8 @@ class CollaborationManager(Node):
             self.route_tried_directions.clear()
             self.retired_recovery_exhaustion_logged = False
 
+        self._sr_result = None
+
         self.reassessment_last_at = now
         self.reassessment_last_stamp_ns = stamp_ns
 
@@ -1799,35 +3063,29 @@ class CollaborationManager(Node):
         self.retired_recovery_goal_id = goal_id
         self.retired_recovery_path_id = ""
 
-        self.get_logger().info(
-            "[SOCIAL RECOVERY] Fresh assessment requested | "
-            f"goal={goal_id} | "
-            f"assessment={self.retired_recovery_attempt_count}/"
-            f"{self.route_search_max_attempts} | "
-            f"source_ns={stamp_ns} | "
-            "direction=NONE | "
-            "navigation_authorized=False"
-        )
-
         self._enter_replanning(
-            reason="RETIRED_EPISODE_FRESH_REASSESSMENT",
+            reason="RETIRED_EPISODE_REASSESSED",
             directional_constraint="NONE",
         )
-    
+        
     # ================================================================
     # Ordered social events
     # ================================================================
+
 
     def _social_decision_callback(self, msg):
         """
         Process ordered social events.
 
-        A retired episode may be superseded by a new,
-        freshly confirmed intrusion even while navigation
-        is active.
+        Preserve confirmed human permission across a new
+        social episode only for the same public goal,
+        person ID, and tracking session.
 
-        Old events cannot reactivate retired episodes.
+        Preserve directional semantics separately from
+        physical motion authorization.
         """
+        import copy
+
         if not self._is_fresh_social_decision(msg):
             return
 
@@ -1841,6 +3099,13 @@ class CollaborationManager(Node):
         }
 
         if event not in supported_events:
+            return
+
+        if not self._validate_participant_context(msg, event):
+            self.get_logger().warning(
+                "[SOCIAL STATE] Invalid participant context.",
+                throttle_duration_sec=2.0,
+            )
             return
 
         try:
@@ -1872,16 +3137,13 @@ class CollaborationManager(Node):
             self.social_state_episode,
         )
 
-        new_episode = (
-            incoming_identity != current_identity
-        )
+        new_episode = incoming_identity != current_identity
 
         if not new_episode:
             if sequence <= self.social_state_sequence:
                 return
 
         else:
-            # Only a confirmed intrusion may open an episode.
             if event != SOCIAL_EVENT_INTRUSION_CONFIRMED:
                 return
 
@@ -1890,8 +3152,7 @@ class CollaborationManager(Node):
 
                 valid_geometry = (
                     bool(str(msg.person_id).strip())
-                    and str(msg.tracking_state).upper()
-                        == "TRACKED"
+                    and str(msg.tracking_state).upper() == "TRACKED"
                     and bool(str(msg.header.frame_id).strip())
                     and all(
                         math.isfinite(float(value))
@@ -1917,11 +3178,6 @@ class CollaborationManager(Node):
                 )
                 return
 
-            # Decision sequence is monotonic within a producer session.
-            # OBSERVATION_LOST uses publication time, whereas
-            # INTRUSION_CONFIRMED uses camera observation time.
-            # Comparing these timestamps rejects valid new episodes.
-            # Freshness is already checked at callback entry.
             if (
                 session == self.social_state_session
                 and sequence <= self.social_state_sequence
@@ -1957,9 +3213,6 @@ class CollaborationManager(Node):
                     )
                     return
 
-                # Never reset an unfinished stop or audio
-                # transaction. The new episode must be
-                # observed again after the barrier completes.
                 if (
                     self.fsm_state
                         == STATE_STOPPING_FOR_SOCIAL_CONFLICT
@@ -1980,19 +3233,15 @@ class CollaborationManager(Node):
                     f"new={incoming_identity}"
                 )
 
-            # Preserve the identity of the replaced episode.
-            # Dictionary insertion order is deterministic.
             if current_identity[0] and current_identity[1]:
                 self.retired_social_episode_ids[
                     current_identity
                 ] = True
 
-            # Bound retained history without unordered set slicing.
             while len(self.retired_social_episode_ids) > 256:
                 oldest_identity = next(
                     iter(self.retired_social_episode_ids)
                 )
-
                 self.retired_social_episode_ids.pop(
                     oldest_identity,
                     None,
@@ -2010,15 +3259,140 @@ class CollaborationManager(Node):
                 self.active_navigation_goal_id or ""
             ).strip()
 
+            previous_scope = self.authorized_episode_key
+
+            incoming_person_id = str(
+                msg.person_id or ""
+            ).strip()
+
+            incoming_tracking_session = str(
+                msg.tracking_session_id or ""
+            ).strip()
+
+            same_person_consent = bool(
+                self.interaction == "dialogue"
+                and previous_scope is not None
+                and len(previous_scope) == 5
+                and self.confirmed_human_intent == "ALLOW_PASSAGE"
+                and self.dialogue_outcome == "ALLOW_CONFIRMED"
+                and previous_scope[0] == episode_origin_goal_id
+                and previous_scope[3] == incoming_tracking_session
+                and previous_scope[4] == incoming_person_id
+                and incoming_person_id
+                and incoming_tracking_session
+            )
+
+            retained_direction = (
+                str(
+                    self.confirmed_human_direction or "NONE"
+                ).strip().upper()
+                if same_person_consent
+                else "NONE"
+            )
+
+            retained_interaction_id = (
+                str(
+                    getattr(
+                        self,
+                        "_directional_confirmed_interaction_id",
+                        "",
+                    ) or ""
+                ).strip()
+                if same_person_consent
+                else ""
+            )
+
+            retained_finalization = None
+
+            if (
+                same_person_consent
+                and retained_direction in {"LEFT", "RIGHT"}
+            ):
+                old_finalization = getattr(
+                    self,
+                    "_directional_finalization",
+                    None,
+                )
+
+                if isinstance(old_finalization, dict):
+                    candidate = old_finalization.get("candidate")
+
+                    if (
+                        old_finalization.get("phase") == "ANNOUNCED"
+                        and old_finalization.get("scope")
+                            == previous_scope
+                        and isinstance(candidate, dict)
+                        and candidate.get("scope") == previous_scope
+                        and candidate.get(
+                            "final_confirmation_received"
+                        ) is True
+                        and candidate.get("direction")
+                            == retained_direction
+                        and candidate.get("interaction_id")
+                            == retained_interaction_id
+                        and candidate.get(
+                            "final_confirmation_request_id"
+                        ) == old_finalization.get("request_id")
+                        and candidate.get(
+                            "resolved_robot_direction"
+                        ) in {"LEFT", "RIGHT"}
+                        and getattr(
+                            self,
+                            "_directional_announcement_complete",
+                            False,
+                        )
+                        and getattr(
+                            self,
+                            "_direction_semantic_ready",
+                            False,
+                        )
+                    ):
+                        retained_finalization = copy.deepcopy(
+                            old_finalization
+                        )
+
+                # Directional consent is not reusable unless
+                # the original confirmation can be preserved.
+                if retained_finalization is None:
+                    same_person_consent = False
+
             self._reset_episode()
 
             self.social_state_session = session
             self.social_state_episode = episode
             self.social_state_sequence = 0
 
+            self._retained_same_person_consent = (
+                {
+                    "scope": (
+                        episode_origin_goal_id,
+                        session,
+                        episode,
+                        incoming_tracking_session,
+                        incoming_person_id,
+                    ),
+                    "direction": retained_direction,
+                    "interaction_id": retained_interaction_id,
+                    "finalization": retained_finalization,
+                }
+                if same_person_consent
+                else None
+            )
+
             self.social_episode_origin_goal_id = (
                 episode_origin_goal_id
             )
+
+            if same_person_consent:
+                self.get_logger().info(
+                    "[SOCIAL CONSENT] Permission retained | "
+                    f"goal={episode_origin_goal_id} | "
+                    f"new_episode={episode} | "
+                    f"person={incoming_person_id} | "
+                    f"tracking_session={incoming_tracking_session} | "
+                    f"human_direction={retained_direction} | "
+                    "dialogue_restart_required=False"
+                )
 
             self._transition_to(
                 STATE_NAVIGATING,
@@ -2027,6 +3401,9 @@ class CollaborationManager(Node):
 
         self.social_state_sequence = sequence
         self.latest_social_decision = msg
+
+        if not self._adopt_participant_context(msg):
+            return
 
         if event in {
             SOCIAL_EVENT_INTRUSION_CONFIRMED,
@@ -2055,9 +3432,16 @@ class CollaborationManager(Node):
             return
 
         if event == SOCIAL_EVENT_CLEAR:
+            if not self._individual_scene_all_clear():
+                self.get_logger().warning(
+                    "[INDIVIDUAL SOCIAL] Scene CLEAR held: "
+                    "an independent episode remains unresolved."
+                )
+                return
+
             if self.human_proximity_active:
                 self._handle_clear(msg)
-
+                
     def _handle_intrusion_confirmed(self, msg):
         self.active_decision_id = msg.decision_id
         self.active_person_id = msg.person_id
@@ -2123,13 +3507,21 @@ class CollaborationManager(Node):
                 f"close={pending['close_id']}"
             )
 
-        # Retain ownership for a late CLOSED,
-        # but terminate the public transaction.
+        # An HRI close timeout is not a request to abandon
+        # the public navigation goal.
+        # Remain stopped, retain the pending close transaction,
+        # and accept a matching late CLOSED acknowledgement.
+        #
+        # Never authorize motion while closure is uncertain.
         if self.active_navigation_goal_id:
-            self._request_terminal_stop(
-                reason="HRI_CLOSE_ACK_TIMEOUT"
+            self._hold_route_search(
+                reason="HRI_CLOSE_ACK_TIMEOUT",
+                reconsider=False,
             )
+
     def _hri_dialogue_control_result_callback(self, msg):
+        """Accept exact HRI closure without bypassing navigation safety."""
+
         try:
             data = json.loads(msg.data)
         except (TypeError, ValueError):
@@ -2151,15 +3543,15 @@ class CollaborationManager(Node):
 
         if (
             str(data.get("close_id") or "")
-            != pending["close_id"]
+                != pending["close_id"]
             or str(data.get("interaction_id") or "")
-            != pending["interaction_id"]
+                != pending["interaction_id"]
         ):
             return
 
         status = str(
             data.get("status") or ""
-        ).upper()
+        ).strip().upper()
 
         if status == "TERMINATION_UNCONFIRMED":
             self.hri_close_fault_reported = True
@@ -2169,78 +3561,132 @@ class CollaborationManager(Node):
             )
 
             self.get_logger().error(
-                "[HRI CLOSE] Audio termination unconfirmed | "
+                "[HRI CLOSE] Termination unconfirmed | "
                 f"close={pending['close_id']}"
             )
-
-            # Keep ownership and accept a late terminal response.
             return
 
         if status != "CLOSED":
-            self.get_logger().error(
-                "[HRI CLOSE] Unexpected result | "
-                f"status={status} | close={pending['close_id']}"
-            )
             return
-
-        self.get_logger().info(
-            "[HRI CLOSE] Confirmed | "
-            f"close={pending['close_id']}"
-        )
 
         closed_interaction_id = pending["interaction_id"]
 
+        turn_key = (
+            pending["interaction_id"],
+            pending["request_id"],
+        )
+
+        owner_scope = self.mode_d_hri_turns.get(turn_key)
+
+        if owner_scope is not None:
+            case = self.mode_d_cases.get(owner_scope)
+
+            if case is not None:
+                case["hri_closed"] = True
+
+            self.mode_d_hri_closures[turn_key] = {
+                "close_id": pending["close_id"],
+                "scope": owner_scope,
+            }
+
+            if self.mode_d_hri_owner == owner_scope:
+                self.mode_d_hri_owner = None
+
+            for key in list(self.mode_d_hri_turns):
+                if key[0] == closed_interaction_id:
+                    self.mode_d_hri_turns.pop(key, None)
+
+            while len(self.mode_d_hri_closures) > 256:
+                oldest_key = next(iter(self.mode_d_hri_closures))
+                self.mode_d_hri_closures.pop(oldest_key, None)
+                
         self.pending_hri_close = None
         self.hri_close_fault_reported = False
         self.dialogue_audio_recovery_pending = False
         self.audio_recovery_interaction_id = ""
         self.audio_recovery_request_id = ""
 
+        if (
+            self.interaction == "dialogue"
+            and self.active_interaction_id == closed_interaction_id
+            and self.dialogue_outcome == "ALLOW_CONFIRMED"
+            and self._permission_applies_to_current_episode()
+        ):
+            self._closed_hri_scope = self._anticipation_scope()
+            
         if self.active_interaction_id == closed_interaction_id:
             self.active_interaction_id = ""
             self.active_dialogue_request_type = ""
             self.pending_dialogue_request_id = ""
+            self.pending_dialogue_scope = None
             self.dialogue_started_at = None
             self.waiting_for_human_initiative = False
 
-        # Resume policy evaluation after the exact HRI transaction ended.
+        self.get_logger().info(
+            "[HRI CLOSE] Exact closure confirmed | "
+            f"interaction={closed_interaction_id} | "
+            f"outcome={self.dialogue_outcome}"
+        )
+
         if (
-            self.active_navigation_goal_id
-            and not self.social_resolution_aborted
-            and self.pending_terminal_stop is None
-            and not self.pending_speech_decision_id
-            and self.fsm_state == STATE_WAITING
-            and self._route_observation_is_fresh()
+            not self.active_navigation_goal_id
+            or self.social_resolution_aborted
+            or self.pending_terminal_stop is not None
+            or self.pending_speech_decision_id
+            or self.pending_gate_command is not None
+            or self.fsm_state != STATE_WAITING
         ):
-            if not self.human_proximity_active:
-                self.deferred_clear_replan_goal_id = (
-                    self.active_navigation_goal_id
-                )
+            return
 
-            elif (
-                "WAIT",
+        if not self.human_proximity_active:
+            self.deferred_clear_replan_goal_id = (
                 self.active_navigation_goal_id
-            ) in self.finished_announcement_attempts:
-                if self.interaction == "dialogue":
-                    if self.dialogue_outcome == "ALLOW_CONFIRMED":
-                        self._enter_replanning(
-                            reason="HRI_CLOSED_PERMISSION_CONFIRMED",
-                            directional_constraint=(
-                                self.confirmed_human_direction
-                            ),
-                        )
-                    elif self.dialogue_outcome == "NONE":
-                        self._start_human_initiative_window()
-                else:
-                    self.conflict_observed_since = (
-                        time.monotonic()
-                    )
-                    self.persistent_conflict_handled = False
-                    self._transition_to(
-                        STATE_OBSERVING,
-                        reason="HRI_CLOSED_OBSERVATION_RESTORED"
-                    )
+            )
+            return
 
+        if (
+            self.interaction == "dialogue"
+            and self.dialogue_outcome == "ALLOW_CONFIRMED"
+            and self._permission_applies_to_current_episode()
+        ):
+            if self.anticipatory_planning_enabled:
+                # No second Nav2 generation here.
+                # A separate selector will reuse a candidate
+                # only after exact terminal reconciliation.
+                self._schedule_social_reassessment()
+
+                self.get_logger().info(
+                    "[MODE D] HRI closed; awaiting cached-path "
+                    "selection and fresh validation."
+                )
+                return
+
+            # Existing non-anticipatory mode-D fallback.
+            self._enter_replanning(
+                reason="HRI_CLOSED_PERMISSION_CONFIRMED",
+                directional_constraint=(
+                    self.confirmed_human_direction
+                ),
+            )
+            return
+
+        if self.dialogue_outcome == "DENY_CONFIRMED":
+            if self._route_observation_is_fresh():
+                self._request_next_social_alternative()
+            else:
+                self._schedule_social_reassessment()
+            return
+
+        if (
+            self.dialogue_outcome == "NONE"
+            and self._route_observation_is_fresh()
+            and not self.dialogue_audio_recovery_pending
+        ):
+            self._start_human_initiative_window()
+            return
+
+        self._schedule_social_reassessment()
+        
     def _request_hri_close(self, reason):
         """Close only a dialogue turn actually submitted to HRI."""
         if self.pending_hri_close is not None:
@@ -2285,19 +3731,15 @@ class CollaborationManager(Node):
     
     def _handle_clear(self, msg):
         """
-        Process factual social clearance.
+        Process factual clearance without confusing it with
+        dialogue ownership or semantic permission.
 
-        Do not interrupt an already executing, validated
-        social recovery merely because the person has moved
-        outside the social conflict zone.
-
-        CLEAR never creates execution authorization.
+        Mode C: preserve the existing clearance policy.
+        Mode D: CLEAR never revokes a confirmed permission
+        and never closes an unfinished dialogue by itself.
         """
 
         if self.pending_terminal_stop is not None:
-            self.get_logger().info(
-                "[CLEAR] Public goal termination already requested."
-            )
             return
 
         goal_id = str(
@@ -2308,14 +3750,10 @@ class CollaborationManager(Node):
             msg.person_id or ""
         ).strip()
 
-        # Capture the previous scope before modifying the
-        # active social context.
         resolved_scope = self._same_resolved_social_scope(
             person_id
         )
 
-        # Nav2 execution must already have been confirmed.
-        # A pending RESUME is not sufficient.
         execution_confirmed = bool(
             goal_id
             and resolved_scope
@@ -2326,15 +3764,20 @@ class CollaborationManager(Node):
             and self.pending_terminal_stop is None
         )
 
-        self.active_decision_id = msg.decision_id
-
-        if person_id:
+        # Preserve the canonical actor while a Mode-D dialogue
+        # owns it. CLEAR may concern another participant.
+        if self.interaction != "dialogue" and person_id:
             self.active_person_id = person_id
+
+        self.active_decision_id = msg.decision_id
 
         self.human_proximity_active = False
         self.social_observation_available = True
-        self.waiting_for_observation_reacquisition = False
+        self.social_observation_complete = bool(
+            msg.observation_complete
+        )
 
+        self.waiting_for_observation_reacquisition = False
         self.social_loss_started_at = None
         self.social_loss_expired = False
         self.pending_retired_episode = None
@@ -2348,25 +3791,135 @@ class CollaborationManager(Node):
         self.persistent_conflict_handled = False
 
         if execution_confirmed:
-            # Do not reset route-search memory, cancel Nav2,
-            # send WAIT or start another planning transaction.
-            #
-            # The existing validated execution continues
-            # under Nav2 controller/costmap supervision.
             self.route_waiting_for_change = False
             self.route_blocked_signature = None
 
             self.get_logger().info(
                 "[SOCIAL CLEAR] "
-                "Resolved social episode cleared | "
-                f"goal={goal_id} | "
-                "validated_navigation_continues=True | "
-                "additional_replanning=False"
+                "Already validated navigation continues | "
+                f"goal={goal_id}"
             )
             return
 
-        # In every other case, retain the original
-        # conservative clearance procedure.
+        # =====================================================
+        # MODE D: independent dialogue and clearance policies
+        # =====================================================
+
+        if self.interaction == "dialogue":
+
+            permission_confirmed = (
+                self.dialogue_outcome == "ALLOW_CONFIRMED"
+                and self.confirmed_human_intent == "ALLOW_PASSAGE"
+                and self._permission_applies_to_current_episode()
+            )
+
+            dialogue_unfinished = bool(
+                self.pending_hri_close is not None
+                or self.pending_dialogue_request_id
+                or self.dialogue_audio_recovery_pending
+            )
+
+            if permission_confirmed:
+
+                # Semantic authorization remains valid for this
+                # exact person and episode. Geometry must be
+                # checked again before any movement.
+                self._invalidate_trajectory_validation(
+                    reason="CLEAR_REQUIRES_FRESH_PATH_VALIDATION"
+                )
+
+                self._schedule_social_reassessment()
+
+                if dialogue_unfinished:
+                    if goal_id:
+                        self._publish_wait(
+                            reason="CLEAR_AWAITING_EXISTING_HRI_TRANSACTION"
+                        )
+
+                    # Keep the already-owned HRI transaction.
+                    # Do not request another close.
+                    return
+
+                if not goal_id:
+                    return
+
+                if self.anticipatory_planning_enabled:
+                    # The cached-path selector will run through
+                    # the existing timer and require new validation.
+                    self._publish_wait(
+                        reason="CLEAR_REVALIDATE_CACHED_PATH"
+                    )
+
+                    self._transition_to(
+                        STATE_WAITING,
+                        reason="CLEAR_REVALIDATE_CACHED_PATH",
+                    )
+                    return
+
+                self._enter_replanning(
+                    reason="CLEAR_AFTER_CONFIRMED_PERMISSION",
+                    directional_constraint=(
+                        self.confirmed_human_direction
+                    ),
+                )
+                return
+
+            if dialogue_unfinished:
+
+                # CLEAR does not own or terminate a dialogue.
+                # The HRI response/close protocol remains in charge.
+                self._invalidate_trajectory_validation(
+                    reason="CLEAR_DURING_ACTIVE_DIALOGUE"
+                )
+
+                if goal_id:
+                    self._publish_wait(
+                        reason="CLEAR_DIALOGUE_STILL_ACTIVE"
+                    )
+
+                self._schedule_social_reassessment()
+
+                self.get_logger().info(
+                    "[MODE D CLEAR] "
+                    "Social conflict cleared; "
+                    "ongoing dialogue preserved."
+                )
+                return
+
+            # No confirmed permission and no active HRI turn.
+            # Existing conservative clearance recovery applies.
+            self._reset_route_search()
+
+            if self.fsm_state in {
+                STATE_STOPPING_FOR_SOCIAL_CONFLICT,
+                STATE_ANNOUNCING_DETECTION,
+            }:
+                self.clear_pending_after_announcement = True
+                return
+
+            if not goal_id:
+                self._reset_episode()
+
+                self._transition_to(
+                    STATE_NAVIGATING,
+                    reason="SOCIAL_CLEAR_WITHOUT_NAVIGATION",
+                )
+                return
+
+            self._invalidate_trajectory_validation(
+                reason="SOCIAL_CLEAR_REQUIRES_REVALIDATION"
+            )
+
+            self._enter_replanning(
+                reason="SOCIAL_CLEAR",
+                directional_constraint="NONE",
+            )
+            return
+
+        # =====================================================
+        # MODE C: original behavior, unchanged
+        # =====================================================
+
         hri_closing = self._request_hri_close(
             "SOCIAL_CLEAR"
         )
@@ -2417,20 +3970,386 @@ class CollaborationManager(Node):
             directional_constraint="NONE",
         )
 
-    def _social_scope_key(self, person_id=None):
-        """Return the goal/session/episode/person identity."""
+    def _validate_participant_context(self, msg, event):
+        """Validate typed participant evidence before adopting an event."""
+        try:
+            seen = set()
+            primary = (
+                str(msg.tracking_session_id).strip(),
+                str(msg.person_id).strip(),
+            )
 
-        person = (
+            if not msg.participants:
+                return False
+
+            for participant in msg.participants:
+                key = (
+                    str(participant.tracking_session_id).strip(),
+                    str(participant.person_id).strip(),
+                )
+
+                if (
+                    not all(key)
+                    or key in seen
+                    or (
+                        participant.conflict
+                        and not participant.observed
+                    )
+                ):
+                    return False
+
+                seen.add(key)
+
+            if primary not in seen:
+                return False
+
+            if (
+                msg.observation_complete
+                and not all(
+                    participant.observed
+                    for participant in msg.participants
+                )
+            ):
+                return False
+
+            if event == SOCIAL_EVENT_CLEAR:
+                return bool(
+                    msg.observation_complete
+                    and not msg.social_conflict_active
+                    and not any(
+                        participant.conflict
+                        for participant in msg.participants
+                    )
+                )
+
+            if not msg.social_conflict_active:
+                return False
+
+            if event in {
+                SOCIAL_EVENT_INTRUSION_CONFIRMED,
+                SOCIAL_EVENT_OBSERVATION_REACQUIRED,
+            }:
+                return any(
+                    (
+                        participant.tracking_session_id,
+                        participant.person_id,
+                    ) == primary
+                    and participant.observed
+                    for participant in msg.participants
+                )
+
+            return event == SOCIAL_EVENT_OBSERVATION_LOST
+
+        except (TypeError, AttributeError, ValueError):
+            return False
+
+    def _adopt_participant_context(self, msg):
+        """
+        Adopt canonical participant context without transferring consent.
+
+        Mode D protects ownership of an unfinished HRI transaction.
+        Mode C retains the existing participant-switch procedure.
+        """
+
+        scope = self._social_scope_key(msg.person_id)
+        previous = self._active_actor_scope
+
+        # =====================================================
+        # MODE D: protect active dialogue ownership
+        # =====================================================
+
+        if (
+            self.interaction == "dialogue"
+            and previous is not None
+            and scope != previous
+        ):
+
+            hri_owned_by_previous = bool(
+                self.pending_hri_close is not None
+                or self.pending_dialogue_request_id
+                or self.dialogue_audio_recovery_pending
+            )
+
+            if hri_owned_by_previous:
+
+                # An event concerning B cannot close A's HRI
+                # transaction or overwrite A's semantic state.
+                #
+                # Nevertheless, B remains relevant to collision
+                # avoidance and must not be ignored geometrically.
+                self.social_observation_complete = bool(
+                    msg.observation_complete
+                )
+
+                self._invalidate_trajectory_validation(
+                    reason="SECONDARY_PARTICIPANT_DURING_HRI"
+                )
+
+                if self.active_navigation_goal_id:
+                    self._publish_wait(
+                        reason="SECONDARY_PARTICIPANT_DURING_HRI"
+                    )
+
+                if not msg.observation_complete:
+                    self.social_observation_available = False
+                    self.waiting_for_observation_reacquisition = True
+
+                self._schedule_social_reassessment()
+
+                self.get_logger().info(
+                    "[SOCIAL PARTICIPANTS] "
+                    "Secondary participant observed while "
+                    "existing HRI transaction owns the dialogue | "
+                    f"dialogue_person={previous[4]} | "
+                    f"event_person={scope[4]} | "
+                    "dialogue_preserved=True | "
+                    "execution_authorized=False"
+                )
+
+                return False
+
+        # =====================================================
+        # Existing canonical actor switch
+        # =====================================================
+
+        if scope != previous:
+
+            if previous is not None:
+                self._actor_semantics[previous] = {
+                    "intent": self.confirmed_human_intent,
+                    "direction": self.confirmed_human_direction,
+                    "outcome": self.dialogue_outcome,
+                    "authorized": (
+                        self.authorized_episode_key == previous
+                    ),
+                    "executed": (
+                        self.executed_social_scope == previous
+                    ),
+                    "forbidden_direction": (
+                        self.forbidden_human_direction
+                    ),
+                }
+
+            while len(self._actor_semantics) > 128:
+                self._actor_semantics.pop(
+                    next(iter(self._actor_semantics))
+                )
+
+            changed_active_actor = bool(
+                previous is not None
+                and self.human_proximity_active
+            )
+
+            if changed_active_actor:
+
+                # A change of actor invalidates any outstanding
+                # trajectory ownership, not the previous actor's
+                # stored permission.
+                if self.pending_generation_request_id:
+                    self.uncertain_generation_request_id = (
+                        self.pending_generation_request_id
+                    )
+
+                # Only request a close if there really is an
+                # outstanding HRI turn. Never invent a closure.
+                if (
+                    self.pending_dialogue_request_id
+                    or self.dialogue_audio_recovery_pending
+                    or self.pending_hri_close is not None
+                ):
+                    self._request_hri_close(
+                        reason="SOCIAL_PARTICIPANT_CHANGED"
+                    )
+
+                self.pending_dialogue_request_id = ""
+                self.pending_dialogue_scope = None
+                self.dialogue_started_at = None
+                self.waiting_for_human_initiative = False
+
+                self._clear_pending_human_preference()
+
+            saved = self._actor_semantics.get(scope, {})
+
+            self.confirmed_human_intent = saved.get(
+                "intent",
+                "UNKNOWN",
+            )
+
+            self.confirmed_human_direction = saved.get(
+                "direction",
+                "NONE",
+            )
+
+            self.dialogue_outcome = saved.get(
+                "outcome",
+                "NONE",
+            )
+
+            self.authorized_episode_key = (
+                scope
+                if saved.get("authorized", False)
+                else None
+            )
+
+            self.executed_social_scope = (
+                scope
+                if saved.get("executed", False)
+                else None
+            )
+
+            self.forbidden_human_direction = saved.get(
+                "forbidden_direction",
+                "NONE",
+            )
+
+            self.dialogue_resolution_complete = (
+                self.dialogue_outcome in {
+                    "ALLOW_CONFIRMED",
+                    "DENY_CONFIRMED",
+                    "NO_RESPONSE",
+                    "NOT_UNDERSTOOD",
+                }
+            )
+
+            self._active_actor_scope = scope
+            self.active_person_id = msg.person_id
+
+            if self.interaction == "dialogue":
+                # A closure for A must never be accepted as the
+                # completed closure of B's dialogue.
+                self._closed_hri_scope = None
+
+                # Cached paths remain bound to the exact actor
+                # scope and cannot be reused for another person.
+                self.anticipatory_selected_request_id = ""
+
+            if changed_active_actor:
+                if self.fsm_state in {
+                    STATE_STOPPING_FOR_SOCIAL_CONFLICT,
+                    STATE_ANNOUNCING_DETECTION,
+                }:
+                    self._invalidate_trajectory_validation(
+                        reason="SOCIAL_PARTICIPANT_CHANGED"
+                    )
+
+                    self._publish_wait(
+                        reason="SOCIAL_PARTICIPANT_CHANGED"
+                    )
+
+                    self._schedule_social_reassessment()
+
+                else:
+                    self._hold_route_search(
+                        reason="SOCIAL_PARTICIPANT_CHANGED",
+                        reconsider=True,
+                    )
+
+        # =====================================================
+        # Observation completeness remains authoritative
+        # =====================================================
+
+        self.social_observation_complete = bool(
+            msg.observation_complete
+        )
+
+        if msg.observation_complete:
+            return True
+
+        if not self.human_proximity_active:
+            self.human_proximity_active = True
+            self.active_person_id = msg.person_id
+            self.active_decision_id = msg.decision_id
+
+            self._ensure_interaction_id()
+
+            self.announcement_social_decision = msg
+            self.announcement_decision_id = msg.decision_id
+
+        self._handle_observation_lost(msg)
+
+        if self.fsm_state in {
+            STATE_NAVIGATING,
+            STATE_OBSERVING,
+            STATE_WAITING,
+        }:
+            self._hold_route_search(
+                reason="SOCIAL_PARTICIPANTS_PARTIALLY_OBSERVED",
+                reconsider=True,
+            )
+
+        return False
+
+    def _social_scope_key(self, person_id=None):
+        """
+        Return the exact canonical social scope for one person.
+
+        Mode C retains the original event-based behavior.
+
+        In mode D, another participant's event must not change
+        the tracking session of the active dialogue participant.
+        """
+
+        person = str(
             self.active_person_id
             if person_id is None
             else person_id
-        )
+        ).strip()
+
+        decision = self.latest_social_decision
+
+        goal_id = str(
+            self.active_navigation_goal_id or ""
+        ).strip()
+
+        producer_session = str(
+            self.social_state_session or ""
+        ).strip()
+
+        episode = str(
+            self.social_state_episode or ""
+        ).strip()
+
+        tracking_session = ""
+
+        if self.interaction == "dialogue":
+            if decision is not None:
+                matches = {
+                    str(p.tracking_session_id or "").strip()
+                    for p in decision.participants
+                    if str(p.person_id or "").strip() == person
+                }
+
+                matches.discard("")
+
+                if len(matches) == 1:
+                    tracking_session = next(iter(matches))
+
+            if not tracking_session:
+                previous = self._active_actor_scope
+
+                if (
+                    previous is not None
+                    and len(previous) == 5
+                    and previous[0] == goal_id
+                    and previous[1] == producer_session
+                    and previous[2] == episode
+                    and previous[4] == person
+                ):
+                    tracking_session = previous[3]
+
+        else:
+            # Preserve the original Mode-C behavior.
+            if decision is not None:
+                tracking_session = str(
+                    decision.tracking_session_id or ""
+                ).strip()
 
         return (
-            str(self.active_navigation_goal_id or "").strip(),
-            str(self.social_state_session or "").strip(),
-            str(self.social_state_episode or "").strip(),
-            str(person or "").strip(),
+            goal_id,
+            producer_session,
+            episode,
+            tracking_session,
+            person,
         )
 
     def _same_resolved_social_scope(self, person_id=None):
@@ -2477,11 +4396,13 @@ class CollaborationManager(Node):
     
     def _handle_observation_lost(self, msg):
         """
-        Preserve social interaction and planning ownership
-        during observation loss.
+        Preserve social and semantic context during observation loss.
 
-        Never equate missing perception with geometric CLEAR.
-        Never validate a candidate from stale observations.
+        Planning may continue while the robot remains held.
+        A pending motion authorization must be revoked.
+
+        Loss never establishes clearance and never erases
+        confirmed human permission for the current episode.
         """
         if not self.human_proximity_active:
             return
@@ -2502,6 +4423,28 @@ class CollaborationManager(Node):
         self.conflict_observed_since = None
         self.persistent_conflict_handled = False
 
+        # Computing a candidate is not permission to execute it.
+        # Preserve the outstanding planning transaction.
+        if self.fsm_state in {
+            STATE_REPLANNING,
+            STATE_VALIDATING_TRAJECTORY,
+        }:
+            return
+
+        # RESUME may already have reached the Gate.
+        # Explicitly revoke it instead of waiting for the
+        # prolonged observation-loss timeout.
+        if self.fsm_state == STATE_RESUMING:
+            self._hold_route_search(
+                reason="SOCIAL_OBSERVATION_LOST_DURING_RESUME",
+                reconsider=True,
+            )
+
+            self.observation_loss_held_goal_id = (
+                self.active_navigation_goal_id
+            )
+            return
+
         dialogue_active = bool(
             self.interaction == "dialogue"
             and self.active_interaction_id
@@ -2514,41 +4457,14 @@ class CollaborationManager(Node):
             }
         )
 
-        # A running trajectory computation is not a motion
-        # authorization. Retain its request identity so that
-        # its eventual candidate/failure can be correlated.
-        if (
-            self.fsm_state in {
-                STATE_REPLANNING,
-                STATE_VALIDATING_TRAJECTORY,
-            }
-            and not self.navigation_active
-        ):
-            self.trajectory_validation = (
-                TRAJECTORY_VALIDATION_UNKNOWN
-            )
-            self.validated_path_id = ""
-            self.validation_received_at = None
-            self.validation_source_stamp_sec = None
-
-            self.get_logger().debug(
-                "[SOCIAL LOSS] "
-                "Planning transaction retained; "
-                "motion validation invalidated."
-            )
-            return
-
+        # Preserve an already established dialogue or speech
+        # transaction. Motion remains subject to its own barriers.
         if dialogue_active or self.fsm_state in {
             STATE_STOPPING_FOR_SOCIAL_CONFLICT,
             STATE_ANNOUNCING_DETECTION,
         }:
-            self._invalidate_trajectory_validation(
-                reason="SOCIAL_LOSS_DURING_TRANSACTION"
-            )
             return
 
-        # There is no need to repeatedly send WAIT
-        # if the Gate has already confirmed the hold.
         if (
             self.fsm_state == STATE_WAITING
             and not self.navigation_active
@@ -2556,15 +4472,23 @@ class CollaborationManager(Node):
             self._schedule_social_reassessment()
             return
 
-        self._hold_route_search(
-            reason="SOCIAL_OBSERVATION_LOST",
-            reconsider=True,
-        )
+        if (
+            self.fsm_state == STATE_NAVIGATING
+            and self.navigation_active
+        ):
+            self._hold_route_search(
+                reason="SOCIAL_OBSERVATION_LOST",
+                reconsider=True,
+            )
 
-        self.observation_loss_held_goal_id = (
-            self.active_navigation_goal_id
-        )
-        
+            self.observation_loss_held_goal_id = (
+                self.active_navigation_goal_id
+            )
+            return
+
+        if not self.navigation_active:
+            self._schedule_social_reassessment()
+
     def _handle_observation_reacquired(self, msg):
         """Restore perception without restarting a resolved dialogue."""
 
@@ -2689,39 +4613,435 @@ class CollaborationManager(Node):
         self._request_passage_clarification()
 
     def _evaluate_conflict_persistence(self, now):
-        if self.interaction == "dialogue":
+        """
+        Trigger mode-C policy for a currently observed person
+        whose individual conflict is persistent.
+
+        Persistence memory belongs to the evaluator.
+        """
+        if self.fsm_state not in {
+            STATE_OBSERVING,
+            STATE_WAITING,
+        }:
             return
 
-        if self.fsm_state != STATE_OBSERVING:
+        if not self._mode_c_reactive_generation_allowed():
             return
 
-        if not self.human_proximity_active:
+        if not self._individual_scene_current():
             return
 
-        if not self.social_observation_available:
+        for identity, state in sorted(
+            self.individual_participants.items()
+        ):
+            if (
+                identity[0] != self.individual_source_session
+                or not state["unresolved"]
+                or not state["persistent"]
+                or state["retired"]
+                or not state["observed_now"]
+                or state["observation_status"] != "OBSERVED"
+                or state["conflict_status"] != "CONFLICT"
+            ):
+                continue
+
+            episode = str(
+                state["episode_id"]
+            ).strip()
+
+            if not episode:
+                continue
+
+            token = (
+                self.active_navigation_goal_id,
+                identity,
+                episode,
+            )
+
+            if token in self._handled_persistent_person_episodes:
+                continue
+
+            self._enter_replanning(
+                reason="SOCIAL_CONFLICT_PERSISTENT",
+                directional_constraint="NONE",
+            )
+
+            # Consume the trigger only after the FSM has
+            # actually entered the replanning phase.
+            if self.fsm_state == STATE_REPLANNING:
+                self._handled_persistent_person_episodes.add(
+                    token
+                )
+
+                self.get_logger().info(
+                    "[INDIVIDUAL PERSISTENCE] "
+                    f"goal={self.active_navigation_goal_id} | "
+                    f"identity={identity!r} | "
+                    f"episode={episode} | "
+                    "reactive_replanning_started=True"
+                )
+
             return
+    
+    def _anticipation_scope(self):
+        """Return the exact canonical context eligible for preplanning."""
 
-        if self.persistent_conflict_handled:
-            return
+        if not (
+            self.interaction == "dialogue"
+            and self.anticipatory_planning_enabled
+        ):
+            return None
 
-        if self.conflict_observed_since is None:
-            self.conflict_observed_since = now
-            return
+        actor_scope = self._active_actor_scope
 
-        if not self.active_navigation_goal_id:
-            return
+        if actor_scope is None or len(actor_scope) != 5:
+            return None
 
-        elapsed = now - self.conflict_observed_since
+        scope = tuple(str(value or "").strip() for value in actor_scope)
 
-        if elapsed < self.conflict_persistence_sec:
-            return
+        if not all(scope):
+            return None
 
-        self.persistent_conflict_handled = True
-        self.get_logger().info(
-            "[SOCIAL POLICY] Persistent conflict | "
-            f"elapsed={elapsed:.2f}s"
+        if (
+            scope[0] != self.active_navigation_goal_id
+            or scope[1] != self.social_state_session
+            or scope[2] != self.social_state_episode
+            or scope[4] != self.active_person_id
+        ):
+            return None
+
+        return scope
+
+    def _select_anticipatory_candidate(self):
+        """
+        Find an already generated path for the confirmed Mode-D
+        social context.
+
+        Selection is not path validation and never authorizes motion.
+        """
+
+        if not (
+            self.interaction == "dialogue"
+            and self.anticipatory_planning_enabled
+            and self.dialogue_outcome == "ALLOW_CONFIRMED"
+            and self.confirmed_human_intent == "ALLOW_PASSAGE"
+            and self._permission_applies_to_current_episode()
+        ):
+            return None
+
+        # HRI must be conclusively closed.
+        if (
+            self.pending_hri_close is not None
+            or self.hri_close_fault_reported
+            or self.dialogue_audio_recovery_pending
+            or self.pending_speech_decision_id
+            or self.pending_dialogue_request_id
+            or self.pending_terminal_stop is not None
+            or self.social_resolution_aborted
+        ):
+            return None
+
+        scope = self._anticipation_scope()
+
+        if (
+            scope is None
+            or scope != self.anticipatory_scope
+        ):
+            return None
+
+        direction = self._normalize_direction(
+            self.confirmed_human_direction
         )
-        self._enter_replanning(reason="SOCIAL_CONFLICT_PERSISTENT")
+
+        if (
+            direction in {"LEFT", "RIGHT"}
+            and direction == self.forbidden_human_direction
+        ):
+            return None
+
+        # Confirmed LEFT never silently becomes RIGHT, or vice versa.
+        # An unconstrained NONE candidate is not a substitute for an
+        # explicitly confirmed person-relative direction.
+        candidates = []
+
+        for request_id, entry in self.anticipatory_candidates.items():
+            metadata = self.anticipatory_requests.get(request_id)
+
+            if metadata is None:
+                continue
+
+            if (
+                entry.get("scope") != scope
+                or metadata.get("scope") != scope
+                or entry.get("direction") != direction
+                or metadata.get("direction") != direction
+                or entry.get("status") != "READY"
+            ):
+                continue
+
+            # The Nav2 generation must be terminally reconciled.
+            if (
+                #metadata.get("status") != "READY"
+                metadata.get("status") != "TERMINATED"
+                or request_id == self.anticipatory_pending_request_id
+                or request_id == getattr(
+                    self, "anticipatory_uncertain_request_id", ""
+                )
+            ):
+                continue
+
+            candidate = entry.get("candidate")
+
+            if candidate is None:
+                continue
+
+            path_id = str(candidate.path_id or "").strip()
+
+            if (
+                not path_id
+                or candidate.request_id != request_id
+                or candidate.navigation_goal_id != scope[0]
+                or path_id != entry.get("path_id")
+                or not candidate.path.header.frame_id
+                or not candidate.path.poses
+            ):
+                continue
+
+            candidates.append((
+                float(entry.get("received_at", 0.0)),
+                request_id,
+                candidate,
+            ))
+
+        if not candidates:
+            return None
+
+        # Prefer the latest candidate within the same exact scope.
+        _, request_id, candidate = max(
+            candidates,
+            key=lambda item: (item[0], item[1]),
+        )
+
+        self.anticipatory_selected_request_id = request_id
+
+        self.get_logger().info(
+            "[ANTICIPATORY SELECTION] "
+            f"goal={scope[0]} | "
+            f"person={scope[4]} | "
+            f"direction={direction} | "
+            f"path={candidate.path_id} | "
+            "fresh_validation_required=True | "
+            "navigation_authorized=False"
+        )
+
+        return candidate
+
+    def _anticipation_tick(self, now):
+        """
+        Run Mode-D preplanning without overlapping Nav2 generations.
+
+        HRI and planning advance independently, but Nav2 planning
+        requests are serialized for the same public goal.
+        """
+
+        if not (
+            self.interaction == "dialogue"
+            and self.anticipatory_planning_enabled
+        ):
+            return
+
+        pending_id = self.anticipatory_pending_request_id
+
+        # Reconcile the current speculative generation before
+        # considering another one, even if the episode changed.
+        if pending_id:
+            metadata = self.anticipatory_requests.get(pending_id)
+
+            if metadata is None:
+                self.anticipatory_uncertain_request_id = pending_id
+                return
+
+            status = metadata.get("status", "GENERATING")
+            started = metadata.get("requested_at", now)
+            last_query = metadata.get("last_query_at", 0.0)
+
+            if (
+                status == "READY"
+                or status == "TERMINATION_UNCONFIRMED"
+                or now - started >= 15.0
+            ):
+                if now - last_query >= 1.0:
+                    metadata["last_query_at"] = now
+
+                    self.generation_status_request_pub.publish(
+                        String(
+                            data=json.dumps({
+                                "version": 1,
+                                "navigation_goal_id": metadata["scope"][0],
+                                "request_id": pending_id,
+                            })
+                        )
+                    )
+
+                if status != "READY":
+                    self.anticipatory_uncertain_request_id = pending_id
+
+            return
+
+        if (
+            self.uncertain_generation_request_id
+            or getattr(
+                self, "anticipatory_uncertain_request_id", ""
+            )
+            or self.pending_generation_request_id
+        ):
+            return
+
+        scope = self._anticipation_scope()
+
+        if scope is None:
+            return
+
+        # The cache belongs to one exact social context.
+        if self.anticipatory_scope != scope:
+            self.anticipatory_scope = scope
+
+            self.anticipatory_queue = (
+                self.mode_d_anticipation_queues.setdefault(
+                    scope,
+                    ["NONE", "LEFT", "RIGHT"],
+                )
+            )
+
+            self.anticipatory_selected_request_id = ""
+
+            # Ne pas effacer les candidats des autres personnes.
+            # Chaque entrée conserve son propre scope.
+
+        if not self.anticipatory_queue:
+            return
+
+        # Keep the existing execution transaction independent.
+        if self.fsm_state in {
+            STATE_REPLANNING,
+            STATE_VALIDATING_TRAJECTORY,
+            STATE_RESUMING,
+        }:
+            return
+
+        if self.fsm_state not in {
+            STATE_ANNOUNCING_DETECTION,
+            STATE_SOCIAL_RESOLUTION,
+            STATE_WAITING_FOR_HUMAN,
+            STATE_WAITING_FOR_CONFIRMATION,
+            STATE_ASKING,
+            STATE_CONFIRMING_HUMAN_INTENT,
+            STATE_WAITING,
+        }:
+            return
+
+        if self.dialogue_outcome not in {
+            "NONE",
+            "PENDING",
+        }:
+            return
+
+        if (
+            not self.active_navigation_goal_id
+            or self.active_navigation_goal_pose is None
+            or self.navigation_active
+            or self.social_resolution_aborted
+            or self.pending_terminal_stop is not None
+            or self.pending_gate_command is not None
+            or self.social_episode_retired
+            or self.social_loss_expired
+            or self.waiting_for_observation_reacquisition
+            or not self.human_proximity_active
+            or not self._route_observation_is_fresh()
+        ):
+            return
+
+        nav = self.latest_navigation_state
+
+        if (
+            nav is None
+            or str(nav.navigation_goal_id or "").strip()
+                != self.active_navigation_goal_id
+            or not self._message_is_recent(nav, 1.0)
+            or bool(nav.navigation_active)
+            or self.navigation_state not in {
+                "WAITING",
+                "SOCIAL_HOLD",
+                "REPLANNING",
+            }
+        ):
+            return
+
+        # Planning may start only after a verified physical hold.
+        if (
+            not self.stable_stop_confirmed
+            or self.motion_state_received_at is None
+            or self.motion_state_stamp_sec is None
+            or now - self.motion_state_received_at > 0.5
+        ):
+            return
+
+        motion_age = (
+            self.get_clock().now().nanoseconds / 1e9
+            - self.motion_state_stamp_sec
+        )
+
+        if not -0.1 <= motion_age <= 0.5:
+            return
+
+        if self.nav2_cancel_requested:
+            if not (
+                self.nav2_cancel_confirmed
+                and self.stop_request_stamp_sec is not None
+                and self.motion_state_stamp_sec
+                    >= self.stop_request_stamp_sec
+            ):
+                return
+
+        direction = self.anticipatory_queue[0]
+
+        request = self._build_trajectory_generation_request(
+            generation_reason=(
+                "REPLAN"
+                if direction == "NONE"
+                else "ALTERNATIVE"
+            ),
+            directional_constraint=direction,
+        )
+
+        if request is None:
+            return
+
+        request.person_id = scope[4]
+
+        request_id = request.request_id
+
+        self.anticipatory_requests[request_id] = {
+            "scope": scope,
+            "direction": direction,
+            "status": "GENERATING",
+            "requested_at": now,
+            "last_query_at": 0.0,
+        }
+
+        self.anticipatory_pending_request_id = request_id
+        self.anticipatory_queue.pop(0)
+
+        self.trajectory_generation_request_pub.publish(request)
+
+        self.get_logger().info(
+            "[ANTICIPATORY PLANNING] "
+            f"request={request_id} | "
+            f"direction={direction} | "
+            f"remaining={len(self.anticipatory_queue)} | "
+            "navigation_authorized=False"
+        )
+
 
     # ================================================================
     # Navigation context and interruption
@@ -2794,7 +5114,91 @@ class CollaborationManager(Node):
 
         return True
 
+    def _reset_social_context_for_new_goal(self, goal_id):
+        """
+        Start a fresh social transaction for a new public navigation goal.
+
+        Discard all goal-scoped social history while preserving the
+        producer's sequence watermark for ordered incoming messages.
+        """
+        self._reset_episode()
+
+        # Discard social observations belonging to the previous context.
+        self.latest_social_decision = None
+        self._active_actor_scope = None
+        self._actor_semantics.clear()
+        self.social_observation_complete = True
+
+        # Treat every participant as newly observed for this goal.
+        self.individual_participants.clear()
+        self.individual_source_session = ""
+        self.individual_source_stamp_ns = 0
+        self.individual_source_fresh = False
+        self.individual_source_complete = False
+        self.individual_received_at = None
+        self.individual_retired_source_sessions.clear()
+
+        # Previous social decisions cannot suppress new goal observations.
+        self.retired_social_episode_ids.clear()
+        self.retired_social_sessions.clear()
+        self._handled_persistent_person_episodes.clear()
+        self.last_navigation_interruption_key = None
+
+        # Reset observation-health evidence from before goal reception.
+        self.latest_observation_health = "UNKNOWN"
+        self.latest_observation_health_at = None
+        self.empty_observation_since = None
+        self.health_session = ""
+        self.health_stamp_ns = None
+        self.route_geometry_person_id = ""
+
+        # Remove previous dialogue and participant ownership.
+        self.mode_d_cases.clear()
+        self.mode_d_hri_owner = None
+        self.mode_d_hri_turns.clear()
+        self.mode_d_hri_closures.clear()
+        self.mode_d_anticipation_queues.clear()
+
+        # Clear obsolete trajectory transactions.
+        self.pending_generation_request_id = ""
+        self.uncertain_generation_request_id = ""
+        self.generation_requested_at = None
+        self.candidate_path_id = ""
+        self.candidate_navigation_goal_id = ""
+
+        # Discard previous navigation-state evidence.
+        self.latest_navigation_state = None
+        self.navigation_state = "UNKNOWN"
+
+        # Restart goal-scoped supervision.
+        self.resolution_watch_goal_id = ""
+        self.resolution_watch_started_at = None
+        self.reassessment_last_at = 0.0
+        self.reassessment_last_stamp_ns = None
+
+        # Keep producer session and sequence ordering intact so that a
+        # fresh observation of the same upstream episode is accepted.
+        self.social_episode_origin_goal_id = goal_id
+
+        self._transition_to(
+            STATE_NAVIGATING,
+            reason="NEW_PUBLIC_GOAL_FRESH_SOCIAL_CONTEXT",
+        )
+
+        self.get_logger().info(
+            "[GOAL SOCIAL RESET] "
+            f"goal={goal_id} | "
+            "previous_social_state_discarded=True | "
+            "same_person_can_be_observed_again=True"
+        )
+        
     def _navigation_goal_context_callback(self, msg):
+        """
+        Establish a new public goal independently of pre-goal social history.
+
+        The first fresh observation after goal reception belongs to
+        the new goal, even if the physical person was seen previously.
+        """
         goal_id = str(msg.navigation_goal_id or "").strip()
 
         if not goal_id:
@@ -2809,72 +5213,75 @@ class CollaborationManager(Node):
             )
             return
 
+        if goal_id == self.active_navigation_goal_id:
+            self.active_navigation_goal_pose = msg.goal
+            return
+
+        # Never discard an unfinished physical stop or termination.
+        if self.pending_terminal_stop is not None:
+            self.get_logger().error(
+                "[GOAL] Previous public termination is still pending."
+            )
+            return
+
         if (
             self.active_navigation_goal_id
-            and goal_id != self.active_navigation_goal_id
+            and (
+                self.navigation_active
+                or self.nav2_cancel_requested
+                or self.pending_stop_hold_request_id
+                or self.pending_gate_command is not None
+                or self.pending_hri_close is not None
+            )
         ):
-            self._invalidate_trajectory_validation(
-                reason="NAVIGATION_GOAL_CHANGED"
+            self.get_logger().warning(
+                "[GOAL] New context deferred because the previous "
+                "navigation or control transaction is still active."
             )
-            self._reset_route_search()
+            return
 
-        if goal_id != self.active_navigation_goal_id:
-            
-            if self.pending_terminal_stop is not None:
-                self.get_logger().error(
-                    "[GOAL] Previous public termination is still pending."
-                )
-                return
+        # Invalidate trajectory evidence from the previous goal.
+        self._invalidate_trajectory_validation(
+            reason="NEW_PUBLIC_GOAL"
+        )
 
-            if (
-                self.human_proximity_active
-                and not self.social_episode_origin_goal_id
-                and not self.social_observation_available
-            ):
-                self._close_obsolete_pre_navigation_episode()
-                
-            self._reset_route_search()
-            self._invalidate_trajectory_validation(
-                "NEW_PUBLIC_GOAL"
-            )
-
-            if (
-                not self.pending_speech_decision_id
-                and self.pending_hri_close is None
-            ):
-                self._transition_to(
-                    STATE_NAVIGATING,
-                    reason="NEW_PUBLIC_GOAL"
-                )
-
-            self.observation_loss_held_goal_id = ""
-            self.gate_ready_goal_id = ""
-            self.pending_gate_command = None
-            self.latest_start_request_id = ""
-            self.initial_start_authorized_goal_id = ""
-            self.initial_start_attempt_count = 0
-            self.initial_start_next_attempt_at = 0.0
+        # Reset all social history before adopting the new goal.
+        self._reset_social_context_for_new_goal(goal_id)
 
         self.active_navigation_goal_id = goal_id
         self.active_navigation_goal_pose = msg.goal
 
+        # Reset exact Gate START transaction ownership.
+        self.observation_loss_held_goal_id = ""
+        self.gate_ready_goal_id = ""
+        self.pending_gate_command = None
+        self.latest_start_request_id = ""
+
+        self.initial_start_authorized_goal_id = ""
+        self.initial_start_attempt_count = 0
+        self.initial_start_next_attempt_at = 0.0
+
         self.get_logger().info(
             "[NAVIGATION GOAL CONTEXT] "
             f"goal_id={goal_id!r} | "
-            f"frame={msg.goal.header.frame_id!r}"
+            f"frame={msg.goal.header.frame_id!r} | "
+            "fresh_social_transaction=True"
         )
 
         self.get_logger().info(
-            "[GOAL] Context received; waiting for matching Gate state | "
+            "[GOAL] Awaiting matching Goal Gate readiness | "
             f"goal={goal_id}"
         )
-
+        
     def _interrupt_navigation_for_existing_social_episode(self):
         """
-        Interrupt new conflicts.
+        Interrupt only an actionable social intrusion.
 
-        Repeated messages from a resolved social context do not
-        restart the stop/announcement/dialogue sequence.
+        A resolved episode cannot interrupt its own RESUME
+        transaction through repeated social observations.
+
+        A genuinely new episode is still actionable.
+        Observation loss is handled by its dedicated policy.
         """
         goal_id = str(
             self.active_navigation_goal_id or ""
@@ -2888,111 +5295,37 @@ class CollaborationManager(Node):
 
         decision = self.latest_social_decision
 
-        person_id = (
-            decision.person_id
-            if decision is not None
-            else self.active_person_id
-        )
+        person_id = str(
+            (
+                decision.person_id
+                if decision is not None
+                else self.active_person_id
+            ) or ""
+        ).strip()
+
+        scope = self._social_scope_key(person_id)
 
         same_scope = self._same_resolved_social_scope(
             person_id
         )
 
+        # A resolved episode cannot issue another interruption
+        # just because visibility changed or Nav2 reported
+        # RESUMING with navigation_active=False.
+        #
+        # This is NOT a general immunity against new intrusions.
+        # A new episode receives a different scope and therefore
+        # does not satisfy this condition.
         if same_scope:
-            if (
-                self.social_observation_available
-                and not self.social_loss_expired
-                and not self.social_episode_retired
-                and self._route_observation_is_fresh()
-            ):
-                return False
-
-            if self.fsm_state in {
-                STATE_REPLANNING,
-                STATE_VALIDATING_TRAJECTORY,
-            }:
-                # Computation may finish, but execution still
-                # requires compatible current observations.
-                return False
-
-            if self.fsm_state in {
-                STATE_NAVIGATING,
-                STATE_RESUMING,
-            }:
-                self._hold_route_search(
-                    reason="RESOLVED_EPISODE_OBSERVATION_UNAVAILABLE",
-                    reconsider=True,
-                )
-                self.waiting_for_observation_reacquisition = True
-                return True
-
             if self.fsm_state == STATE_WAITING:
                 self._schedule_social_reassessment()
-                return True
 
             return False
 
-        nav = self.latest_navigation_state
-
-        if (
-            nav is None
-            or str(nav.navigation_goal_id or "").strip() != goal_id
-            or not self._message_is_recent(nav, 1.0)
-        ):
-            return False
-
-        if self.fsm_state == STATE_ANNOUNCING_DETECTION:
-            if self.announcement_context_key != ("WAIT", goal_id):
-                if self.deferred_social_goal_id != goal_id:
-                    self.deferred_social_goal_id = goal_id
-
-                    self._invalidate_trajectory_validation(
-                        reason="PUBLIC_GOAL_DURING_SOCIAL_SPEECH"
-                    )
-                    self._publish_wait(
-                        reason="PUBLIC_GOAL_DURING_SOCIAL_SPEECH"
-                    )
-
-                return True
-
-            return False
-
-        if self.fsm_state not in {
-            STATE_NAVIGATING,
-            STATE_OBSERVING,
-            STATE_WAITING,
-        }:
-            return False
-
-        if (
-            self.social_episode_retired
-            or self.social_loss_expired
-            or not self.social_observation_available
-        ):
-            if self.observation_loss_held_goal_id != goal_id:
-                self.observation_loss_held_goal_id = goal_id
-
-                self._hold_route_search(
-                    reason=(
-                        "SOCIAL_OBSERVATION_UNAVAILABLE_FOR_PUBLIC_GOAL"
-                    ),
-                    reconsider=True,
-                )
-
-            self.waiting_for_observation_reacquisition = True
-
-            self._transition_to(
-                STATE_WAITING,
-                reason="SOCIAL_OBSERVATION_UNAVAILABLE_FOR_PUBLIC_GOAL",
-            )
-            return True
-
+        # An unconfirmed event must never acquire authority
+        # over an ongoing Gate transaction.
         if decision is None:
-            self._hold_route_search(
-                reason="SOCIAL_INTRUSION_CONTEXT_MISSING",
-                reconsider=True,
-            )
-            return True
+            return False
 
         event = normalize_social_navigation_event(
             decision.event
@@ -3008,48 +5341,81 @@ class CollaborationManager(Node):
             decision,
             self.social_decision_max_age_sec,
         ):
-            if (
-                not self.navigation_active
-                and self.navigation_state in {
-                    "WAITING",
-                    "SOCIAL_HOLD",
-                }
+            return False
+
+        nav = self.latest_navigation_state
+
+        if (
+            nav is None
+            or str(nav.navigation_goal_id or "").strip()
+                != goal_id
+            or not self._message_is_recent(nav, 1.0)
+        ):
+            return False
+
+        # Preserve an existing announcement transaction.
+        if self.fsm_state == STATE_ANNOUNCING_DETECTION:
+            if self.announcement_context_key != (
+                "WAIT",
+                goal_id,
             ):
-                self._schedule_social_reassessment()
+                if self.deferred_social_goal_id != goal_id:
+                    self.deferred_social_goal_id = goal_id
 
-                self._transition_to(
-                    STATE_WAITING,
-                    reason="SOCIAL_INTRUSION_CONTEXT_STALE",
-                )
-                return False
+                    self._invalidate_trajectory_validation(
+                        reason="PUBLIC_GOAL_DURING_SOCIAL_SPEECH"
+                    )
 
-            self._hold_route_search(
-                reason="SOCIAL_INTRUSION_CONTEXT_STALE",
-                reconsider=True,
-            )
-            return True
+                    self._publish_wait(
+                        reason="PUBLIC_GOAL_DURING_SOCIAL_SPEECH"
+                    )
 
-        self.announcement_social_decision = decision
-        self.announcement_decision_id = str(
-            decision.decision_id or ""
-        ).strip()
-        self.active_person_id = str(
-            decision.person_id or ""
-        ).strip()
+                return True
 
-        if not self.announcement_decision_id:
-            self._hold_route_search(
-                reason="SOCIAL_DECISION_ID_MISSING",
-                reconsider=False,
-            )
-            return True
+            return False
+
+        # IMPORTANT:
+        # A newly confirmed episode is allowed to interrupt
+        # RESUMING even before Nav2 reports active=True.
+        if self.fsm_state not in {
+            STATE_NAVIGATING,
+            STATE_RESUMING,
+            STATE_OBSERVING,
+            STATE_WAITING,
+        }:
+            return False
 
         interruption_key = (
             goal_id,
             self.social_state_session,
             self.social_state_episode,
-            self.active_person_id,
+            person_id,
         )
+
+        if (
+            self.last_navigation_interruption_key
+            == interruption_key
+        ):
+            return False
+
+        # Only a positive, current social observation can
+        # initiate a new conflict stop.
+        if (
+            not self.social_observation_available
+            or self.social_loss_expired
+            or self.social_episode_retired
+        ):
+            return False
+
+        self.announcement_social_decision = decision
+        self.announcement_decision_id = str(
+            decision.decision_id or ""
+        ).strip()
+
+        self.active_person_id = person_id
+
+        if not self.announcement_decision_id:
+            return False
 
         running = bool(
             self.navigation_active
@@ -3087,9 +5453,11 @@ class CollaborationManager(Node):
         if stopped:
             if not announcement_finished:
                 self._ensure_interaction_id()
+
                 self.last_navigation_interruption_key = (
                     interruption_key
                 )
+
                 self._enter_announcement()
                 return True
 
@@ -3098,8 +5466,12 @@ class CollaborationManager(Node):
         if announcement_finished and not running:
             return False
 
+        # The initial public goal may have been accepted by
+        # the Gate without beginning physical movement.
         prestart = bool(
-            self.initial_start_authorized_goal_id != goal_id
+            self.fsm_state != STATE_RESUMING
+            and self.initial_start_authorized_goal_id
+                != goal_id
             and self.pending_gate_command is None
             and self.initial_start_attempt_count == 0
             and self.navigation_state in {
@@ -3111,13 +5483,21 @@ class CollaborationManager(Node):
             and not self.nav2_cancel_confirmed
         )
 
+        # Reserve the exact interruption identity BEFORE
+        # publishing WAIT to avoid duplicate callbacks.
+        self.last_navigation_interruption_key = (
+            interruption_key
+        )
+
         self._invalidate_trajectory_validation(
             reason="SOCIAL_INTRUSION_INTERRUPTS_GOAL"
         )
+
         self._ensure_interaction_id()
 
         self.pending_human_intent = "UNKNOWN"
         self.pending_human_direction = "NONE"
+
         self.confirmed_human_intent = "UNKNOWN"
         self.confirmed_human_direction = "NONE"
 
@@ -3126,7 +5506,6 @@ class CollaborationManager(Node):
         self.pending_dialogue_scope = None
         self.dialogue_outcome = "NONE"
 
-        self.last_navigation_interruption_key = interruption_key
         self.navigation_was_active_at_intrusion = running
 
         self.nav2_cancel_requested = not prestart
@@ -3143,6 +5522,7 @@ class CollaborationManager(Node):
             self._publish_wait(
                 reason="SOCIAL_CONFLICT_BEFORE_NAVIGATION_START"
             )
+
             self._enter_announcement()
             return True
 
@@ -3154,87 +5534,92 @@ class CollaborationManager(Node):
             STATE_STOPPING_FOR_SOCIAL_CONFLICT,
             reason="ACTIVE_NAVIGATION_SOCIAL_INTRUSION",
         )
+
         self._publish_wait(
             reason="ACTIVE_NAVIGATION_SOCIAL_INTRUSION"
         )
+
         return True
     
     def _gate_command_result_callback(self, msg):
+        """Match Gate acknowledgements to their exact command transaction."""
         try:
             data = json.loads(msg.data)
-        except (TypeError, ValueError):
-            return
 
-        if not isinstance(data, dict):
+            if (
+                not isinstance(data, dict)
+                or data.get("version") != 1
+                or data.get("producer") != "navigation_goal_gate"
+            ):
+                return
+
+            goal_id = str(
+                data.get("navigation_goal_id") or ""
+            ).strip()
+
+            action = str(
+                data.get("action") or ""
+            ).strip().upper()
+
+            request_id = str(
+                data.get("request_id") or ""
+            ).strip()
+
+            status = str(
+                data.get("status") or ""
+            ).strip().upper()
+
+            path_id = str(
+                data.get("path_id") or ""
+            ).strip()
+
+        except (ValueError, TypeError):
             return
 
         if (
-            data.get("version") != 1
-            or data.get("producer") != "navigation_goal_gate"
+            not goal_id
+            or goal_id != self.active_navigation_goal_id
         ):
             return
-
-        goal_id = str(
-            data.get("navigation_goal_id") or ""
-        ).strip()
-
-        if not goal_id or goal_id != self.active_navigation_goal_id:
-            return
-
-        action = str(data.get("action") or "").upper()
-        request_id = str(data.get("request_id") or "").strip()
-        status = str(data.get("status") or "").upper()
-        reason = str(data.get("reason") or "")
-        path_id = str(data.get("path_id") or "").strip()
 
         if action == "GOAL_READY" and status == "READY":
             self.gate_ready_goal_id = goal_id
-
-            self.get_logger().info(
-                f"[GATE] Goal ready after speech | goal={goal_id}"
-            )
-
             self._close_obsolete_pre_navigation_episode()
-
             self._evaluate_initial_goal_start()
             return
 
-        if (
-            action == "WAIT"
-            and status == "HOLD_CONFIRMED"
-            and self.fsm_state
-                == STATE_STOPPING_FOR_SOCIAL_CONFLICT
-            and self.nav2_cancel_requested
-        ):
+        if action == "WAIT" and status == "HOLD_CONFIRMED":
             if (
-                not self.pending_stop_hold_request_id
-                or request_id
-                    != self.pending_stop_hold_request_id
+                self.fsm_state == STATE_STOPPING_FOR_SOCIAL_CONFLICT
+                and self.nav2_cancel_requested
+                and request_id
+                and request_id == self.pending_stop_hold_request_id
             ):
-                self.get_logger().warning(
-                    "[STOP BARRIER] Obsolete WAIT acknowledgement | "
-                    f"received={request_id} | "
-                    f"expected={self.pending_stop_hold_request_id}"
-                )
-                return
+                self.nav2_cancel_confirmed = True
+                self._evaluate_stop_barrier()
 
-            self.nav2_cancel_confirmed = True
-
-            self.get_logger().info(
-                "[STOP BARRIER] Matching Gate hold confirmed | "
-                f"goal={goal_id} | request={request_id}"
-            )
-
-            self._evaluate_stop_barrier()
             return
 
-        if (
-            action == "REPLAN"
-            and status == "HOLD_CONFIRMED"
-            and self.fsm_state == STATE_REPLANNING
-            and not self.pending_generation_request_id
-            and not self.navigation_active
+        pending = self.pending_gate_command
+
+        if not pending or (
+            pending["goal_id"] != goal_id
+            or pending["action"] != action
+            or pending["request_id"] != request_id
+            or (
+                action == "RESUME"
+                and pending["path_id"] != path_id
+            )
         ):
+            return
+
+        if action == "REPLAN" and status == "HOLD_CONFIRMED":
+            if self.fsm_state != STATE_REPLANNING:
+                return
+
+            self.pending_gate_command = None
+            self._replan_hold_ready = goal_id
+
             self._request_current_trajectory_validation(
                 generation_reason="REPLAN",
                 directional_constraint=(
@@ -3243,99 +5628,33 @@ class CollaborationManager(Node):
             )
             return
 
-        if action == "START":
-            if request_id != self.latest_start_request_id:
-                return
+        if status in {"REJECTED", "EXPIRED"}:
+            self.pending_gate_command = None
+            self._replan_hold_ready = None
 
-            if status == "ACCEPTED":
-                self.initial_start_authorized_goal_id = goal_id
-                self.pending_gate_command = None
-
-                self.get_logger().info(
-                    "[START] Gate accepted command | "
-                    f"goal={goal_id} | request={request_id}"
-                )
-                return
-
-            if status in {"REJECTED", "EXPIRED"}:
+            if action == "START":
                 self.initial_start_authorized_goal_id = ""
-
-                pending = self.pending_gate_command
-                if (
-                    pending is not None
-                    and pending["request_id"] == request_id
-                ):
-                    self.pending_gate_command = None
-
-                # Do not retry immediately: give the Gate and
-                # observation stream time to settle.
                 self.initial_start_next_attempt_at = (
                     time.monotonic() + 0.5
                 )
 
-                self.get_logger().warning(
-                    "[START] Gate did not retain authorization | "
-                    f"status={status} | reason={reason}"
-                )
-                return
-
-        if action == "RESUME":
-            pending = self.pending_gate_command
-
-            if (
-                pending is None
-                or pending["action"] != "RESUME"
-                or pending["goal_id"] != goal_id
-                or pending["request_id"] != request_id
-                or pending["path_id"] != path_id
-            ):
-                return
-
-            if status in {
-                "ACCEPTED",
-                "ACCEPTED_PENDING_CANDIDATE",
-                "ACCEPTED_PENDING_TERMINATION",
-            }:
-                pending["status"] = status
-                pending["accepted_at"] = time.monotonic()
-
-                self.get_logger().info(
-                    "[RESUME] Gate response | "
-                    f"status={status} | path={path_id}"
-                )
-                return
-
-            if status in {"REJECTED", "EXPIRED"}:
-                self.pending_gate_command = None
-
-                self._invalidate_trajectory_validation(
-                    reason=f"GATE_RESUME_{status}"
-                )
-
-                self._publish_wait(
-                    reason=f"GATE_RESUME_{status}"
-                )
-
-                self._transition_to(
-                    STATE_WAITING,
-                    reason=f"GATE_RESUME_{status}",
-                )
-
-                self.get_logger().warning(
-                    "[RESUME] Authorization lost | "
-                    f"status={status} | reason={reason}"
-                )
-                return
-
-        if (
-            action == "REPLAN"
-            and status == "REJECTED"
-            and self.fsm_state == STATE_REPLANNING
-        ):
             self._hold_route_search(
-                reason="GATE_REPLAN_REJECTED",
+                reason=f"GATE_{action}_{status}",
                 reconsider=True,
             )
+            return
+
+        if action == "START" and status == "ACCEPTED":
+            self.initial_start_authorized_goal_id = goal_id
+            self.pending_gate_command = None
+
+        elif action == "RESUME" and status in {
+            "ACCEPTED",
+            "ACCEPTED_PENDING_CANDIDATE",
+            "ACCEPTED_PENDING_TERMINATION",
+        }:
+            pending["status"] = status
+            pending["accepted_at"] = time.monotonic()
 
     def _navigation_state_callback(self, msg):
         self.latest_navigation_state = msg
@@ -3347,10 +5666,8 @@ class CollaborationManager(Node):
         if (
             not goal_id
             or goal_id != self.active_navigation_goal_id
+            or not self._message_is_recent(msg, 1.0)
         ):
-            return
-
-        if not self._message_is_recent(msg, 1.0):
             return
 
         self.navigation_state = normalize_navigation_state(
@@ -3358,22 +5675,23 @@ class CollaborationManager(Node):
         )
         self.navigation_active = bool(msg.navigation_active)
 
-        self.get_logger().info(
+        self.get_logger().debug(
             "[NAVIGATION STATE] "
-            f"goal_id={goal_id!r} | "
-            f"state={self.navigation_state!r} | "
+            f"goal={goal_id} | "
+            f"state={self.navigation_state} | "
             f"active={self.navigation_active}"
         )
 
+        # Public goal termination is authoritative.
         if self.navigation_state in {
             "SUCCEEDED",
             "ABORTED",
-            "CANCELED"
+            "CANCELED",
         }:
             if (
                 self.pending_terminal_stop is not None
                 and self.pending_terminal_stop["goal_id"]
-                == goal_id
+                    == goal_id
             ):
                 self.pending_terminal_stop = None
                 self.terminal_stop_fault_reported = False
@@ -3399,6 +5717,7 @@ class CollaborationManager(Node):
             self._evaluate_stop_barrier()
             return
 
+        # Preserve the existing REPLAN acknowledgement path.
         if (
             self.fsm_state == STATE_REPLANNING
             and self.navigation_state == "REPLANNING"
@@ -3409,16 +5728,31 @@ class CollaborationManager(Node):
                 self.pending_replan_directional_constraint
             )
 
-            self.get_logger().info(
-                "[REPLAN] Gate acknowledged REPLANNING | "
-                f"goal={goal_id!r} | direction={direction}"
-            )
-
             self._request_current_trajectory_validation(
                 generation_reason="REPLAN",
                 directional_constraint=direction,
             )
 
+            self._evaluate_stop_barrier()
+            return
+
+        # CRITICAL ORDER:
+        # Confirm actual execution before evaluating repeated
+        # events from the social episode that was just resolved.
+        if self.fsm_state == STATE_RESUMING:
+            if (
+                self.navigation_state == NAVIGATION_NAVIGATING
+                and self.navigation_active
+            ):
+                self._finish_episode_after_resume()
+
+                # A new independently confirmed episode will
+                # be processed through the social-event callback.
+                return
+
+            # RESUMING with active=False is expected while
+            # the Gate submits the FollowPath action.
+            # It must not be interpreted as a fresh conflict.
             self._evaluate_stop_barrier()
             return
 
@@ -3436,12 +5770,6 @@ class CollaborationManager(Node):
         self._interrupt_navigation_for_existing_social_episode()
         self._evaluate_stop_barrier()
 
-        if (
-            self.fsm_state == STATE_RESUMING
-            and self.navigation_state == NAVIGATION_NAVIGATING
-            and self.navigation_active
-        ):
-            self._finish_episode_after_resume()
     # ================================================================
     # Physical-stop barrier
     # ================================================================
@@ -3867,13 +6195,19 @@ class CollaborationManager(Node):
 
         if not self.social_observation_available:
             self.waiting_for_observation_reacquisition = True
-            self._publish_wait(
-                reason="SOCIAL_OBSERVATION_UNAVAILABLE_AFTER_SPEECH"
-            )
-            self._transition_to(
-                STATE_WAITING,
-                reason="SOCIAL_OBSERVATION_UNAVAILABLE_AFTER_SPEECH",
-            )
+
+            if self._mode_c_reactive_generation_allowed():
+                self._enter_replanning(
+                    reason="MODE_C_REACTIVE_AFTER_OBSERVATION_LOSS",
+                    directional_constraint="NONE",
+                )
+
+            else:
+                self._hold_route_search(
+                    reason="SOCIAL_OBSERVATION_UNAVAILABLE_AFTER_SPEECH",
+                    reconsider=True,
+                )
+
             return
 
         if (
@@ -3952,22 +6286,62 @@ class CollaborationManager(Node):
     # Autonomous readaptation explanation
     # ================================================================
 
-    def _begin_autonomous_readaptation_announcement(self, *, reason):
+    def _begin_autonomous_readaptation_announcement(
+        self,
+        *,
+        reason,
+    ):
+        """Close the HRI turn before announcing an autonomous fallback."""
         self.dialogue_started_at = None
         self.waiting_for_human_initiative = False
         self._clear_pending_human_preference()
 
         reason = str(reason or "").strip().upper()
 
+        if (
+            self.pending_terminal_stop is not None
+            or self.social_resolution_aborted
+        ):
+            return
+
+        if (
+            self.pending_hri_close is not None
+            or self.pending_dialogue_request_id
+            or self.dialogue_audio_recovery_pending
+        ):
+            self._readaptation_after_hri_close = (
+                self.active_navigation_goal_id,
+                self._social_scope_key(),
+                reason,
+            )
+
+            if self.pending_hri_close is None:
+                if not self._request_hri_close(
+                    reason="AUTONOMOUS_READAPTATION"
+                ):
+                    self._hold_route_search(
+                        reason="HRI_CLOSE_TRANSACTION_UNAVAILABLE",
+                        reconsider=False,
+                    )
+                    return
+
+            self._hold_route_search(
+                reason="READAPTATION_AWAITING_HRI_CLOSE",
+                reconsider=True,
+            )
+            return
+
+        self._readaptation_after_hri_close = None
+        self._ensure_interaction_id()
+
         self._transition_to(
             STATE_ANNOUNCING_DETECTION,
             reason="ANNOUNCING_AUTONOMOUS_READAPTATION",
         )
-        self.get_logger().warning(
-            "[SOCIAL POLICY] Announcing autonomous readaptation | "
-            f"reason={reason}"
+
+        self._request_autonomous_readaptation_explanation(
+            reason=reason
         )
-        self._request_autonomous_readaptation_explanation(reason=reason)
 
     def _request_autonomous_readaptation_explanation(self, *, reason):
         self._clear_pending_human_preference()
@@ -4214,17 +6588,30 @@ class CollaborationManager(Node):
         request.interaction_id = self.active_interaction_id
         request.request_id = f"HRI_TURN_{uuid.uuid4().hex}"
 
-        request.person_id = self.active_person_id
+        # L'identité doit être renseignée AVANT la réservation.
+        request.person_id = str(
+            self.active_person_id or ""
+        ).strip()
+
         request.response_timeout = float(
             self.dialogue_response_timeout_sec
         )
         request.language = self.language
 
+        if self.interaction == "dialogue":
+            if not self._mode_d_bind_hri_turn(request):
+                self.get_logger().warning(
+                    "[HRI OWNER] Turn not created | "
+                    f"person={request.person_id!r} | "
+                    "reason=PERSON_SCOPE_UNAVAILABLE_OR_BUSY"
+                )
+                return None
+
         self.pending_dialogue_request_id = request.request_id
         self.pending_dialogue_scope = self._social_scope_key()
 
         return request
-    
+
     def _start_human_initiative_window(self):
         """Give the person a bounded opportunity to speak first."""
         if (
@@ -4250,6 +6637,13 @@ class CollaborationManager(Node):
         self.dialogue_outcome = "PENDING"
 
         request = self._new_dialogue_request()
+
+        if request is None:
+            self._hold_route_search(
+                reason="HRI_PERSON_SCOPE_UNAVAILABLE",
+                reconsider=True,
+            )
+            return
 
         request.request_type = "HUMAN_INITIATIVE_WINDOW"
         request.context = "SOCIAL_CONFLICT"
@@ -4279,6 +6673,13 @@ class CollaborationManager(Node):
     def _request_passage_clarification(self):
         self._ensure_interaction_id()
         request = self._new_dialogue_request()
+
+        if request is None:
+            self._hold_route_search(
+                reason="HRI_PERSON_SCOPE_UNAVAILABLE",
+                reconsider=True,
+            )
+            return
 
         request.request_type = "PASSAGE_CLARIFICATION"
         self.active_dialogue_request_type = "PASSAGE_CLARIFICATION"
@@ -4643,6 +7044,12 @@ class CollaborationManager(Node):
             question_key = "confirm_allow"
 
         request = self._new_dialogue_request()
+        if request is None:
+            self._hold_route_search(
+                reason="HRI_PERSON_SCOPE_UNAVAILABLE",
+                reconsider=True,
+            )
+            return
         request.request_type = "INTENT_CONFIRMATION"
         self.active_dialogue_request_type = "INTENT_CONFIRMATION"
         request.context = "INTENT_REQUIRES_CONFIRMATION"
@@ -4659,8 +7066,144 @@ class CollaborationManager(Node):
             reason="SEMANTIC_CONFIRMATION_REQUESTED",
         )
 
+
+    def _directional_identity_callback(self, msg):
+        """Retain the latest spatial identity observation."""
+        import copy
+
+        self.directional_identity_snapshot = copy.deepcopy(msg)
+        self.directional_identity_received_at = time.monotonic()
+
+    def _request_directional_constraint_installation(self, scope):
+        """Request a person-relative keepout mask after confirmed consent.
+
+        This method never authorizes navigation execution.
+        """
+        import math
+        import uuid
+
+        if (
+            self.interaction != "dialogue"
+            or self.confirmed_human_intent != "ALLOW_PASSAGE"
+            or self.confirmed_human_direction not in {"LEFT", "RIGHT"}
+            or not isinstance(scope, tuple)
+            or len(scope) != 5
+            or not all(scope)
+            or scope != self._social_scope_key()
+        ):
+            return False
+
+        goal_id, _, _, tracking_session, person_id = scope
+
+        if (
+            goal_id != self.active_navigation_goal_id
+            or person_id != self.active_person_id
+            or self.pending_terminal_stop is not None
+            or self.social_resolution_aborted
+        ):
+            return False
+
+        snapshot = self.directional_identity_snapshot
+        received_at = self.directional_identity_received_at
+
+        if snapshot is None or received_at is None:
+            self.get_logger().warning(
+                "[DIRECTIONAL MASK] Identity observation unavailable"
+            )
+            return False
+
+        if time.monotonic() - received_at > 0.5:
+            self.get_logger().warning(
+                "[DIRECTIONAL MASK] Identity observation expired"
+            )
+            return False
+
+        if (
+            str(snapshot.tracking_session_id).strip()
+            != tracking_session
+        ):
+            return False
+
+        if not bool(snapshot.source_observation_complete):
+            return False
+
+        source_stamp = snapshot.header.stamp
+        source_ns = (
+            int(source_stamp.sec) * 1_000_000_000
+            + int(source_stamp.nanosec)
+        )
+
+        source_age = (
+            self.get_clock().now().nanoseconds - source_ns
+        ) / 1e9
+
+        if not math.isfinite(source_age) or not -0.1 <= source_age <= 0.5:
+            return False
+
+        persons = [
+            person
+            for person in snapshot.persons
+            if (
+                str(person.id).strip() == person_id
+                and str(person.tracking_session_id).strip()
+                == tracking_session
+                and str(person.tracking_state).strip() == "TRACKED"
+                and bool(person.observed_in_current_array)
+                and int(person.identity_generation) > 0
+            )
+        ]
+
+        if len(persons) != 1:
+            self.get_logger().warning(
+                "[DIRECTIONAL MASK] Person identity not uniquely verified"
+            )
+            return False
+
+        # One installation transaction per confirmed social scope.
+        if self.directional_constraint_scope == scope:
+            return bool(self.directional_constraint_request_id)
+
+        request = DirectionalConstraintRequest()
+
+        request.header.stamp = self.get_clock().now().to_msg()
+        request.header.frame_id = str(snapshot.header.frame_id)
+
+        request.request_id = f"DIR_{uuid.uuid4().hex}"
+        request.navigation_goal_id = goal_id
+        request.interaction_id = self.active_interaction_id
+        request.person_id = person_id
+        request.tracking_session_id = tracking_session
+        request.identity_generation = int(persons[0].identity_generation)
+
+        request.action = "INSTALL"
+        request.directional_constraint = self.confirmed_human_direction
+
+        # Installation lease; observation freshness remains checked
+        # independently by the mask producer.
+        request.validity_duration.sec = 30
+        request.validity_duration.nanosec = 0
+
+        if not request.interaction_id:
+            return False
+
+        self.directional_constraint_pub.publish(request)
+
+        self.directional_constraint_request_id = request.request_id
+        self.directional_constraint_scope = scope
+
+        self.get_logger().info(
+            "[DIRECTIONAL MASK] INSTALL requested | "
+            f"goal={goal_id} | "
+            f"person={person_id} | "
+            f"direction={request.directional_constraint} | "
+            f"request={request.request_id}"
+        )
+
+        return True
+
+
     def _handle_confirmation_response(self, intent):
-        """Apply semantic confirmation without authorizing motion."""
+        """Commit confirmed intent, then close the exact HRI turn."""
 
         intent = str(intent or "").strip().upper()
 
@@ -4668,7 +7211,6 @@ class CollaborationManager(Node):
             self.authorized_episode_key = None
             self.executed_social_scope = None
             self.confirmed_human_intent = "REQUEST_STOP"
-
             self._request_terminal_stop(
                 reason="HUMAN_REQUESTED_STOP"
             )
@@ -4684,11 +7226,59 @@ class CollaborationManager(Node):
                 reconsider=False,
             )
             return
+        
+        person_scope = self.mode_d_hri_turns.get(
+            (
+                self.active_interaction_id,
+                self.pending_dialogue_request_id,
+            )
+        )
 
-        confirmed_intent = self.pending_human_intent
+        if (
+            self.interaction == "dialogue"
+            and (
+                person_scope is None
+                or person_scope != self.mode_d_hri_owner
+            )
+        ):
+            self._hold_route_search(
+                reason="HRI_PERSON_TRANSACTION_MISMATCH",
+                reconsider=False,
+            )
+            return
+
+        confirmed_intent = str(
+            self.pending_human_intent or ""
+        ).strip().upper()
+
         direction = self._normalize_direction(
             self.pending_human_direction
         )
+
+        if self.interaction == "dialogue":
+            case = self._mode_d_case(person_scope)
+
+            case["confirmed_intent"] = confirmed_intent
+            case["confirmed_direction"] = (
+                direction
+                if confirmed_intent == "ALLOW_PASSAGE"
+                else "NONE"
+            )
+
+            case["dialogue_outcome"] = (
+                "ALLOW_CONFIRMED"
+                if confirmed_intent == "ALLOW_PASSAGE"
+                else "DENY_CONFIRMED"
+            )
+
+            case["hri_closed"] = False
+
+            if (
+                confirmed_intent == "DENY_PASSAGE"
+                and direction in {"LEFT", "RIGHT"}
+            ):
+                case["forbidden_direction"] = direction
+
         scope = self.pending_dialogue_scope
 
         if (
@@ -4699,6 +7289,8 @@ class CollaborationManager(Node):
             or scope is None
             or not all(scope)
             or scope != self._social_scope_key()
+            or not self.pending_dialogue_request_id
+            or not self.active_interaction_id
         ):
             self._hold_route_search(
                 reason="CONFIRMATION_CONTEXT_INVALID",
@@ -4706,27 +7298,19 @@ class CollaborationManager(Node):
             )
             return
 
+        # Bind the semantic decision to this exact actor,
+        # episode and public navigation goal.
         self.confirmed_human_intent = confirmed_intent
         self.confirmed_human_direction = direction
 
         self.executed_social_scope = None
-        self.authorized_episode_key = (
-            scope
-            if confirmed_intent == "ALLOW_PASSAGE"
-            else None
-        )
 
-        self._clear_pending_human_preference()
+        if confirmed_intent == "ALLOW_PASSAGE":
+            self.authorized_episode_key = scope
+            self.dialogue_outcome = "ALLOW_CONFIRMED"
 
-        self.pending_dialogue_request_id = ""
-        self.pending_dialogue_scope = None
-
-        self.dialogue_started_at = None
-        self.waiting_for_human_initiative = False
-        self.dialogue_retry_count = 0
-        self.dialogue_speech_retry_count = 0
-
-        if confirmed_intent == "DENY_PASSAGE":
+        else:
+            self.authorized_episode_key = None
             self.dialogue_outcome = "DENY_CONFIRMED"
 
             if direction in {"LEFT", "RIGHT"}:
@@ -4734,32 +7318,116 @@ class CollaborationManager(Node):
 
             self.confirmed_human_direction = "NONE"
 
-            self._request_next_social_alternative()
+        self._clear_pending_human_preference()
+
+        self.dialogue_started_at = None
+        self.waiting_for_human_initiative = False
+        self.dialogue_retry_count = 0
+        self.dialogue_speech_retry_count = 0
+
+        # Simple C/D: confirmed consent is independent of HRI closure.
+        if hasattr(self, "_begin_direct_nav2_handoff"):
+
+            if confirmed_intent == "ALLOW_PASSAGE":
+                # Preserve the exact consent identity before HRI cleanup.
+                self._directional_confirmed_scope = scope
+                self._directional_confirmed_interaction_id = str(
+                    self.active_interaction_id or ""
+                ).strip()
+
+            # Request HRI closure without waiting for its acknowledgment.
+            self._request_hri_close(
+                reason="SEMANTIC_INTENT_CONFIRMED"
+            )
+
+            # Detach HRI ownership from the navigation transaction.
+            self._detach_hri_turn()
+
+            self._transition_to(
+                STATE_WAITING,
+                reason="HUMAN_INTENT_CONFIRMED",
+            )
+
+            if confirmed_intent == "ALLOW_PASSAGE":
+                self._release_navigation(direction)
+            else:
+                self._hold_after_denial()
+
             return
 
-        self.dialogue_outcome = "ALLOW_CONFIRMED"
+        # Important: request close BEFORE clearing HRI IDs.
+        close_requested = self._request_hri_close(
+            reason="SEMANTIC_INTENT_CONFIRMED"
+        )
+
+        if not close_requested:
+            self.get_logger().error(
+                "[DIALOGUE] Exact HRI closure unavailable; "
+                "navigation remains inhibited."
+            )
+
+            self._publish_wait(
+                reason="HRI_CLOSE_TRANSACTION_UNAVAILABLE"
+            )
+
+            self._transition_to(
+                STATE_WAITING,
+                reason="HRI_CLOSE_TRANSACTION_UNAVAILABLE",
+            )
+            return
+
+        if (
+            confirmed_intent == "ALLOW_PASSAGE"
+            and direction in {"LEFT", "RIGHT"}
+        ):
+            installation_requested = (
+                self._request_directional_constraint_installation(scope)
+            )
+
+            if not installation_requested:
+                self._publish_wait(
+                    reason="DIRECTIONAL_MASK_INSTALLATION_UNAVAILABLE"
+                )
+
+                self._transition_to(
+                    STATE_WAITING,
+                    reason="DIRECTIONAL_MASK_INSTALLATION_UNAVAILABLE",
+                )
+                return
+            
+        # The close transaction now owns the original IDs.
+        self.pending_dialogue_request_id = ""
+        self.pending_dialogue_scope = None
 
         if (
             self.active_navigation_goal_id
             and self.pending_terminal_stop is None
-            and self.pending_hri_close is None
+            and not self.social_resolution_aborted
         ):
-            self.social_resolution_aborted = False
             self.resolution_watch_goal_id = (
                 self.active_navigation_goal_id
             )
             self.resolution_watch_started_at = time.monotonic()
 
         self.get_logger().info(
-            "[DIALOGUE] Permission retained | "
+            "[DIALOGUE] Confirmed intent retained | "
             f"scope={scope} | "
+            f"intent={confirmed_intent} | "
             f"direction={direction} | "
+            "hri_close_pending=True | "
             "navigation_authorized=False"
         )
 
-        self._enter_replanning(
-            reason="HUMAN_PERMISSION_CONFIRMED",
-            directional_constraint=direction,
+        # Confirmed permission does not renew the Gate WAIT.
+        # Explicit human denial preserves the stop policy.
+        if confirmed_intent == "DENY_PASSAGE":
+            self._publish_wait(
+                reason="HUMAN_DENIED_PASSAGE"
+            )
+
+        self._transition_to(
+            STATE_WAITING,
+            reason="HUMAN_INTENT_CONFIRMED",
         )
 
     def propose_alternative_direction(self, direction):
@@ -4785,6 +7453,12 @@ class CollaborationManager(Node):
             "alternative_left" if direction == "LEFT" else "alternative_right"
         )
         request = self._new_dialogue_request()
+        if request is None:
+            self._hold_route_search(
+                reason="HRI_PERSON_SCOPE_UNAVAILABLE",
+                reconsider=True,
+            )
+            return
         request.request_type = "ALTERNATIVE_PROPOSAL"
         request.context = "REQUESTED_ROUTE_UNAVAILABLE"
         request.question = get_dialogue_text(question_key, self.language)
@@ -4918,34 +7592,27 @@ class CollaborationManager(Node):
         generation_reason,
         directional_constraint,
     ):
-        """
-        Submit a bounded trajectory generation request.
-
-        A missing human response does not prevent planning.
-        A generated candidate is never automatically authorized
-        for execution.
-        """
-
-        if self.social_resolution_aborted:
+        """Generate once, after the matching REPLAN hold acknowledgement."""
+        if (
+            getattr(self, "_replan_hold_ready", None)
+            != self.active_navigation_goal_id
+        ):
             return
 
-        if not self.active_navigation_goal_id:
-            return
-
-        if self.active_navigation_goal_pose is None:
-            return
-
-        # Do not overlap uncertain planner transactions.
-        if self.uncertain_generation_request_id:
-            self._hold_route_search(
-                "PREVIOUS_PLANNING_TERMINATION_UNCONFIRMED"
-            )
+        if (
+            self.fsm_state != STATE_REPLANNING
+            or not self._reactive_planning_ready()
+            or self.anticipatory_pending_request_id
+            or self.anticipatory_uncertain_request_id
+            or self.announcement_context_key is not None
+            or self.current_announcement_action
+        ):
             return
 
         if self.route_attempt_count >= self.route_search_max_attempts:
             self._hold_route_search(
                 reason="SOCIAL_ROUTE_ATTEMPTS_EXHAUSTED",
-                reconsider=False,
+                reconsider=True,
             )
             return
 
@@ -4953,61 +7620,16 @@ class CollaborationManager(Node):
             directional_constraint
         )
 
-        retired_recovery = (
-            self.retired_recovery_goal_id
-            == self.active_navigation_goal_id
-            and self._retired_recovery_evidence_available()
-        )
-
-        ordinary_no_conflict = (
-            not self.human_proximity_active
-            and self.social_observation_available
-            and not self.social_episode_retired
-            and not self.social_loss_expired
-            and not self.waiting_for_observation_reacquisition
-        )
-
-        confirmed_passage_search = (
-            self.interaction == "dialogue"
-            and self.dialogue_outcome == "ALLOW_CONFIRMED"
-            and self.confirmed_human_intent == "ALLOW_PASSAGE"
-            and self.active_navigation_goal_id
-            == self.social_episode_origin_goal_id
-        )
-
-        # Permit planning after an unanswered or
-        # unrecognized dialogue, not movement.
-        autonomous_readaptation_search = (
-            self.interaction == "dialogue"
-            and self.dialogue_outcome in {
-                "NO_RESPONSE",
-                "NOT_UNDERSTOOD",
-            }
-            and self.pending_hri_close is None
-            and self.pending_terminal_stop is None
-            and not self.dialogue_audio_recovery_pending
-            and not self.pending_speech_decision_id
-        )
-
-        if not (
-            retired_recovery
-            or ordinary_no_conflict
-            or confirmed_passage_search
-            or autonomous_readaptation_search
-            or self._route_observation_is_fresh()
+        if (
+            direction in {"LEFT", "RIGHT"}
+            and direction == self.forbidden_human_direction
         ):
             self._hold_route_search(
-                "PLANNING_OBSERVATION_EXPIRED"
+                reason="HUMAN_FORBIDDEN_DIRECTION",
+                reconsider=False,
             )
             return
 
-        if retired_recovery and direction != "NONE":
-            self._hold_route_search(
-                "RETIRED_RECOVERY_REQUIRES_STANDARD_PATH"
-            )
-            return
-
-        # Remove authorization associated with the old path.
         self._invalidate_trajectory_validation(
             reason="FRESH_TRAJECTORY_REQUIRED"
         )
@@ -5022,12 +7644,12 @@ class CollaborationManager(Node):
 
         if request is None:
             self._hold_route_search(
-                "TRAJECTORY_GENERATION_CONTEXT_UNAVAILABLE"
+                reason="TRAJECTORY_GENERATION_CONTEXT_UNAVAILABLE",
+                reconsider=True,
             )
             return
 
-        if retired_recovery:
-            request.person_id = ""
+        self._replan_hold_ready = None
 
         self.route_attempt_count += 1
         self.route_tried_directions.add(direction)
@@ -5037,30 +7659,20 @@ class CollaborationManager(Node):
 
         self.trajectory_generation_request_pub.publish(request)
 
-        self.get_logger().info(
-            "[TRAJECTORY SEARCH] "
-            f"attempt={self.route_attempt_count}/"
-            f"{self.route_search_max_attempts} | "
-            f"request={request.request_id} | "
-            f"reason={request.generation_reason} | "
-            f"direction={direction} | "
-            f"retired_recovery={retired_recovery} | "
-            f"autonomous_readaptation={autonomous_readaptation_search}"
-        )
     def _build_trajectory_generation_request(
         self,
         *,
         generation_reason,
         directional_constraint,
     ):
-        if not self.active_navigation_goal_id:
-            return None
-
-        if self.active_navigation_goal_pose is None:
+        """Build a request and retain its immutable public-goal owner."""
+        if (
+            not self.active_navigation_goal_id
+            or self.active_navigation_goal_pose is None
+        ):
             return None
 
         request = TrajectoryGenerationRequest()
-
         request.header.stamp = self.get_clock().now().to_msg()
         request.request_id = f"TRAJ_REQ_{uuid.uuid4().hex}"
         request.navigation_goal_id = self.active_navigation_goal_id
@@ -5076,51 +7688,193 @@ class CollaborationManager(Node):
             directional_constraint
         )
 
-        request.person_id = self.active_person_id
+        request.person_id = (
+            self.route_geometry_person_id
+            if (
+                self.interaction == "none"
+                and request.directional_constraint in {"LEFT", "RIGHT"}
+            )
+            else ""
+            if self.interaction == "none"
+            else self.active_person_id
+        )
+
+        if not hasattr(self, "_generation_owners"):
+            self._generation_owners = {}
+
+        self._generation_owners[request.request_id] = (
+            request.navigation_goal_id
+        )
 
         return request
-    def _candidate_trajectory_callback(self, msg):
-        if self.fsm_state not in {
-            STATE_REPLANNING,
-            STATE_VALIDATING_TRAJECTORY,
+    
+    def _mode_d_person_scope(self, person_id):
+        """Identifier une incarnation et son épisode individuel."""
+
+        person_id = str(person_id or "").strip()
+        goal_id = str(
+            self.active_navigation_goal_id or ""
+        ).strip()
+
+        if not goal_id or not person_id:
+            return None
+
+        matches = [
+            (identity, state)
+            for identity, state
+            in self.individual_participants.items()
+            if (
+                identity[1] == person_id
+                and state["episode_id"]
+                and not state["retired"]
+            )
+        ]
+
+        # Une identité ambiguë ne peut pas recevoir une
+        # nouvelle autorisation sémantique.
+        if len(matches) != 1:
+            return None
+
+        identity, state = matches[0]
+
+        return (
+            goal_id,
+            identity[0],
+            identity[1],
+            identity[2],
+            state["episode_id"],
+        )
+
+    def _mode_d_case(self, scope):
+        """Obtenir l'état propre à une personne et un épisode."""
+
+        if scope is None:
+            return None
+
+        if scope not in self.mode_d_cases:
+            self.mode_d_cases[scope] = {
+                "confirmed_intent": "UNKNOWN",
+                "confirmed_direction": "NONE",
+                "dialogue_outcome": "NONE",
+                "hri_closed": False,
+                "forbidden_direction": "NONE",
+                "candidate_request_ids": set(),
+            }
+
+        return self.mode_d_cases[scope]
+
+    def _mode_d_bind_hri_turn(self, request):
+        """Réserver le propriétaire exact d'un tour HRI."""
+
+        scope = self._mode_d_person_scope(
+            request.person_id
+        )
+
+        if scope is None:
+            return False
+
+        if self.mode_d_hri_owner not in {
+            None,
+            scope,
         }:
-            return
+            return False
 
-        if not self.active_navigation_goal_id:
-            return
+        identity = (
+            request.interaction_id,
+            request.request_id,
+        )
 
+        if identity in self.mode_d_hri_turns:
+            return False
+
+        self.mode_d_hri_owner = scope
+        self.mode_d_hri_turns[identity] = scope
+
+        self._mode_d_case(scope)
+
+        return True
+
+    def _candidate_trajectory_callback(self, msg):
+        """Accept candidates independently of cross-topic terminal-result order."""
         request_id = str(msg.request_id or "").strip()
-
-        if (
-            not self.pending_generation_request_id
-            or not request_id
-            or request_id != self.pending_generation_request_id
-        ):
-            return
-
         path_id = str(msg.path_id or "").strip()
         goal_id = str(msg.navigation_goal_id or "").strip()
 
-        if not path_id:
+        if (
+            not all((request_id, path_id, goal_id))
+            or not msg.path.header.frame_id
+            or not msg.path.poses
+        ):
             return
 
-        if not goal_id or goal_id != self.active_navigation_goal_id:
+        metadata = self.anticipatory_requests.get(request_id)
+
+        if metadata is not None:
+            scope = metadata["scope"]
+
+            if (
+                scope != self._anticipation_scope()
+                or goal_id != scope[0]
+                or metadata.get("status") not in {
+                    "GENERATING",
+                    "READY",
+                    "TERMINATED",
+                }
+            ):
+                return
+
+            existing = self.anticipatory_candidates.get(request_id)
+
+            if existing is not None:
+                return
+
+            self.anticipatory_candidates[request_id] = {
+                "scope": scope,
+                "direction": metadata["direction"],
+                "path_id": path_id,
+                "candidate": copy.deepcopy(msg),
+                "received_at": time.monotonic(),
+                "status": "READY",
+            }
+
+            if metadata["status"] != "TERMINATED":
+                metadata["status"] = "READY"
+
             return
 
-        if path_id != self.candidate_path_id:
-            self.trajectory_validation = TRAJECTORY_VALIDATION_UNKNOWN
-            self.validated_path_id = ""
-            self.validation_received_at = None
+        if (
+            self.fsm_state not in {
+                STATE_REPLANNING,
+                STATE_VALIDATING_TRAJECTORY,
+            }
+            or goal_id != self.active_navigation_goal_id
+            or request_id != self.pending_generation_request_id
+            or self.uncertain_generation_request_id
+        ):
+            return
 
-        # Only this callback establishes the candidate identity.
-        self.candidate_path_id = path_id
-        self.candidate_navigation_goal_id = goal_id
         self.pending_generation_request_id = ""
 
-        self.get_logger().info(
-            "[CANDIDATE TRAJECTORY] "
-            f"path_id={path_id} | goal={goal_id!r}"
+        getattr(
+            self,
+            "_generation_owners",
+            {},
+        ).pop(request_id, None)
+
+        self.trajectory_validation = TRAJECTORY_VALIDATION_UNKNOWN
+        self.validated_path_id = ""
+        self.validation_received_at = None
+        self.validation_source_stamp_sec = None
+
+        self.candidate_path_id = path_id
+        self.candidate_navigation_goal_id = goal_id
+
+        self.reactive_cached_candidate = copy.deepcopy(msg)
+        self._reactive_cached_scope = self._social_scope_key()
+        self._reactive_cached_direction = (
+            self.pending_replan_directional_constraint
         )
+
         self._transition_to(
             STATE_VALIDATING_TRAJECTORY,
             reason="CANDIDATE_TRAJECTORY_RECEIVED",
@@ -5139,132 +7893,126 @@ class CollaborationManager(Node):
     # ================================================================
 
     def _trajectory_generation_result_callback(self, msg):
-        """Handle planner results without confusing them with social conflicts."""
+        """Accept terminal evidence for the exact recorded request owner."""
         try:
             data = json.loads(msg.data)
-        except (TypeError, ValueError):
+
+            if (
+                not isinstance(data, dict)
+                or data.get("version") != 1
+                or data.get("producer") != "trajectory_manager"
+            ):
+                return
+
+            goal_id = str(
+                data.get("navigation_goal_id") or ""
+            ).strip()
+
+            request_id = str(
+                data.get("request_id") or ""
+            ).strip()
+
+            status = str(
+                data.get("status") or ""
+            ).strip().upper()
+
+            reason = str(
+                data.get("reason") or "UNSPECIFIED"
+            )
+
+        except (ValueError, TypeError):
             return
-
-        if not isinstance(data, dict):
-            return
-
-        if (
-            data.get("version") != 1
-            or data.get("producer") != "trajectory_manager"
-        ):
-            return
-
-        goal_id = str(
-            data.get("navigation_goal_id") or ""
-        ).strip()
-
-        request_id = str(
-            data.get("request_id") or ""
-        ).strip()
-
-        status = str(
-            data.get("status") or ""
-        ).strip().upper()
-
-        reason = str(
-            data.get("reason") or "UNSPECIFIED"
-        ).strip()
 
         if (
             not goal_id
-            or goal_id != self.active_navigation_goal_id
             or not request_id
+            or status not in {
+                "FAILED",
+                "TERMINATED",
+                "TERMINATION_UNCONFIRMED",
+            }
         ):
             return
 
-        retired_recovery = (
-            self.social_episode_retired
-            and self.retired_recovery_goal_id == goal_id
+        metadata = self.anticipatory_requests.get(request_id)
+        owners = getattr(self, "_generation_owners", {})
+
+        owner = (
+            metadata["scope"][0]
+            if metadata is not None
+            else owners.get(request_id)
         )
 
-        if status == "TERMINATED":
-            if request_id != self.uncertain_generation_request_id:
-                return
-
-            self.uncertain_generation_request_id = ""
-
-            self.get_logger().info(
-                "[TRAJECTORY RECOVERY] Previous generation terminated | "
-                f"request={request_id}"
-            )
-
-            if self.social_resolution_aborted:
-                return
-
-            # The recovery timer owns retries for retired episodes.
-            if retired_recovery:
-                return
-
-            if (
-                self.fsm_state == STATE_WAITING
-                and self.human_proximity_active
-                and self._route_observation_is_fresh()
-            ):
-                self._request_next_social_alternative()
-
+        if goal_id != owner:
             return
 
-        if request_id != self.pending_generation_request_id:
+        if metadata is not None:
+            if status == "TERMINATION_UNCONFIRMED":
+                if metadata.get("status") in {
+                    "TERMINATED",
+                    "FAILED",
+                }:
+                    return
+
+                metadata["status"] = status
+                self.anticipatory_uncertain_request_id = request_id
+                return
+
+            metadata["status"] = status
+
+            if self.anticipatory_pending_request_id == request_id:
+                self.anticipatory_pending_request_id = ""
+
+            if self.anticipatory_uncertain_request_id == request_id:
+                self.anticipatory_uncertain_request_id = ""
+
+            if status == "FAILED":
+                self.anticipatory_candidates.pop(request_id, None)
+
+            owners.pop(request_id, None)
             return
 
-        if self.fsm_state not in {
-            STATE_REPLANNING,
-            STATE_VALIDATING_TRAJECTORY,
+        if request_id not in {
+            self.pending_generation_request_id,
+            self.uncertain_generation_request_id,
         }:
             return
-
-        if status not in {
-            "FAILED",
-            "TERMINATION_UNCONFIRMED",
-        }:
-            return
-
-        self.get_logger().error(
-            "[TRAJECTORY RESULT] "
-            f"request={request_id} | "
-            f"status={status} | "
-            f"reason={reason}"
-        )
 
         if status == "TERMINATION_UNCONFIRMED":
             self.uncertain_generation_request_id = request_id
 
-            self._hold_route_search(
-                "PLANNING_TERMINATION_UNCONFIRMED"
-            )
+            if request_id == self.pending_generation_request_id:
+                self.pending_generation_request_id = ""
+
+            if goal_id == self.active_navigation_goal_id:
+                self._hold_route_search(
+                    reason="PLANNING_TERMINATION_UNCONFIRMED",
+                    reconsider=True,
+                )
+
             return
 
-        # FAILED is a planning failure, not a social-validation result.
-        self._hold_route_search(
-            reason=f"NAV2_PLANNING_FAILED:{reason}",
-            reconsider=not retired_recovery,
-        )
+        if self.pending_generation_request_id == request_id:
+            self.pending_generation_request_id = ""
 
-        if self.social_resolution_aborted:
-            return
+        if self.uncertain_generation_request_id == request_id:
+            self.uncertain_generation_request_id = ""
 
-        if retired_recovery:
-            self.get_logger().warning(
-                "[TRAJECTORY RECOVERY] No path produced by Nav2. "
-                "Waiting for the bounded standard-path retry; "
-                "no directional bypass requested."
-            )
-            return
+        owners.pop(request_id, None)
+        self.planning_reconciliation = None
 
-        # Directional alternatives require a currently observed person.
-        # The existing alternative policy also enforces dialogue in mode D.
         if (
-            self.human_proximity_active
-            and self._route_observation_is_fresh()
+            self.social_resolution_aborted
+            or self.pending_terminal_stop is not None
         ):
-            self._request_next_social_alternative()
+            return
 
-
+        if goal_id == self.active_navigation_goal_id:
+            self._hold_route_search(
+                reason=f"PLANNING_{status}:{reason}",
+                reconsider=True,
+            )
+     
     def _trajectory_validation_callback(self, msg):
         """Accept an exact result and retain actual geometric conflicts."""
 
@@ -5334,6 +8082,13 @@ class CollaborationManager(Node):
         )
 
         if result == TRAJECTORY_VALIDATION_CONFLICT:
+            
+            self.route_geometry_person_id = str(
+                msg.person_id or ""
+            ).strip()
+                        
+
+            self.reactive_cached_candidate = None
             scope = self._social_scope_key()
 
             if self.conflict_evidence_scope != scope:
@@ -5347,10 +8102,33 @@ class CollaborationManager(Node):
                 reason="CANDIDATE_SOCIAL_CONFLICT"
             )
 
+            if (
+                self.interaction == "dialogue"
+                and self.anticipatory_planning_enabled
+                and self.dialogue_outcome == "ALLOW_CONFIRMED"
+                and self._permission_applies_to_current_episode()
+                and self.anticipatory_selected_request_id
+            ):
+                # The physical conflict remains real.
+                # Keep human permission, wait for a new observation,
+                # and revalidate the cached path without new Nav2 planning.
+                self._hold_route_search(
+                    reason="CACHED_PATH_SOCIAL_CONFLICT",
+                    reconsider=True,
+                )
+
+                self._request_passage_assistance()
+                return
+
             self._request_next_social_alternative()
             return
 
         if result == TRAJECTORY_VALIDATION_UNKNOWN:
+            
+            self.mode_c_last_checked_source_ns = max(
+                self.mode_c_last_checked_source_ns,
+                int(self.health_stamp_ns or 0),
+            )
             if (
                 not self.human_proximity_active
                 and not self.navigation_active
@@ -5403,6 +8181,12 @@ class CollaborationManager(Node):
         else:
             hold_reason = ""
 
+        if (
+            not hold_reason
+            and self._individual_scene_blocks_motion()
+        ):
+            hold_reason = "INDIVIDUAL_EPISODE_UNRESOLVED"
+            
         if hold_reason:
             self._hold_route_search(
                 reason=hold_reason,
@@ -5418,13 +8202,29 @@ class CollaborationManager(Node):
         self._enter_resuming(path_id)
 
     def _invalidate_trajectory_validation(self, reason):
+        """Revoke path authorization without forgetting outstanding planning."""
+        pending = self.pending_generation_request_id
+
+        if pending:
+            if self.uncertain_generation_request_id not in {
+                "",
+                pending,
+            }:
+                self.get_logger().error(
+                    "Concurrent ordinary planning ownership; "
+                    "retaining both IDs."
+                )
+            else:
+                self.uncertain_generation_request_id = pending
+                self.pending_generation_request_id = ""
+
         self.trajectory_validation = TRAJECTORY_VALIDATION_UNKNOWN
         self.validated_path_id = ""
         self.validation_received_at = None
         self.validation_source_stamp_sec = None
+
         self.candidate_path_id = ""
         self.candidate_navigation_goal_id = ""
-        self.pending_generation_request_id = ""
         self.generation_requested_at = None
         self.early_validations = {}
 
@@ -5455,112 +8255,34 @@ class CollaborationManager(Node):
         *,
         require_selected_goal=True,
     ):
-        goal_id = str(self.active_navigation_goal_id or "").strip()
+        """
+        Retirement and empty observations never resolve a missing participant.
 
-        if not goal_id or self.active_navigation_goal_pose is None:
-            return False
-
-        if self.social_resolution_aborted:
-            return False
-        
-        if (
-            self.pending_hri_close is not None
-            or self.hri_close_fault_reported
-        ):
-            return False
-
-        if (
-            self.interaction == "dialogue"
-            and getattr(self, "dialogue_outcome", "NONE")
-                == "DENY_CONFIRMED"
-        ):
-            return False
-
-        if not (
-            self.social_episode_retired
-            and self.social_loss_expired
-            and self.human_proximity_active
-        ):
-            return False
-
-        if (
-            require_selected_goal
-            and self.retired_recovery_goal_id != goal_id
-        ):
-            return False
-
-        retired_at = self.retired_episode_retired_at
-
-        if retired_at is None:
-            return False
-
-        now = time.monotonic()
-
-        # The empty observation must be confirmed AFTER retirement.
-        if now - retired_at < 2.0:
-            return False
-
-        if (
-            self.latest_observation_health_at is None
-            or self.latest_observation_health_at <= retired_at
-        ):
-            return False
-
-        # Uses the existing source-stamp, reception-stamp,
-        # session and continuity checks.
-        if not self._fresh_empty_observation_available(
-            minimum_duration_sec=2.0
-        ):
-            return False
-
-        if self.navigation_active:
-            return False
-
-        # UNKNOWN and FORWARDING are not evidence of inactivity.
-        if self.navigation_state not in {
-            "WAITING",
-            "REPLANNING",
-        }:
-            return False
-
-        # An unfinished Nav2 cancellation remains a hard barrier.
-        if self.nav2_cancel_requested:
-            if not (
-                self.nav2_cancel_confirmed
-                and self.stable_stop_confirmed
-            ):
-                return False
-
-            if (
-                self.motion_state_received_at is None
-                or now - self.motion_state_received_at > 0.5
-                or self.motion_state_stamp_sec is None
-                or self.stop_request_stamp_sec is None
-                or self.motion_state_stamp_sec
-                    < self.stop_request_stamp_sec
-            ):
-                return False
-
-        # Do not bypass an unresolved speech transaction.
-        if self.pending_speech_decision_id:
-            return False
-
-        if getattr(
-            self,
-            "dialogue_audio_recovery_pending",
-            False,
-        ):
-            return False
-
-        return True
-
+        Recovery requires new factual evidence through the normal
+        observation and exact-path validation pipeline.
+        """
+        return False
+    
     def _trajectory_execution_allowed(self, path_id):
-        goal_id = str(self.active_navigation_goal_id or "").strip()
+        """
+        Authorize only an exact freshly validated trajectory.
+
+        Human consent is semantic context.
+        It never replaces current observation or path validation.
+        """
+        goal_id = str(
+            self.active_navigation_goal_id or ""
+        ).strip()
+
         path_id = str(path_id or "").strip()
 
         if (
-            self.pending_hri_close is not None
+            self.social_resolution_aborted
+            or self.pending_hri_close is not None
             or self.pending_terminal_stop is not None
+            or self.hri_close_fault_reported
+            or self.pending_speech_decision_id
+            or self.dialogue_audio_recovery_pending
         ):
             return False
 
@@ -5573,7 +8295,10 @@ class CollaborationManager(Node):
         if self.candidate_navigation_goal_id != goal_id:
             return False
 
-        if self.trajectory_validation != TRAJECTORY_VALIDATION_VALID:
+        if (
+            self.trajectory_validation
+            != TRAJECTORY_VALIDATION_VALID
+        ):
             return False
 
         if not (
@@ -5585,143 +8310,213 @@ class CollaborationManager(Node):
 
         if not self._trajectory_validation_is_fresh():
             return False
+        
+        if self._individual_scene_blocks_motion():
+            return False
 
-        # An ordinary recovery requires available observation
-        # and no outstanding loss or retirement state.
-        ordinary_recovery = (
-            self.social_observation_available
-            and not self.social_loss_expired
-            and not self.social_episode_retired
-            and not self.waiting_for_observation_reacquisition
+        ordinary_recovery = bool(
+            self._route_observation_is_fresh()
         )
 
-        # A retired episode has a separate, explicit recovery
-        # path. It must correspond to the exact validated path.
-        retired_recovery = (
+        # Retired-episode recovery has its own evidence policy.
+        # It must remain bound to this exact validated path.
+        retired_recovery = bool(
             self.retired_recovery_path_id == path_id
             and self._retired_recovery_evidence_available()
         )
 
-        return bool(ordinary_recovery or retired_recovery)
-
+        return bool(
+            ordinary_recovery
+            or retired_recovery
+        )
 
     # ================================================================
     # Replanning and resuming
     # ================================================================
 
+    def _unknown_candidate_revalidation_tick(self, now):
+        """Revalidate a retained candidate without replacing another transaction."""
+        if (
+            getattr(self, "_readaptation_after_hri_close", None)
+                is not None
+            or self.fsm_state != STATE_WAITING
+            or not self.route_waiting_for_change
+            or not self._reactive_planning_ready()
+            or self.announcement_context_key is not None
+            or self.current_announcement_action
+            or self.anticipatory_pending_request_id
+            or self.anticipatory_uncertain_request_id
+        ):
+            return
+
+        if (
+            self.interaction == "dialogue"
+            and (
+                self.dialogue_outcome not in {
+                    "ALLOW_CONFIRMED",
+                    "DENY_CONFIRMED",
+                    "NO_RESPONSE",
+                    "NOT_UNDERSTOOD",
+                }
+                or self.mode_d_hri_owner is not None
+            )
+        ):
+            return
+
+        candidate = self.reactive_cached_candidate
+
+        if candidate is None:
+            return
+
+        if (
+            getattr(self, "_reactive_cached_scope", None)
+            != self._social_scope_key()
+        ):
+            self.reactive_cached_candidate = None
+            return
+
+        if (
+            self.dialogue_outcome == "ALLOW_CONFIRMED"
+            and self.confirmed_human_direction in {"LEFT", "RIGHT"}
+        ):
+            if (
+                getattr(self, "_reactive_cached_direction", None)
+                != self.confirmed_human_direction
+            ):
+                self.reactive_cached_candidate = None
+                return
+
+        goal_id = str(
+            self.active_navigation_goal_id or ""
+        ).strip()
+
+        path_id = str(
+            candidate.path_id or ""
+        ).strip()
+
+        if (
+            not goal_id
+            or not path_id
+            or not str(candidate.request_id or "").strip()
+            or candidate.navigation_goal_id != goal_id
+            or not candidate.path.header.frame_id
+            or not candidate.path.poses
+            or (
+                self.candidate_path_id
+                and self.candidate_path_id != path_id
+            )
+        ):
+            return
+
+        if (
+            not self._fresh_observation_health_available()
+            or not self._individual_scene_current()
+        ):
+            return
+
+        stamp_ns = self.health_stamp_ns
+
+        if (
+            stamp_ns is None
+            or stamp_ns <= self.mode_c_last_checked_source_ns
+            or self.individual_source_stamp_ns != stamp_ns
+            or now - self.mode_c_last_revalidation_at < 1.0
+        ):
+            return
+
+        self.mode_c_last_checked_source_ns = stamp_ns
+        self.mode_c_last_revalidation_at = now
+
+        self._invalidate_trajectory_validation(
+            reason="MODE_C_FRESH_SOURCE_REVALIDATION"
+        )
+
+        self.candidate_path_id = path_id
+        self.candidate_navigation_goal_id = goal_id
+        self.generation_requested_at = now
+
+        self._transition_to(
+            STATE_VALIDATING_TRAJECTORY,
+            reason="MODE_C_FRESH_SOURCE_REVALIDATION",
+        )
+
+        self.mode_c_revalidation_pub.publish(
+            copy.deepcopy(candidate)
+        )
+
+        self.get_logger().info(
+            "[CANDIDATE REVALIDATION] "
+            f"goal={goal_id} | "
+            f"path={path_id} | "
+            f"source={stamp_ns} | "
+            "nav2_generation=False | "
+            "navigation_authorized=False"
+        )
 
     def _enter_replanning(
         self,
         reason,
         directional_constraint=None,
     ):
-        """
-        Start trajectory replanning.
-
-        Human silence or an unrecognized response may trigger
-        autonomous trajectory search.
-
-        Planning is not authorization to move.
-        Execution still requires exact, fresh validation.
-        """
+        """Request one exact Gate hold before starting ordinary planning."""
         if (
-            self.pending_hri_close is not None
+            getattr(self, "_readaptation_after_hri_close", None)
+                is not None
+            or self.social_resolution_aborted
             or self.pending_terminal_stop is not None
+            or self.pending_hri_close is not None
+            or self.pending_gate_command is not None
+            or self.pending_generation_request_id
+            or self.uncertain_generation_request_id
+            or self.anticipatory_pending_request_id
+            or self.anticipatory_uncertain_request_id
+            or self.pending_speech_decision_id
+            or self.pending_dialogue_request_id
+            or self.dialogue_audio_recovery_pending
         ):
-            return
-
-        if self.social_resolution_aborted:
             return
 
         if (
             not self.active_navigation_goal_id
             or self.active_navigation_goal_pose is None
         ):
-            self._hold_route_search(
-                "REPLAN_WITHOUT_PUBLIC_GOAL"
-            )
             return
 
-        retired_recovery = (
-            self.retired_recovery_goal_id
-            == self.active_navigation_goal_id
-            and self._retired_recovery_evidence_available()
-        )
-
-        confirmed_passage_search = (
-            self.interaction == "dialogue"
-            and self.dialogue_outcome == "ALLOW_CONFIRMED"
-            and self.confirmed_human_intent == "ALLOW_PASSAGE"
-            and self.active_navigation_goal_id
-            == self.social_episode_origin_goal_id
-        )
-
-        # Human silence does not authorize passage,
-        # but it permits an autonomous planning attempt.
-        autonomous_readaptation_search = (
-            self.interaction == "dialogue"
-            and self.dialogue_outcome in {
-                "NO_RESPONSE",
-                "NOT_UNDERSTOOD",
-            }
-            and self.pending_hri_close is None
-            and self.pending_terminal_stop is None
-            and not self.dialogue_audio_recovery_pending
-            and not self.pending_speech_decision_id
-        )
-
-        # Fresh social evidence is not mandatory merely
-        # to calculate a candidate trajectory.
-        if not (
-            retired_recovery
-            or confirmed_passage_search
-            or autonomous_readaptation_search
-            or self._route_observation_is_fresh()
-        ):
+        if not self._reactive_planning_ready():
             self._hold_route_search(
-                "REPLAN_REQUIRES_FRESH_SOCIAL_EVIDENCE"
+                reason="REPLAN_REQUIRES_CONFIRMED_HOLD",
+                reconsider=True,
             )
             return
-
-        dialogue_outcome = self.dialogue_outcome
-
-        dialogue_ready = dialogue_outcome in {
-            "ALLOW_CONFIRMED",
-            "DENY_CONFIRMED",
-            "NO_RESPONSE",
-            "NOT_UNDERSTOOD",
-        }
 
         if (
             self.interaction == "dialogue"
             and self.human_proximity_active
-            and not retired_recovery
         ):
-            if not dialogue_ready:
+            if self.dialogue_outcome == "NONE":
+                self._start_human_initiative_window()
+                return
 
-                if dialogue_outcome == "NONE":
-                    self._start_human_initiative_window()
-                    return
+            if self.dialogue_outcome not in {
+                "ALLOW_CONFIRMED",
+                "DENY_CONFIRMED",
+                "NO_RESPONSE",
+                "NOT_UNDERSTOOD",
+            }:
+                return
 
-                if dialogue_outcome == "PENDING":
-                    return
-
-                if dialogue_outcome == "DELIVERY_FAILED":
-                    self._hold_route_search(
-                        "DIALOGUE_TECHNICAL_RECOVERY_REQUIRED"
-                    )
-                    return
-
-                self._hold_route_search(
-                    "DIALOGUE_OUTCOME_NOT_RESOLVED"
-                )
+            if (
+                self.dialogue_outcome == "ALLOW_CONFIRMED"
+                and not self._permission_applies_to_current_episode()
+            ):
                 return
 
         if self.route_attempt_count >= self.route_search_max_attempts:
-            self._hold_route_search(
-                "SOCIAL_ROUTE_ATTEMPTS_EXHAUSTED",
-                reconsider=True,
-            )
+            if not self._request_passage_assistance():
+                self._hold_route_search(
+                    reason="SOCIAL_ROUTE_ATTEMPTS_EXHAUSTED",
+                    reconsider=True,
+                )
             return
 
         direction = self._normalize_direction(
@@ -5731,17 +8526,24 @@ class CollaborationManager(Node):
         )
 
         if (
+            self.dialogue_outcome == "ALLOW_CONFIRMED"
+            and self.confirmed_human_direction in {"LEFT", "RIGHT"}
+        ):
+            direction = self.confirmed_human_direction
+
+        if (
             direction in {"LEFT", "RIGHT"}
             and direction == self.forbidden_human_direction
         ):
             self._hold_route_search(
-                "HUMAN_FORBIDDEN_DIRECTION"
+                reason="HUMAN_FORBIDDEN_DIRECTION",
+                reconsider=False,
             )
             return
 
         self.route_generation_reason = (
             "ALTERNATIVE"
-            if reason == "SOCIAL_ALTERNATIVE"
+            if direction in {"LEFT", "RIGHT"}
             else "REPLAN"
         )
 
@@ -5758,7 +8560,7 @@ class CollaborationManager(Node):
             reason=reason,
         )
 
-        self._publish_collaborative_decision(
+        request_id = self._publish_collaborative_decision(
             action="REPLAN",
             outcome="TRAJECTORY_SEARCH",
             human_intent=self.confirmed_human_intent,
@@ -5767,13 +8569,49 @@ class CollaborationManager(Node):
             reason=reason,
         )
 
-    def _enter_resuming(self, path_id):
-        """Request exact-path execution and retain a recovery path."""
+        if not request_id:
+            self._hold_route_search(
+                reason="REPLAN_PUBLICATION_FAILED",
+                reconsider=True,
+            )
+            return
 
+        self.pending_gate_command = {
+            "goal_id": self.active_navigation_goal_id,
+            "action": "REPLAN",
+            "request_id": request_id,
+            "path_id": "",
+            "sent_at": time.monotonic(),
+            "status": "SENT",
+        }
+
+        self._replan_hold_ready = None
+
+    def _enter_resuming(self, path_id):
+        """
+        Submit one exact-path execution authorization.
+
+        Keep reassessment armed for rejection, expiry or timeout.
+        The reassessment evaluator cannot run during RESUMING
+        or while a Gate transaction remains pending.
+
+        Actual execution confirmation disarms reassessment.
+        """
         goal_id = str(
             self.active_navigation_goal_id or ""
         ).strip()
+
         path_id = str(path_id or "").strip()
+
+        if self.pending_terminal_stop is not None:
+            return
+
+        # Never overwrite an outstanding Gate transaction.
+        if self.pending_gate_command is not None:
+            self.get_logger().warning(
+                "[RESUME] Another Gate transaction is pending."
+            )
+            return
 
         if not self._trajectory_execution_allowed(path_id):
             self._hold_route_search(
@@ -5782,8 +8620,10 @@ class CollaborationManager(Node):
             )
             return
 
-        # Used only if the FSM later returns to WAITING.
+        # This is a recovery fallback, not an immediate retry.
+        # STATE_RESUMING prevents the evaluator from using it.
         self._schedule_social_reassessment()
+        self.route_blocked_signature = None
 
         self._transition_to(
             STATE_RESUMING,
@@ -5799,6 +8639,13 @@ class CollaborationManager(Node):
             reason="EXACT_TRAJECTORY_VALID_AND_FRESH",
         )
 
+        if not request_id:
+            self._hold_route_search(
+                reason="RESUME_REQUEST_PUBLICATION_FAILED",
+                reconsider=True,
+            )
+            return
+
         self.pending_gate_command = {
             "goal_id": goal_id,
             "action": "RESUME",
@@ -5807,6 +8654,14 @@ class CollaborationManager(Node):
             "sent_at": time.monotonic(),
             "status": "SENT",
         }
+
+        self.get_logger().info(
+            "[RESUME TRANSACTION] "
+            f"goal={goal_id} | "
+            f"path={path_id} | "
+            f"request={request_id} | "
+            "recovery_armed=True"
+        )
 
     def _finish_episode_after_resume(self):
         """Remember resolution after actual validated execution starts."""
@@ -5868,45 +8723,79 @@ class CollaborationManager(Node):
     # ================================================================
 
     def _publish_wait(self, reason):
-        """
-        Publish a non-terminal WAIT and retain its request identity.
+        """Retain one WAIT identity throughout the same physical-stop transaction."""
+        self.pending_gate_command = None
+        self._replan_hold_ready = None
 
-        During a physical stop transaction, only the latest
-        matching Gate HOLD_CONFIRMED may confirm cancellation.
-        """
-        if self.pending_gate_command is not None:
-            if self.pending_gate_command.get("action") in {
-                "START", "RESUME"
-            }:
-                self.pending_gate_command = None
+        goal_id = self.active_navigation_goal_id
 
-        if not self.active_navigation_goal_id:
-            self.get_logger().debug(
-                "[COLLABORATION] Local WAIT only | "
-                f"reason={reason}"
-            )
+        if not goal_id:
             return ""
 
-        request_id = self._publish_collaborative_decision(
-            action="WAIT",
-            outcome="WAITING",
-            human_intent=self.confirmed_human_intent,
-            directional_constraint=self.confirmed_human_direction,
-            path_id="",
-            reason=reason,
+        stopping = bool(
+            self.fsm_state == STATE_STOPPING_FOR_SOCIAL_CONFLICT
+            and self.nav2_cancel_requested
         )
 
-        if (
-            self.fsm_state
-            == STATE_STOPPING_FOR_SOCIAL_CONFLICT
-            and self.nav2_cancel_requested
-        ):
-            self.pending_stop_hold_request_id = request_id
+        scope = (
+            goal_id,
+            self.stop_request_stamp_sec,
+        )
 
-            # A newer WAIT supersedes an older acknowledgement.
+        saved = getattr(self, "_physical_wait", None)
+        now = time.monotonic()
+
+        if (
+            stopping
+            and saved is not None
+            and saved["scope"] == scope
+        ):
+            self.pending_stop_hold_request_id = (
+                saved["message"].request_id
+            )
+
+            if (
+                not self.nav2_cancel_confirmed
+                and now - saved["sent_at"] >= 2.0
+            ):
+                msg = copy.deepcopy(saved["message"])
+                msg.header.stamp = self.get_clock().now().to_msg()
+
+                self.collaborative_decision_pub.publish(msg)
+                saved["sent_at"] = now
+
+            return self.pending_stop_hold_request_id
+
+        msg = CollaborativeDecision()
+        msg.header.stamp = self.get_clock().now().to_msg()
+
+        msg.interaction_id = self.active_interaction_id
+        msg.navigation_goal_id = goal_id
+        msg.request_id = f"REQ_{uuid.uuid4().hex}"
+        msg.person_id = self.active_person_id
+
+        msg.action = "WAIT"
+        msg.outcome = "WAITING"
+        msg.human_intent = self.confirmed_human_intent
+        msg.directional_constraint = self.confirmed_human_direction
+        msg.path_id = ""
+        msg.reason = reason
+
+        msg.navigation_authorized = False
+        msg.requires_replan = False
+
+        if stopping:
+            self.pending_stop_hold_request_id = msg.request_id
             self.nav2_cancel_confirmed = False
 
-        return request_id
+            self._physical_wait = {
+                "scope": scope,
+                "message": copy.deepcopy(msg),
+                "sent_at": now,
+            }
+
+        self.collaborative_decision_pub.publish(msg)
+        return msg.request_id
     
     def _publish_collaborative_decision(
         self,
@@ -5918,21 +8807,12 @@ class CollaborationManager(Node):
         path_id,
         reason,
     ):
-        action = str(
-            action or ""
-        ).strip().upper()
+        """Publish a collaborative command under the execution authorization policy."""
+        action = str(action or "").strip().upper()
+        path_id = str(path_id or "").strip()
+        reason = str(reason or "").strip().upper()
 
-        path_id = str(
-            path_id or ""
-        ).strip()
-
-        if action not in {
-            "START",
-            "STOP",
-            "WAIT",
-            "REPLAN",
-            "RESUME"
-        }:
+        if action not in {"START", "STOP", "WAIT", "REPLAN", "RESUME"}:
             raise ValueError(
                 f"Unsupported collaborative action: {action}"
             )
@@ -5947,13 +8827,33 @@ class CollaborationManager(Node):
 
         if action == "RESUME":
             if not path_id:
-                raise RuntimeError(
-                    "RESUME requires a path_id."
-                )
+                raise RuntimeError("RESUME requires a path_id.")
 
             if not self._trajectory_execution_allowed(path_id):
                 raise RuntimeError(
-                    "RESUME rejected: exact-path validation barrier failed."
+                    "RESUME rejected: exact trajectory authorization failed."
+                )
+
+        elif action == "START" and path_id:
+            mode_c_restart = bool(
+                reason == "MODE_C_VALIDATED_NAV2_RESTART"
+                and str(
+                    getattr(self, "_episode_mode", "")
+                ).strip().upper() == "C"
+                and str(
+                    directional_constraint or ""
+                ).strip().upper() == "NONE"
+                and self._released
+                and not self._denied_scope
+                and self.dialogue_outcome != "DENY_CONFIRMED"
+                and self.pending_terminal_stop is None
+                and self._stopped()
+                and self._trajectory_execution_allowed(path_id)
+            )
+
+            if not mode_c_restart:
+                raise RuntimeError(
+                    "START with path_id requires validated Mode C recovery."
                 )
 
         elif path_id:
@@ -5962,8 +8862,8 @@ class CollaborationManager(Node):
             )
 
         msg = CollaborativeDecision()
-
         msg.header.stamp = self.get_clock().now().to_msg()
+
         msg.interaction_id = self.active_interaction_id
         msg.navigation_goal_id = self.active_navigation_goal_id
         msg.request_id = f"REQ_{uuid.uuid4().hex}"
@@ -5985,10 +8885,8 @@ class CollaborationManager(Node):
             "[COLLABORATIVE DECISION] "
             f"action={action} | "
             f"authorized={navigation_authorized} | "
-            f"replan={msg.requires_replan} | "
             f"goal={self.active_navigation_goal_id!r} | "
-            f"path_id={path_id!r} | "
-            f"intent={human_intent} | "
+            f"path={path_id!r} | "
             f"direction={directional_constraint} | "
             f"reason={reason}"
         )
@@ -6098,6 +8996,15 @@ class CollaborationManager(Node):
     # ================================================================
 
     def _evaluate_pending_gate_command(self, now):
+        """
+        Supervise Gate acknowledgement deadlines.
+
+        A timeout does not prove that execution never started.
+        Revoke the authorization through WAIT before recovery.
+
+        Recovery requires fresh evidence and the normal Gate
+        planning barrier. It never reuses the expired path.
+        """
         pending = self.pending_gate_command
 
         if pending is None:
@@ -6111,17 +9018,12 @@ class CollaborationManager(Node):
             self.pending_gate_command = None
             return
 
+        timeout = {
+            "START": 2.0,
+            "RESUME": 10.0,
+        }.get(action, 5.0)
+
         elapsed = now - pending["sent_at"]
-
-        if action == "START":
-            timeout = 2.0
-
-        elif action == "RESUME":
-            # Includes deferred acceptance and actual start.
-            timeout = 10.0
-
-        else:
-            timeout = 5.0
 
         if elapsed < timeout:
             return
@@ -6130,87 +9032,92 @@ class CollaborationManager(Node):
 
         self.get_logger().error(
             "[GATE WATCHDOG] Transaction timeout | "
-            f"action={action} | goal={goal_id} | "
-            f"request={request_id} | elapsed={elapsed:.1f}s"
+            f"action={action} | "
+            f"goal={goal_id} | "
+            f"request={request_id} | "
+            f"elapsed={elapsed:.1f}s"
         )
 
         if action == "START":
-            # The Gate may still have received the request.
-            # Never assume this timeout means Nav2 is idle.
             self.initial_start_authorized_goal_id = ""
-
             self.initial_start_next_attempt_at = now + 0.5
 
-            # An explicit WAIT revokes any unconsumed authorization.
+            # Revoke a possibly received but unacknowledged START.
             self._publish_wait(
                 reason="START_ACK_TIMEOUT"
             )
             return
 
         if action == "RESUME":
-            self._publish_wait(
-                reason="RESUME_START_TIMEOUT"
-            )
-
-            self._invalidate_trajectory_validation(
-                reason="RESUME_START_TIMEOUT"
-            )
-
-            self._transition_to(
-                STATE_WAITING,
+            # This helper invalidates the old candidate and validation,
+            # publishes WAIT and enables observation-driven reassessment.
+            # It preserves the confirmed human preference.
+            self._hold_route_search(
                 reason="RESUME_START_TIMEOUT",
+                reconsider=True,
             )
+            return
+
+        self._hold_route_search(
+            reason=f"GATE_{action}_ACK_TIMEOUT",
+            reconsider=True,
+        )
 
     def _timer_callback(self):
         """
-        Periodic supervision of collaboration transactions.
+        Supervise collaboration and optional Mode-D preplanning.
 
-        Responsibilities:
-            - Verify the physical stop barrier.
-            - Monitor HRI dialogue closure.
-            - Supervise social observation loss.
-            - Process episode retirement.
-            - Monitor speech completion.
-            - Supervise Gate transactions.
-            - Release deferred CLEAR recovery.
-            - Supervise bounded trajectory resolution.
-            - Evaluate initial navigation authorization.
-
-        Timeouts never authorize motion by themselves.
+        Mode C uses its existing control path unchanged.
+        Anticipation never publishes execution authorization.
         """
+
         now = time.monotonic()
 
-        # 1. PHYSICAL STOP BARRIER
+        # 1. Physical stop barrier.
         self._evaluate_stop_barrier()
 
-        # 2. HRI CLOSE SUPERVISION
+        # 2. HRI close and terminal stop supervision.
         self._watch_hri_close(now)
         self._watch_terminal_stop(now)
 
-        # 3. SOCIAL OBSERVATION SUPERVISION
+        # 3. Observation supervision.
         self._evaluate_social_loss_timeout(now)
         self._apply_pending_social_retirement()
 
-        # 4. SPEECH AND IDLE EPISODE SUPERVISION
+        # 4. Speech and episode supervision.
         self._evaluate_initial_announcement_timeout(now)
         self._evaluate_idle_episode_retirement()
 
-        # 5. NAVIGATION GATE TRANSACTION SUPERVISION
+        # 5. Gate transactions.
         self._evaluate_pending_gate_command(now)
 
-        # 6. DEFERRED CLEAR RECOVERY
+        # 6. Deferred clearance.
         self._evaluate_deferred_clear_replan()
-
-        # 7. BOUNDED SOCIAL ROUTE RESOLUTION
+        if self.interaction == "dialogue":
+            self._try_cached_path_revalidation(now)
+            
+        # 7. Original route-resolution procedure.
         self._evaluate_route_resolution(now)
+        self._unknown_candidate_revalidation_tick(now)
+        self._reactive_search_tick(now)
+        self._watch_planning_reconciliation(now)
 
-        # 8. NEW MOTION-RELATED WORK
+        # 8. Optional speculative generation for mode D.
+        # This branch does not exist in mode C.
+        if (
+            self.interaction == "dialogue"
+            and self.anticipatory_planning_enabled
+        ):
+            self._anticipation_tick(now)
+
+        # 9. Original goal and social supervision.
         if not self.social_resolution_aborted:
+            #self._mode_c_reactive_tick()
             self._evaluate_retired_episode_recovery()
             self._evaluate_conflict_persistence(now)
             self._evaluate_initial_goal_start()
 
-        # 9. FSM DIAGNOSTIC WATCHDOG
+        # 10. Existing diagnostic watchdog.
         monitored_states = {
             STATE_STOPPING_FOR_SOCIAL_CONFLICT,
             STATE_WAITING,
@@ -6240,6 +9147,7 @@ class CollaborationManager(Node):
             f"{bool(self.uncertain_generation_request_id)}",
             throttle_duration_sec=10.0,
         )
+        
     def _evaluate_deferred_clear_replan(self):
         goal_id = self.deferred_clear_replan_goal_id
 
@@ -6276,7 +9184,15 @@ class CollaborationManager(Node):
             reason="SOCIAL_CLEAR_HRI_CLOSED",
             directional_constraint="NONE"
         )
+
     def _evaluate_social_loss_timeout(self, now):
+        """
+        Supervise prolonged loss of social observation.
+
+        Keep semantic consent and its direction.
+        Never erase an outstanding planner request.
+        Never treat timeout as geometric clearance.
+        """
         if not self.human_proximity_active:
             return
 
@@ -6299,9 +9215,24 @@ class CollaborationManager(Node):
             return
 
         self.social_loss_expired = True
+        self.waiting_for_observation_reacquisition = True
+
         self._apply_pending_social_retirement()
-        self._invalidate_trajectory_validation(reason="SOCIAL_LOSS_TIMEOUT")
-        if (
+
+        # A planning request belongs to TrajectoryManager.
+        # Do not erase its identity while awaiting an
+        # authoritative candidate or terminal outcome.
+        generation_outstanding = bool(
+            self.pending_generation_request_id
+            or self.uncertain_generation_request_id
+        )
+
+        if not generation_outstanding:
+            self._invalidate_trajectory_validation(
+                reason="SOCIAL_LOSS_TIMEOUT"
+            )
+
+        dialogue_active = bool(
             self.interaction == "dialogue"
             and self.fsm_state in {
                 STATE_WAITING_FOR_HUMAN,
@@ -6311,51 +9242,77 @@ class CollaborationManager(Node):
             }
             and self.active_interaction_id
             and self.pending_dialogue_request_id
-        ):
-            # Social observation has expired, but the HRI
-            # request retains ownership of its own timeout.
-            #
-            # Do not reset dialogue_started_at.
-            # Do not clear pending_dialogue_request_id.
-            # Do not interpret observation loss as silence.
-            #
-            # The trajectory remains invalidated.
+        )
+
+        if dialogue_active:
             self.get_logger().warning(
-                "[SOCIAL LOSS] Observation timeout reached; "
-                "active HRI transaction retained | "
-                f"interaction={self.active_interaction_id} | "
-                f"request={self.pending_dialogue_request_id}"
+                "[SOCIAL LOSS] Prolonged loss during dialogue | "
+                "HRI transaction preserved | "
+                f"interaction={self.active_interaction_id}"
             )
             return
 
-        self._clear_pending_human_preference()
+        # Do not overwrite:
+        # - confirmed_human_intent
+        # - confirmed_human_direction
+        # - authorized_episode_key
+        # - dialogue_outcome
+        #
+        # Consent is semantic memory, not permission to move.
 
-        #self.confirmed_human_intent = "UNKNOWN"
-        #self.confirmed_human_direction = "NONE"
-        #self.active_interaction_id = ""
-        #self.active_dialogue_request_type = ""
+        self.pending_human_intent = "UNKNOWN"
+        self.pending_human_direction = "NONE"
+
         self.active_alternative_direction = "NONE"
-
         self.dialogue_started_at = None
         self.waiting_for_human_initiative = False
+
+        # Do not reset the actual generation direction
+        # or a still-running planning transaction.
         self.dialogue_retry_count = 0
         self.dialogue_speech_retry_count = 0
-        self.pending_replan_directional_constraint = "NONE"
-        self.waiting_for_observation_reacquisition = True
 
         self.get_logger().warning(
-            "[SOCIAL LOSS] Interaction expired; public goal retained | "
-            f"goal={self.active_navigation_goal_id!r} | "
-            f"elapsed={elapsed:.2f}s"
+            "[SOCIAL LOSS] Observation timeout | "
+            f"goal={self.active_navigation_goal_id} | "
+            f"elapsed={elapsed:.2f}s | "
+            f"generation_outstanding={generation_outstanding} | "
+            f"confirmed_direction={self.confirmed_human_direction}"
         )
+
+        # Planning or validation may finish, but cannot
+        # authorize execution using stale observations.
+        if self.fsm_state in {
+            STATE_REPLANNING,
+            STATE_VALIDATING_TRAJECTORY,
+        }:
+            return
+
+        if (
+            self.fsm_state == STATE_WAITING
+            and not self.navigation_active
+        ):
+            self._schedule_social_reassessment()
+            return
+
+        # A pending RESUME must not be abandoned silently.
+        # The Gate owns the pending command; a prolonged
+        # loss prevents treating stale evidence as clearance.
+        if self.fsm_state == STATE_RESUMING:
+            self._publish_wait(
+                reason="SOCIAL_LOSS_TIMEOUT_DURING_RESUME"
+            )
+            self._transition_to(
+                STATE_WAITING,
+                reason="SOCIAL_LOSS_TIMEOUT_DURING_RESUME",
+            )
+            return
 
         if self.active_navigation_goal_id:
-            self._publish_wait(reason="SOCIAL_LOSS_TIMEOUT_HOLD")
-
-        self._transition_to(
-            STATE_WAITING,
-            reason="SOCIAL_LOSS_EXPIRED_WAITING_FOR_OBSERVATION",
-        )
+            self._hold_route_search(
+                reason="SOCIAL_LOSS_TIMEOUT_HOLD",
+                reconsider=True,
+            )
 
     def _evaluate_initial_announcement_timeout(self, now):
         if self.fsm_state != STATE_ANNOUNCING_DETECTION:
@@ -6406,8 +9363,13 @@ class CollaborationManager(Node):
     # ================================================================
 
     def _reset_episode(self):
+        # Clear retained consent before opening another context.
+        self._retained_same_person_consent = None
+        self._directional_retry_pending = False
+
         # Preserve public goal identity and transport ordering.
         self.active_interaction_id = ""
+
         self.active_decision_id = ""
         self.active_person_id = ""
         self.announcement_decision_id = ""
@@ -6521,18 +9483,68 @@ class CollaborationManager(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = CollaborationManager()
+
+    selector = None
+    node = None
 
     try:
+        # Read ROS parameters before selecting the manager class.
+        selector = rclpy.create_node(
+            "collaboration_manager"
+        )
+
+        selector.declare_parameter(
+            "collaboration_manager_type",
+            "original",
+        )
+
+        manager_type = str(
+            selector.get_parameter(
+                "collaboration_manager_type"
+            ).value
+        ).strip().lower()
+
+        # Release the temporary node before creating the manager.
+        selector.destroy_node()
+        selector = None
+
+        if manager_type == "simple_cd":
+            from .simple_collaboration_manager import (
+                SimpleCDCollaborationManager,
+            )
+
+            manager_class = SimpleCDCollaborationManager
+
+        elif manager_type == "original":
+            manager_class = CollaborationManager
+
+        else:
+            raise ValueError(
+                f"Unsupported collaboration manager: {manager_type}"
+            )
+
+        node = manager_class()
+
+        node.get_logger().info(
+            "[COLLABORATION IMPLEMENTATION] "
+            f"selected={manager_type} | "
+            f"class={type(node).__name__}"
+        )
+
         rclpy.spin(node)
+
     except KeyboardInterrupt:
         pass
+
     finally:
-        node.destroy_node()
+        if selector is not None:
+            selector.destroy_node()
+
+        if node is not None:
+            node.destroy_node()
 
         if rclpy.ok():
             rclpy.shutdown()
-
 
 if __name__ == "__main__":
     main()

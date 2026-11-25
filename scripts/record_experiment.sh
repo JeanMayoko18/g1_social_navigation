@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 
 (
@@ -18,7 +17,7 @@ set -euo pipefail
 # Examples:
 #
 #   bash scripts/record_experiment.sh technical C S1a 01
-#   bash scripts/record_experiment.sh technical D S1a 06
+#   bash scripts/record_experiment.sh technical D S1a 07
 #   bash scripts/record_experiment.sh participant D S5 01
 #
 # Diagnostics:
@@ -189,12 +188,12 @@ case "$scenario" in
 
     S1b)
         scenario_description="standing_person_no_admissible_detour"
-        scenario_goal="remain_waiting_while_conflict_unresolved"
+        scenario_goal="remain_stopped_and_periodically_reassess_until_admissible_path_or_explicit_termination"
         ;;
 
     S2)
         scenario_description="transverse_crossing"
-        scenario_goal="resume_only_after_confirmed_clear"
+        scenario_goal="resume_only_on_fresh_validated_path_after_social_resolution"
         ;;
 
     S3)
@@ -355,11 +354,11 @@ topics=(
     /goal_pose
 
     # Nav2 actions
-    /navigate_to_pose/_action/goal
-    /navigate_to_pose/_action/cancel
+    #/navigate_to_pose/_action/goal
+    #/navigate_to_pose/_action/cancel
     /navigate_to_pose/_action/feedback
     /navigate_to_pose/_action/status
-    /navigate_to_pose/_action/result
+    #/navigate_to_pose/_action/result
 
     /navigate_to_pose_internal/_action/goal
     /navigate_to_pose_internal/_action/cancel
@@ -442,6 +441,15 @@ if [[ "$configuration" == "C" ||
         /social_perception/social_zones
         /social_perception/social_state
 
+        # BoT-SORT: continuity and propagation of identities
+        /social_perception/detections_source
+        /social_perception/detections_3d
+        /social_perception/detections_3d_odom
+        /social_perception/detections_identified_odom
+
+        # Spatial tracking in odom frame
+        /social_perception/tracked_persons_odom
+
         /social_navigation/navigation_goal_context
         /social_navigation/navigation_state
         /social_navigation/robot_motion_state
@@ -515,11 +523,113 @@ if [[ "$record_livox_raw" == "1" ]]; then
 fi
 
 # =============================================================================
+# SOCIAL REASSESSMENT, RECOVERY AND EXECUTION ACKNOWLEDGEMENTS
+# =============================================================================
+
+if [[ "$configuration" == "C" ||
+      "$configuration" == "D" ]]; then
+
+    topics+=(
+        /social_navigation/observation_health
+        /social_navigation/episode_retirement
+
+        /social_navigation/reassessment_request
+        /social_navigation/reassessment_result
+
+        /social_navigation/trajectory_generation_result
+        /social_navigation/trajectory_generation_status_request
+
+        /social_navigation/gate_command_result
+
+        /explainability/speech_cancel_request
+    )
+fi
+
+if [[ "$configuration" == "D" ]]; then
+    topics+=(
+        /hri/dialogue_control
+        /hri/dialogue_control_result
+    )
+fi
+
+# Planning action state and environment context.
+topics+=(
+    /compute_path_to_pose/_action/status
+    /compute_path_to_pose/_action/feedback
+
+    /map
+    /map_runtime
+    /initialpose
+
+    /global_costmap/costmap
+    /global_costmap/costmap_updates
+    /local_costmap/costmap
+    /local_costmap/costmap_updates
+
+    /parameter_events
+)
+
+# =============================================================================
+# DIRECTIONAL NAVIGATION AND HRI AUDIO DIAGNOSTICS
+# =============================================================================
+
+if [[ "$configuration" == "C" ||
+      "$configuration" == "D" ]]; then
+
+    topics+=(
+
+        # Directional constraint lifecycle
+        /social_navigation/directional_constraint_request
+        /social_navigation/directional_constraint_status
+
+        # Directional keepout filter used by Nav2
+        /social_navigation/directional_filter_info
+        /social_navigation/directional_keepout_mask
+
+    )
+fi
+
+if [[ "$configuration" == "D" ]]; then
+
+    topics+=(
+
+        # ASR capture protocol
+        /hri/asr_turn_command
+        /hri/asr_turn_status
+
+        # Microphone listening state
+        /hri/asr_listening_enabled
+
+    )
+fi
+
+# =============================================================================
 # SAVE REQUESTED TOPICS
 # =============================================================================
 
 printf '%s\n' "${topics[@]}" \
     > "${trial_directory}/requested_topics.txt"
+
+# =============================================================================
+# EFFECTIVE RUNTIME PARAMETERS
+# Capture the actual configuration, including temporal-continuity settings.
+# =============================================================================
+
+mkdir -p "${trial_directory}/parameters"
+
+if [[ "${DIAG_PARAM_DUMP:-0}" == "1" ]]; then
+    while IFS= read -r node_name; do
+        [[ "$node_name" == /* ]] || continue
+
+        node_file="${node_name#/}"
+        node_file="${node_file//\//__}"
+
+        timeout 5s ros2 param dump "$node_name" \
+            > "${trial_directory}/parameters/${node_file}.yaml" \
+            2> "${trial_directory}/parameters/${node_file}.stderr" || true
+
+    done < "${trial_directory}/available_nodes.txt"
+fi
 
 # =============================================================================
 # NEW: HOST PERFORMANCE MEASUREMENTS
@@ -639,13 +749,16 @@ case "$scenario" in
         ;;
 
     S1b)
-        printf '  Person remains stationary and blocks the admissible passage.\n'
-        printf '  Expected: robot remains waiting; conflicting path must not execute.\n'
+        # S1b reminder:
+        printf '  Expected: remain stopped and periodically reassess the situation.\n'
+        printf '  A conflicting or unvalidated path must never execute.\n'
+
         ;;
 
     S2)
-        printf '  Person crosses transversely and leaves the monitored region.\n'
-        printf '  Expected: CLEAR must be confirmed before resume.\n'
+        # S2 reminder:
+        printf '  Expected: resume only on an exact, freshly validated path.\n'
+        printf '  CLEAR alone does not authorize movement.\n'
         ;;
 
     S3)
@@ -668,7 +781,7 @@ printf '\n'
 printf 'IMPORTANT:\n'
 printf '  1. Wait until rosbag reports that recording has started.\n'
 printf '  2. Begin the authorized diagnostic observation.\n'
-printf '  3. For the initial diagnostic, keep the robot immobile.\n'
+printf '  3. Conduct the authorized navigation trial under direct supervision.\n'
 printf '  4. Do not change participant behavior during the trial.\n'
 printf '  5. Record through the period of social processing.\n'
 printf '  6. Press Ctrl+C once to stop recording cleanly.\n'
@@ -685,13 +798,37 @@ ros2 bag record \
 
 )
 
+# =============================================================================
+# LAUNCH EXAMPLES — run these commands manually in a terminal.
+# =============================================================================
+#
+# cd ~/g1_ws
+# source install/setup.bash
+# source tools/source_g1_env.sh
+#cd ~/g1_ws
 
-"""
-cd ~/g1_ws
-source install/setup.bash
-source tools/source_g1_env.sh
+# export DIAG_RECORD_LIVOX_RAW=0
+# export DIAG_SYSTEM_METRICS=1
+# export DIAG_PARAM_DUMP=0
+# COMMUNICATION_INITIATOR=human       human|robot
 
-./scripts/record_experiment.sh technical D S1a 05
-bash ~/g1_ws/scripts/record_experiment.sh participant D S1a 01
 
-"""
+# #python3 ./scripts/extract_social_timeline_old.py /home/jean/g1_ws/experiments/restaurant_social_awareness/technical/D/S1a/technical_D_S1a_R13/navigation
+
+# Technical trial — Mode D:
+# bash ~/g1_ws/scripts/record_experiment.sh technical D S1a 14
+
+
+# Participant trial — Mode D:
+# bash ~/g1_ws/scripts/record_experiment.sh participant D S1a 01
+#
+# Technical trial — Mode C:
+# bash ~/g1_ws/scripts/record_experiment.sh technical C S1a 01
+#
+# Technical trial — Mode D, planned human initiative:
+# COMMUNICATION_INITIATOR=human bash ~/g1_ws/scripts/record_experiment.sh technical D S1a 04
+#
+# Use a new trial number if the output directory already exists.
+#
+# ros2 bag info ~/g1_ws/experiments/restaurant_social_awareness/technical/D/S1a/technical_D_S1a_R04/navigation
+# =============================================================================

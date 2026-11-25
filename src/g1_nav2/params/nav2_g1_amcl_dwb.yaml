@@ -223,6 +223,13 @@ global_costmap:
 
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
 
+      filters: ["directional_keepout"]
+
+      directional_keepout:
+        plugin: "nav2_costmap_2d::KeepoutFilter"
+        enabled: true
+        filter_info_topic: /social_navigation/directional_filter_info
+
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
@@ -274,6 +281,13 @@ local_costmap:
       #plugins: ["obstacle_layer", "voxel_layer","camera_obstacle_layer", "social_layer", "inflation_layer"]
       #plugins: ["obstacle_layer", "voxel_layer", "inflation_layer"]
       plugins: [ "voxel_layer", "inflation_layer"]
+
+      filters: ["directional_keepout"]
+
+      directional_keepout:
+        plugin: "nav2_costmap_2d::KeepoutFilter"
+        enabled: true
+        filter_info_topic: /social_navigation/directional_filter_info
       # ----------------------------------------------------------
       # PRIMARY OBSTACLE SOURCE — MID-360 / LaserScan
       # ----------------------------------------------------------
@@ -365,8 +379,8 @@ local_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         enabled: true
-        inflation_radius: 0.55
-        cost_scaling_factor: 3.0 
+        inflation_radius: 0.70
+        cost_scaling_factor: 2.0 
         #inflation_radius: 0.70
         #cost_scaling_factor: 2.0  
 

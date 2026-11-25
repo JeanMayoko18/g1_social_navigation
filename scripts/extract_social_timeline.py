@@ -77,6 +77,11 @@ IMPORTANT_TOPICS = (
     "/social_navigation/decision",
     "/explainability/speech_status",
     "/hri/human_intent",
+    # BoT-SORT: continuity and propagation of identities
+    "/social_perception/detections_source",
+    "/social_perception/detections_3d",
+    "/social_perception/detections_3d_odom",
+    "/social_perception/detections_identified_odom",
 )
 
 
@@ -754,4 +759,4 @@ if __name__ == "__main__":
     main()
 
 
-#python3 ./scripts/extract_social_timeline.py /home/jean/g1_ws/experiments/restaurant_social_awareness/technical/D/S1a/technical_D_S1a_R05/navigation
+#python3 ./scripts/extract_social_timeline.py /home/jean/g1_ws/experiments/restaurant_social_awareness/technical/D/S1a/technical_D_S1a_R03/navigation
