@@ -1,6 +1,6 @@
 # Social navigation
 
-Start with a working [mapped-navigation session](navigation.md). The [system launcher](../src/g1_social_bringup/launch/system.launch.py) is the entry point for integrated social bringup. Its [launch directory](../src/g1_social_bringup/launch/) contains separate entry points for image ingress, perception, vision inference, social decisions, speech, navigation and visualization.
+Prepare the [shared hardware](hardware.md) with RGB-D enabled and use a saved map. The [system launcher](../src/g1_social_bringup/launch/system.launch.py) is the entry point for integrated social bringup. Its [launch directory](../src/g1_social_bringup/launch/) contains separate entry points for image ingress, perception, vision inference, social decisions, speech, navigation and visualization.
 
 | Question during an encounter | Where to look |
 | --- | --- |
@@ -21,6 +21,82 @@ Perception supplies tracks and social zones. Temporal interpretation uses memory
 ![Research poster on human-aware humanoid navigation through verbal interaction and permission-based decision making](../img/architecture/social-navigation-poster.png)
 
 </details>
+
+## C · announcements
+
+Start the shared hardware with **camera=true** and a saved map. Stop the preceding system launch on both hosts before changing profiles. Check RGB and aligned depth on the robot (Ctrl+C between checks).
+
+```bash
+ros2 topic hz /camera/camera/color/image_raw
+ros2 topic hz /camera/camera/aligned_depth_to_color/image_raw
+```
+**Robot terminal 3 · speech and RGB transport**
+
+```bash
+ros2 launch g1_social_bringup system.launch.py \
+  profile:=C interaction:=none deployment:=pc_perception \
+  camera_transport:=compressed identity_backend:=yolo_track language:=en \
+  host:=robot ros_distro:=foxy enable_yolo:=false \
+  navigation_mode:=nav2 enable_visualization:=false
+```
+**PC terminal 1 · inference, collaboration and Nav2**
+
+```bash
+ros2 launch g1_social_bringup system.launch.py \
+  profile:=C interaction:=none deployment:=pc_perception \
+  camera_transport:=compressed identity_backend:=yolo_track language:=en \
+  host:=pc ros_distro:=humble enable_yolo:=true \
+  collaboration_manager_type:=simple_cd anticipatory_planning_enabled:=false \
+  navigation_mode:=nav2 map:="$HOME/g1_ws/maps/g1_trial_01.yaml" \
+  controller:=dwb navigation_speed:=0.12 start_visual_odometry:=false \
+  enable_visualization:=true enable_social_rviz:=true
+```
+**PC terminal 2 · observe the encounter.** Check that the receiver and person tracker deliver data, set the initial pose in RViz and send a reachable goal.
+
+```bash
+ros2 topic hz /perception/transport/color
+# With a person in view, inspect the available social, speech and HRI streams:
+ros2 topic list -t | grep -E "social_navigation|explainability|/hri/"
+```
+Have a participant enter the path. Observe the stop and announcement, then have the participant clear the path. Check resumption or replanning and arrival at the original goal.
+
+## D · dialogue
+
+Start the shared hardware with **camera=true** and a saved map. Stop the preceding system launch on both hosts before changing profiles. Check RGB and aligned depth on the robot (Ctrl+C between checks).
+
+```bash
+ros2 topic hz /camera/camera/color/image_raw
+ros2 topic hz /camera/camera/aligned_depth_to_color/image_raw
+```
+**Robot terminal 3 · speech and RGB transport**
+
+```bash
+ros2 launch g1_social_bringup system.launch.py \
+  profile:=D interaction:=dialogue deployment:=pc_perception \
+  camera_transport:=compressed identity_backend:=yolo_track language:=en \
+  host:=robot ros_distro:=foxy enable_yolo:=false \
+  navigation_mode:=nav2 enable_visualization:=false
+```
+**PC terminal 1 · inference, collaboration and Nav2**
+
+```bash
+ros2 launch g1_social_bringup system.launch.py \
+  profile:=D interaction:=dialogue deployment:=pc_perception \
+  camera_transport:=compressed identity_backend:=yolo_track language:=en \
+  host:=pc ros_distro:=humble enable_yolo:=true \
+  collaboration_manager_type:=simple_cd anticipatory_planning_enabled:=false \
+  navigation_mode:=nav2 map:="$HOME/g1_ws/maps/g1_trial_01.yaml" \
+  controller:=dwb navigation_speed:=0.12 start_visual_odometry:=false \
+  enable_visualization:=true enable_social_rviz:=true
+```
+**PC terminal 2 · observe the encounter.** Check that the receiver and person tracker deliver data, set the initial pose in RViz and send a reachable goal.
+
+```bash
+ros2 topic hz /perception/transport/color
+# With a person in view, inspect the available social, speech and HRI streams:
+ros2 topic list -t | grep -E "social_navigation|explainability|/hri/"
+```
+Confirm microphone/ASR availability on the Humble dialogue host and audible speech on the robot. During a goal, have a participant enter the path, wait for the robot’s question and answer it. Observe permission and any agreed passing side, then the resumed goal. Record whether a directional mask was available when testing a side preference.
 
 ## Observe one encounter
 

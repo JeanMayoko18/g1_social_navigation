@@ -1,33 +1,54 @@
-# Start hardware and sensors
+# Shared hardware for mapping and navigation
 
-Prepare the [environment](environment.md) on the host running each command. The deployment examples place hardware on the G1. For a hardware component hosted on the PC, use Humble, the PC’s wired interface and its local sensor/driver access. The hardware launcher defaults to `network_interface:=eth0`.
+Use a built workspace on each participating host. For a wired PC, complete the [Ethernet check](network.md). In **each new terminal**, source the [host environment](environment.md). On the PC use Humble; on the robot use Foxy. The examples below place hardware on the G1 and navigation on the PC.
 
-## Option 1 · integrated bring-up
-
+**Robot terminal 1 · locomotion.** Use the wired interface for this host (the project G1 uses `eth0`). For the Unitree LOCO backend:
 ```bash
+ros2 run rl_sar rl_real_g1_edu23_unitree_loco eth0 --real --control-backend=unitree_loco --max-motion-duration=0.0
+```
+Press **0** for Bring Up, wait for the ready posture, then press **1** for Enter Locomotion. Keep this terminal running. For a custom policy or PC-hosted locomotion, use the [locomotion guide](locomotion.md).
+
+**Robot terminal 2 · shared hardware.** Start one hardware instance. Edit the three selections at the top before running. Use `camera=false` for mapping or ordinary navigation and `camera=true` for a social trial. For Livox, source the installed driver overlay first (on the project robot: `source ~/ros2_ws/install/setup.bash`, then `source ~/g1_ws/install/setup.bash`).
+```bash
+scan=livox          # livox or unitree
+odom=dogc           # see the source table below
+camera=false        # false for A; true for C or D
+livox_driver=false
+if [ "$scan" = livox ]; then livox_driver=true; fi
+dog_calibration=false
+if [ "$odom" = dogc ]; then dog_calibration=true; fi
+
 ros2 launch rl_sar hardware.launch.py \
-  run_robot_core:=true \
-  run_lidar_pipeline:=true \
-  run_realsense_pipeline:=true \
-  enable_realsense:=true \
-  enable_realsense_tf:=true \
-  odom_source:=dogc \
-  enable_dog_odom_calibration:=true
+  run_robot_core:=true run_lidar_pipeline:=true \
+  lidar_source:="$scan" enable_livox_driver:="$livox_driver" \
+  scan_target_frame:=base_footprint scan_min_height:=-0.53 scan_max_height:=0.72 \
+  odom_source:="$odom" enable_dog_odom_calibration:="$dog_calibration" \
+  run_realsense_pipeline:="$camera" enable_realsense:="$camera" enable_realsense_tf:="$camera"
+```
+If a separate driver already supplies the Livox cloud, set `livox_driver=false` before executing the launch. The Livox height limits are in the project G1’s planar frame at pelvis height. Check these limits for your robot. Changing from A to C/D requires RGB-D: stop and restart terminal 2 with `camera=true`, or use the separate camera procedure in [Hardware](hardware.md). Keep the same hardware running when switching between C and D.
+
+| Odometry choice | Selector input | What the robot must supply |
+| --- | --- | --- |
+| `dog` | `/dog_odom_2d` | Baseline planar DOG odometry. |
+| `dogc` | `/odom_dog_calibrated` | Calibrated DOG. This is the project's tested longitudinal correction. |
+| `unitree` | `/odom_unitree` | Unitree mode-state odometry. Observed with LOCO; verify publication with your backend. |
+| `aocf` | `/odom_aocf` | Start the configured adaptive DOG producer first. |
+| `mola` | `/odom_mola_nav` | Start configured MOLA and its navigation adapter first. |
+| `dogekf` | `/odom_dog_ekf` | Requires a running DOG EKF. Listed by the selector; no trial recipe supplied. |
+
+In the inspected robot core, automatic startup of the AOCF, MOLA adapter and DOG EKF nodes is commented out. Selecting one routes its input; confirm the producer delivers samples. Either scan choice feeds `/scan`. All odometry choices feed the same `/odom` and `odom → base_footprint` TF.
+
+**PC · verify the hardware before continuing.** Run each streaming check separately; press Ctrl+C after observing samples. For C/D also check color and aligned depth.
+```bash
+ros2 topic hz /scan
+ros2 topic hz /odom
+ros2 run tf2_ros tf2_echo odom base_footprint
 ```
 
-This command uses the launch default `lidar_source:=unitree`. For an integrated Livox MID-360 run, append the following arguments to the same launch command. Source the Livox driver workspace first as shown below.
 
-```text
-lidar_source:=livox \
-  enable_livox_driver:=true \
-  scan_target_frame:=base_footprint \
-  scan_min_height:=-0.53 \
-  scan_max_height:=0.72
-```
+## Alternative sensor bring-up
 
-If a separate Livox driver already publishes the cloud and IMU, use `enable_livox_driver:=false`.
 
-## Option 2 · separate terminals
 
 Prepare each terminal independently. For external sensor drivers on the project robot, add their overlay before re-sourcing the G1 overlay:
 
@@ -84,7 +105,7 @@ ros2 launch rl_sar hardware.launch.py \
 
 The parent includes the RealSense child when either the pipeline or the mounting TF is enabled. The camera driver requires both `run_realsense_pipeline` and `enable_realsense`. This split keeps the mounting TF while the external driver owns acquisition.
 
-## Choose odometry
+## Odometry notes
 
 | `odom_source` | Source and scope |
 | --- | --- |
