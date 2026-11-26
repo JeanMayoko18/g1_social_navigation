@@ -21,20 +21,63 @@ cd ~/g1_ws
 If the workspace already exists, enter it with `cd ~/g1_ws`. Select the project
 branch you intend to deploy before transferring the sources.
 
-## 2. Transfer the project from the PC to the G1
+## 2. Transfer selected packages from the PC to the robot
 
-Complete the [wired network setup](network.md) first. Run the transfer
-commands **on the PC**.
+The navigation stack can run on ROS 2 mobile robots that provide a compatible
+laser scan, odometry, TF frames and velocity command interface. If you cloned
+`g1_ws` on your PC and want to run navigation onboard, you can either clone
+the repository directly on the robot or transfer selected source packages
+from your PC using `transfer_pkgs.sh`.
 
-### Project development PC with the transfer helper
+### 1. Select the packages on the PC
+
+Open `~/g1_ws/transfer_pkgs.sh` and review the `packages` array. Include
+`g1_nav2` for navigation and `g1_social_costmap` if the robot will run Nav2
+with the social costmap layer. Include `rl_sar` when deploying the Unitree G1
+locomotion bridge. For another platform, use its own hardware drivers and
+velocity command interface.
+
+### 2. Enter the destination and start the transfer
+
+Complete the [wired network setup](network.md), then run the following
+commands in a Bash terminal **on the PC**:
 
 ```bash
 cd ~/g1_ws
-bash transfer_test.sh
+read -rp "Robot SSH destination (user@IP): " ROBOT_HOST
+read -rp "Remote workspace path: " ROBOT_WORKSPACE
+ROBOT_HOST="$ROBOT_HOST" ROBOT_WORKSPACE="$ROBOT_WORKSPACE" bash transfer_pkgs.sh
 ```
 
-Enter the G1's reachable IP address **each time the script asks for it**.
-Use the address configured on your robot's Ethernet connection.
+At the first prompt, enter the robot's **SSH username and reachable IP
+address**, for example `unitree@192.168.1xx.16x`. At the second prompt,
+enter the **absolute workspace path on the robot**, for example
+`/home/unitree/g1_ws`. These values apply to this transfer. Press Enter
+at either prompt to use the corresponding G1 default configured in the script.
+
+The helper creates `src/` under the remote workspace and copies each selected
+package over SSH using `rsync`. If SSH asks for a password, enter the password
+for the robot account. A successful transfer prints `ALL TRANSFERS FINISHED`.
+If a package transfer fails, the script reports the package name and stops.
+
+### 3. Verify the sources and build on the robot
+
+Open a terminal **on the robot** and enter the workspace path you supplied
+during the transfer. For the example above:
+
+```bash
+cd /home/unitree/g1_ws
+ls src
+```
+
+Verify that the selected packages are present, then follow the build steps
+below using a ROS 2 distribution supported by your platform and the framework.
+The Unitree G1 setup documented here uses ROS 2 Foxy.
+
+The helper transfers the source packages listed in `packages`. If navigation
+uses a saved map, also copy the map YAML and its referenced image to the host
+running Nav2. Transfer any workspace-level tools required by your launch
+procedure separately.
 
 ### Fresh GitHub clone
 
