@@ -16,6 +16,17 @@
 
 This ROS 2 workspace connects Nav2 to the Unitree G1 EDU+ locomotion system. The navigation stack uses a LiDAR scan, odometry and a map to localize the robot and follow a goal. Social navigation adds person perception and coordinates stopping, communication and resumption when someone is in the robot’s path. OM integration is planned.
 
+## Install and build before the first launch
+
+Start with the [installation, PC-to-robot transfer and build guide](docs/installation.md).
+It covers cloning the workspace, transferring sources from the PC to the G1,
+installing dependencies, building the real-hardware locomotion bridge, and
+building the navigation and social packages.
+
+Build on each machine that will run project software. The project G1 uses
+ROS 2 Foxy on ARM64. The development PC uses ROS 2 Humble on x86_64.
+After the build, continue with the launch configuration for your deployment.
+
 ## Test the framework on your G1
 
 Start with step 1, then open the task you want to run. Steps 3–5 accept an existing map of your environment. Each block identifies the host and includes a check for a successful run.
